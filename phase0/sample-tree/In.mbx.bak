@@ -1,0 +1,76 @@
+From ???@??? Mon Dec 16 00:53:20 2002
+From: Steve Dorner <dorner@example.edu>
+To: stephen@example.com
+Subject: Welcome to the fixture
+Date: Tue, 16 Dec 2002 10:00:00 -0600
+Content-Type: text/plain; charset=us-ascii
+
+Plain ASCII body. Nothing tricky here.
+From ???@??? Tue Dec 17 00:53:20 2002
+From: list@kayak.org
+To: stephen@example.com
+Subject: Baidarka build night
+Date: Wed, 17 Dec 2002 09:04:22 -0600
+Content-Type: text/plain; charset=us-ascii
+
+Bring your Greenland paddle.
+From ???@??? Wed Dec 18 00:53:20 2002
+From: euro@example.fr
+To: stephen@example.com
+Subject: Cafe test (utf8 mislabeled as latin1)
+Date: Thu, 18 Dec 2002 12:00:00 +0100
+Content-Type: text/plain; charset=iso-8859-1
+
+Fee: 5€. Café résumé naïve.
+From ???@??? Thu Dec 19 00:53:20 2002
+From: pierre@example.fr
+To: stephen@example.com
+Subject: Vrai latin-1
+Date: Fri, 19 Dec 2002 08:00:00 +0100
+Content-Type: text/plain; charset=iso-8859-1
+
+Na�ve caf� - latin1.
+From ???@??? Fri Dec 20 00:53:20 2002
+From: news@example.com
+To: stephen@example.com
+Subject: HTML or text
+Date: Sat, 20 Dec 2002 00:00:00 -0600
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="BOUNDARY-ALT-1"
+
+This is a MIME multipart message.
+
+--BOUNDARY-ALT-1
+Content-Type: text/plain; charset=us-ascii
+
+The plain version.
+
+--BOUNDARY-ALT-1
+Content-Type: text/html; charset=us-ascii
+
+<html><body><p>The <b>HTML</b> version.</p></body></html>
+
+--BOUNDARY-ALT-1--
+From ???@??? Sat Dec 21 00:53:20 2002
+From: attach@example.com
+To: stephen@example.com
+Subject: Here is the file
+Date: Sun, 21 Dec 2002 00:00:00 -0600
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="BOUNDARY-MIX-1"
+
+This is a MIME multipart message.
+
+--BOUNDARY-MIX-1
+Content-Type: text/plain; charset=us-ascii
+
+See attached notes.
+
+--BOUNDARY-MIX-1
+Content-Type: text/plain; name="notes.txt"
+Content-Disposition: attachment; filename="notes.txt"
+
+line one of the attachment
+line two
+
+--BOUNDARY-MIX-1--

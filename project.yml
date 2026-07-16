@@ -1,0 +1,89 @@
+# XcodeGen spec for the Phase 3 GUI.
+#
+#   brew install xcodegen        # one-time, if not present
+#   xcodegen generate            # run from ~/ClaudeProjects/Eudora
+#   open EudoraApp.xcodeproj     # ⌘R to build & run
+#
+# The app target links the existing local SwiftPM package (EudoraMac) and its
+# EudoraStore / EudoraSearch products — so the GUI binds to the same interop and
+# search layer the CLI and tests use. Regenerating the project never touches the
+# package sources; edit code freely and re-run `xcodegen generate` only when the
+# file layout or settings change.
+
+name: EudoraApp
+
+options:
+  bundleIdPrefix: com.stephen.eudora
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+packages:
+  EudoraMac:
+    path: EudoraMac
+
+targets:
+  EudoraApp:
+    type: application
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: EudoraApp/Sources
+    dependencies:
+      - package: EudoraMac
+        product: EudoraStore
+      - package: EudoraMac
+        product: EudoraSearch
+      - package: EudoraMac
+        product: EudoraNet
+    settings:
+      base:
+        PRODUCT_NAME: Eudora
+        PRODUCT_BUNDLE_IDENTIFIER: com.stephen.eudora.app
+        INFOPLIST_FILE: EudoraApp/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        MARKETING_VERSION: "0.3.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.7"
+        MACOSX_DEPLOYMENT_TARGET: "13.0"
+        # Personal, locally-run build: no team, no hardened runtime or sandbox.
+        # This app reads a Eudora tree in place from an arbitrary path in your
+        # home directory; sandboxing it later means adding the user-selected-file
+        # entitlement + security-scoped bookmarks.
+        #
+        # Signed with a stable identity, NOT ad-hoc ("-"). Ad-hoc gives the binary
+        # a new signature every build, so the Keychain's "Always Allow" grant for
+        # the SMTP password never sticks and re-prompts on each launch. A stable
+        # identity fixes that.
+        #
+        # We reference the existing "Apple Development: stephen@musanim.com" cert
+        # by its SHA-1 fingerprint (from `security find-identity -v -p codesigning`)
+        # rather than by name+team. That skips Xcode's team/account validation —
+        # this account isn't signed into Xcode ▸ Accounts, which broke both manual
+        # (name+team) and automatic signing. Direct-by-fingerprint needs no Apple
+        # account and no provisioning profile for a no-sandbox local Mac app.
+        # If the cert is ever renewed the fingerprint changes; re-run the command
+        # above and paste the new hash here.
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "D493F1004F5E3E7A3C1A3912E00D9922C411A402"
+        DEVELOPMENT_TEAM: ""
+        PROVISIONING_PROFILE_SPECIFIER: ""
+        ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_APP_SANDBOX: NO
+
+# A shared scheme so `xcodegen generate` always emits the app scheme and Xcode
+# keeps it selected (rather than defaulting to the eudora-spike CLI target).
+schemes:
+  EudoraApp:
+    build:
+      targets:
+        EudoraApp: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
