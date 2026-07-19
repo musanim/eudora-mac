@@ -30,6 +30,9 @@ targets:
     deploymentTarget: "13.0"
     sources:
       - path: EudoraApp/Sources
+      # Asset catalog: the Eudora 7 column-header icons (ColumnStatus,
+      # ColumnAttachment). Adding files here needs `xcodegen generate`.
+      - path: EudoraApp/Resources
     dependencies:
       - package: EudoraMac
         product: EudoraStore

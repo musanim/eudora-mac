@@ -134,6 +134,26 @@ final class AppModel: ObservableObject {
     @Published var selectedMailboxID: MailboxItem.ID?
     @Published var selectedMessageID: MessageRow.ID?
 
+    // Bind List/Table selection through these, never to `$selectedMailboxID`
+    // directly. A selection binding is written *during* SwiftUI's update pass —
+    // both when the user clicks and when a control reconciles its selection
+    // against changed contents — and writing an @Published there produces
+    // "Publishing changes from within view updates is not allowed."
+    // Deferring the write by one runloop turn moves it safely outside.
+    var mailboxSelection: Binding<MailboxItem.ID?> {
+        Binding(get: { [weak self] in self?.selectedMailboxID },
+                set: { [weak self] new in
+                    DispatchQueue.main.async { self?.selectedMailboxID = new }
+                })
+    }
+
+    var messageSelection: Binding<MessageRow.ID?> {
+        Binding(get: { [weak self] in self?.selectedMessageID },
+                set: { [weak self] new in
+                    DispatchQueue.main.async { self?.selectedMessageID = new }
+                })
+    }
+
     @Published var rows: [MessageRow] = []
     @Published var listingSource: String = ""
     @Published var mailboxSummary: String = ""
@@ -172,6 +192,20 @@ final class AppModel: ObservableObject {
     /// select once that mailbox's listing has been rebuilt (see loadListing()).
     private var pendingMessageID: MessageRow.ID?
 
+    /// Remembered selection for the open tree (see ViewState.swift). Held in
+    /// memory and written on every selection change.
+    private var viewState = ViewState()
+
+    /// The mailbox `rows` currently reflects, so a repeat load can be skipped.
+    private var listedMailboxID: MailboxItem.ID?
+
+    /// Coalescing token for scroll-position writes (see rememberScroll).
+    private var scrollSaveGeneration = 0
+
+    /// True between `open()` returning and the restored mailbox being listed —
+    /// the window stays hidden behind the splash for that gap.
+    private var splashHeldForRestore = false
+
     // MARK: opening a tree
 
     /// UserDefaults key holding the last-opened Eudora folder path. The app is
@@ -182,6 +216,10 @@ final class AppModel: ObservableObject {
     /// Restore on launch: $EUDORA_ROOT wins (handy for the fixture), otherwise
     /// the last folder opened, if it still exists. Else wait for File ▸ Open.
     func openDefaultIfAvailable() {
+        // Every exit from here ends the launch wait, including the early return
+        // when a tree is already open (onAppear can fire more than once) —
+        // unless a restore is going to finish the job (see restoreSelection).
+        defer { hideSplashUnlessRestoring() }
         guard rootURL == nil else { return }
         if let env = ProcessInfo.processInfo.environment["EUDORA_ROOT"] {
             open(URL(fileURLWithPath: (env as NSString).expandingTildeInPath))
@@ -196,6 +234,11 @@ final class AppModel: ObservableObject {
     }
 
     func open(_ url: URL) {
+        // Whatever happens below — success, empty tree, unreadable folder — the
+        // splash comes down when this returns, unless a restored selection is
+        // still to be listed, in which case restoreSelection takes it down.
+        splashHeldForRestore = false
+        defer { hideSplashUnlessRestoring() }
         UserDefaults.standard.set(url.path, forKey: Self.lastFolderKey)
         let s = MailStore(root: url)
         store = s
@@ -206,6 +249,7 @@ final class AppModel: ObservableObject {
         indexItems(tree)
         selectedMailboxID = nil
         selectedMessageID = nil
+        listedMailboxID = nil
         rows = []
         preview = nil
         status = tree.isEmpty
@@ -223,6 +267,112 @@ final class AppModel: ObservableObject {
         } else {
             openOrBuildIndex(for: url)
         }
+
+        restoreSelection(forRoot: url.path)
+    }
+
+    // MARK: remembered selection
+
+    /// Puts the sidebar and message selection back where the user left them for
+    /// this tree. Both are validated against what's on disk *now* — a mailbox may
+    /// be gone, and the remembered message may have been deleted — so a stale
+    /// blob degrades to "no selection" rather than to a wrong selection.
+    private func restoreSelection(forRoot root: String) {
+        viewState = ViewStateStore.load(forRoot: root)
+        guard let saved = viewState.selectedMailbox,
+              let item = itemsByID[saved], !item.isFolder else { return }
+
+        // Resolve the remembered byte offset to today's index, exactly as
+        // openHit does for a search hit. nil means that message is gone.
+        if let offset = viewState.selectedMessageOffsetByMailbox[saved] {
+            pendingMessageID = store?.indexOfRecord(at: item.base, offset: offset)
+        }
+        pendingListFocus = (pendingMessageID != nil)
+        selectedMailboxID = saved
+        // Keep the splash up past the end of open(): the listing is built on the
+        // next runloop turn, and revealing the window before then shows an empty
+        // message list for the mailbox that's supposedly selected.
+        splashHeldForRestore = true
+
+        // Drive the reload explicitly rather than relying on
+        // `.onChange(of: selectedMailboxID)`. open() has just set the selection
+        // to nil and back, both before SwiftUI observed either value, so if the
+        // newly-opened tree's remembered mailbox has the same id as the one
+        // already showing (say "In" in both trees), onChange sees no change and
+        // never fires — leaving an empty list under a selected mailbox and a
+        // pendingMessageID that leaks into whatever the user clicks next.
+        DispatchQueue.main.async { [weak self] in
+            self?.loadListing()
+            // One more turn so SwiftUI draws the rows just built, then reveal.
+            DispatchQueue.main.async {
+                self?.splashHeldForRestore = false
+                SplashWindow.hide()
+            }
+        }
+    }
+
+    /// Takes the splash down unless a restore is still finishing.
+    private func hideSplashUnlessRestoring() {
+        guard !splashHeldForRestore else { return }
+        SplashWindow.hide()
+    }
+
+    /// Set when a listing loads with a remembered scroll position; the message
+    /// table's AppKit bridge applies it and then clears it. Published so the
+    /// bridge's `updateNSView` is invoked.
+    @Published var pendingScrollTopRow: Int?
+
+    /// Records the message list's scroll position for the current mailbox.
+    ///
+    /// Scrolling fires continuously, so the write to UserDefaults is coalesced —
+    /// the in-memory state updates immediately, the save lands once the scroll
+    /// has been still for a moment.
+    func rememberScroll(topRow: Int) {
+        guard let mailbox = selectedMailboxID, topRow >= 0 else { return }
+        guard viewState.scrollTopRowByMailbox[mailbox] != topRow else { return }
+        viewState.scrollTopRowByMailbox[mailbox] = topRow
+
+        // Coalesce with a generation token rather than a DispatchWorkItem: a
+        // work item's block is escaping and doesn't inherit this method's main
+        // actor isolation, so it couldn't touch `viewState` at all. A closure
+        // passed to asyncAfter from a @MainActor method does inherit it.
+        scrollSaveGeneration += 1
+        let generation = scrollSaveGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self, self.scrollSaveGeneration == generation,
+                  let root = self.rootURL?.path else { return }
+            ViewStateStore.save(self.viewState, forRoot: root)
+        }
+    }
+
+    /// Called by the bridge once the scroll position has been applied.
+    func clearPendingScroll() { pendingScrollTopRow = nil }
+
+    /// Set when a restored selection should also take keyboard focus, so the
+    /// highlight is the active (not washed-out) one and the arrow keys move from
+    /// the restored row. Only set on restore — focusing the list on every
+    /// mailbox click would steal the arrow keys from the sidebar.
+    @Published var pendingListFocus = false
+
+    /// Called by the bridge once focus has been given to the message list.
+    func clearPendingListFocus() { pendingListFocus = false }
+
+    /// Records the current selection. Called once a selection has actually taken
+    /// effect, never while one is mid-flight.
+    ///
+    /// - Parameter messageOffset: the selected message's byte offset in the
+    ///   .mbx, from the caller that just read the record.
+    private func rememberSelection(messageOffset: Int? = nil) {
+        // A nil mailbox is never persisted: the sidebar List writes nil through
+        // its (deferred) selection binding while reconciling against a freshly
+        // replaced tree, which would otherwise land after restoreSelection and
+        // erase what was just restored.
+        guard let root = rootURL?.path, let mailbox = selectedMailboxID else { return }
+        viewState.selectedMailbox = mailbox
+        if let offset = messageOffset {
+            viewState.selectedMessageOffsetByMailbox[mailbox] = offset
+        }
+        ViewStateStore.save(viewState, forRoot: root)
     }
 
     private func indexItems(_ items: [MailboxItem]) {
@@ -252,19 +402,44 @@ final class AppModel: ObservableObject {
     /// Full (re)load of the selected mailbox — clears the message selection,
     /// unless a hit is being opened (pendingMessageID), in which case that
     /// message is selected once the rows exist.
-    func loadListing() {
+    /// - Parameter force: rebuild even if this mailbox is already listed. Used by
+    ///   the in-place refreshes (mail sent, mail received); the default path is
+    ///   idempotent so the explicit restore call and a subsequent `onChange` for
+    ///   the same mailbox don't load twice — the second pass would find
+    ///   `pendingMessageID` already consumed and clear the restored selection.
+    func loadListing(force: Bool = false) {
+        guard force || listedMailboxID != selectedMailboxID || pendingMessageID != nil else {
+            return
+        }
+        listedMailboxID = selectedMailboxID
         preview = nil
         if let pending = pendingMessageID {
             pendingMessageID = nil
             rebuildRows()
-            selectedMessageID = pending
-            // Render directly: onChange(selectedMessageID) won't fire if `pending`
-            // equals the previously selected index (e.g. row 2 → row 2 in another
-            // mailbox), which would otherwise leave the preview blank.
-            loadMessage()
+            // The index may no longer exist — a restored selection can outlive
+            // the messages it pointed at (deleted, or a mailbox that shrank).
+            if rows.contains(where: { $0.id == pending }) {
+                selectedMessageID = pending
+                // Render directly: onChange(selectedMessageID) won't fire if
+                // `pending` equals the previously selected index (e.g. row 2 →
+                // row 2 in another mailbox), which would leave the preview blank.
+                loadMessage()
+            } else {
+                selectedMessageID = nil
+            }
         } else {
             selectedMessageID = nil
             rebuildRows()
+        }
+        rememberSelection()
+
+        // Hand the remembered scroll position to the AppKit bridge, clamped to
+        // what this mailbox now holds.
+        if let mailbox = selectedMailboxID,
+           let top = viewState.scrollTopRowByMailbox[mailbox], !rows.isEmpty {
+            pendingScrollTopRow = min(top, rows.count - 1)
+        } else {
+            pendingScrollTopRow = nil
         }
     }
 
@@ -378,6 +553,7 @@ final class AppModel: ObservableObject {
             return
         }
         preview = Self.render(msg.part, sourceNote: listingSource)
+        rememberSelection(messageOffset: msg.record.offset)
     }
 
     /// Choose the best displayable body (prefer text/html, else text/plain),
@@ -552,7 +728,7 @@ final class AppModel: ObservableObject {
         guard let store, let outbox = store.outboxBase() else { return }
         _ = try Outbox.append(messageData: raw, to: outbox, who: who, subject: subject)
         reloadTree()
-        if let id = selectedMailboxID, itemsByID[id]?.type == .outbox { loadListing() }
+        if let id = selectedMailboxID, itemsByID[id]?.type == .outbox { loadListing(force: true) }
     }
 
     /// Rebuild the sidebar tree (e.g. after message counts change) without
@@ -683,7 +859,7 @@ final class AppModel: ObservableObject {
             }
 
             reloadTree()
-            if let id = selectedMailboxID, itemsByID[id]?.type == .inbox { loadListing() }
+            if let id = selectedMailboxID, itemsByID[id]?.type == .inbox { loadListing(force: true) }
             banner = fetched.isEmpty
                 ? "No new mail."
                 : "Received \(fetched.count) message\(fetched.count == 1 ? "" : "s")."
