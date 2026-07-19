@@ -161,13 +161,15 @@ public final class POP3Client: @unchecked Sendable {
 
     private func start() async throws {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            var resumed = false
+            let once = ResumeOnce()
             connection.stateUpdateHandler = { state in
-                guard !resumed else { return }
                 switch state {
-                case .ready: resumed = true; cont.resume()
-                case .failed(let e): resumed = true; cont.resume(throwing: POP3Error.connectionFailed(e.localizedDescription))
-                case .waiting(let e): resumed = true; cont.resume(throwing: POP3Error.connectionFailed(e.localizedDescription))
+                case .ready:
+                    if once.claim() { cont.resume() }
+                case .failed(let e):
+                    if once.claim() { cont.resume(throwing: POP3Error.connectionFailed(e.localizedDescription)) }
+                case .waiting(let e):
+                    if once.claim() { cont.resume(throwing: POP3Error.connectionFailed(e.localizedDescription)) }
                 default: break
                 }
             }

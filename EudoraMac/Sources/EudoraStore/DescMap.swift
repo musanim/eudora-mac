@@ -1,11 +1,10 @@
 import Foundation
 
-/// Eudora mailbox kinds, as marked by the TypeChar in `descmap.pce`.
-///
-/// NOTE: these letters are our fixture convention approximating Eudora
-/// (I=In, O=Out, T=Trash, J=Junk, F=Folder, M=regular mailbox). The real
-/// letters must be re-verified against a genuine `descmap.pce` before we rely
-/// on them for anything destructive.
+/// Eudora mailbox kinds. Verified against a genuine Windows Eudora 7
+/// `descmap.pce`: the TypeChar is **S** (system mailbox: In/Out/Junk/Trash,
+/// distinguished by name), **M** (regular mailbox), or **F** (folder — a `.fol`
+/// subdirectory with its own `descmap.pce`). The single-letter cases below are
+/// the internal roles we resolve those to (plus legacy fixture chars I/O/T/J).
 public enum MailboxType: String {
     case inbox = "I"
     case outbox = "O"
@@ -39,7 +38,7 @@ public struct DescMapEntry {
     public let type: MailboxType
     public let unread: String
 
-    public var hasUnread: Bool { unread.uppercased().hasPrefix("N") }
+    public var hasUnread: Bool { unread.uppercased().hasPrefix("Y") }
 }
 
 public enum DescMap {
@@ -61,9 +60,32 @@ public enum DescMap {
             let unread = parts.count > 3 ? parts[3] : ""
             rows.append(DescMapEntry(display: parts[0],
                                      filename: parts[1],
-                                     type: MailboxType(char: parts[2]),
+                                     type: resolveType(char: parts[2], display: parts[0]),
                                      unread: unread))
         }
         return rows
+    }
+
+    /// Map a `descmap.pce` TypeChar to a role. Real Eudora uses "S" for the four
+    /// system mailboxes (resolved to In/Out/Junk/Trash by their display name),
+    /// "M" for a regular mailbox, and "F" for a folder. Legacy fixture chars
+    /// (I/O/T/J) are still honoured.
+    static func resolveType(char: String, display: String) -> MailboxType {
+        switch char.uppercased() {
+        case "F": return .folder
+        case "I": return .inbox
+        case "O": return .outbox
+        case "T": return .trash
+        case "J": return .junk
+        case "S":
+            switch display.lowercased() {
+            case "in":    return .inbox
+            case "out":   return .outbox
+            case "junk":  return .junk
+            case "trash": return .trash
+            default:      return .mailbox
+            }
+        default: return .mailbox   // "M" and anything unknown
+        }
     }
 }

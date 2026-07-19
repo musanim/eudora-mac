@@ -28,6 +28,9 @@ final class SQLiteDB {
             let msg = String(cString: sqlite3_errmsg(handle))
             throw SQLiteError.open(msg)
         }
+        // If another connection briefly holds a write lock (e.g. an overlapping
+        // reindex of the same file), wait up to 5s rather than fail immediately.
+        sqlite3_busy_timeout(handle, 5000)
     }
 
     deinit { sqlite3_close(handle) }

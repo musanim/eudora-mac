@@ -15,3 +15,7 @@ EudoraTestPassword.txt
 
 # Vendored third-party reference source (kept locally, not tracked)
 reference/
+
+# Real mail — private test data, never commit (repo is public)
+phaseX/
+Eudora_*.zip

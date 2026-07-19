@@ -13,6 +13,7 @@ public struct MailboxNode {
 
 public enum IndexSource: String {
     case toc = "toc"
+    case tocCompacted = "toc (deleted hidden)"
     case scanNoToc = "scan (no .toc)"
     case scanStale = "scan (.toc stale — offsets disagree)"
 }
@@ -35,7 +36,10 @@ public struct Listing {
 
 /// The interop facade: reads a Eudora tree in place. `.mbx` is truth; `.toc` is
 /// a rebuildable cache that we verify against the mbx and fall back from.
-public struct MailStore {
+///
+/// `Sendable` (it holds only a `URL` and reads files on demand) so the search
+/// indexer can build off the main thread from a value copy.
+public struct MailStore: Sendable {
     public let root: URL
     public init(root: URL) { self.root = root }
 
@@ -48,12 +52,18 @@ public struct MailStore {
         for entry in DescMap.read(directory: directory) {
             let child = directory.appendingPathComponent(entry.filename)
             if entry.type.isFolder {
+                // A folder is a ".fol" subdirectory (its filename in descmap
+                // carries the extension); recurse into it as a directory.
                 nodes.append(MailboxNode(entry: entry, base: child, depth: depth,
                                          messageCount: 0,
                                          children: build(directory: child, depth: depth + 1)))
             } else {
-                nodes.append(MailboxNode(entry: entry, base: child, depth: depth,
-                                         messageCount: messageCount(base: child),
+                // descmap filenames include the extension (e.g. "In.mbx"); the
+                // base used to derive .mbx/.toc is the name *without* it. This is
+                // a no-op for fixtures whose filenames carry no extension.
+                let base = child.deletingPathExtension()
+                nodes.append(MailboxNode(entry: entry, base: base, depth: depth,
+                                         messageCount: messageCount(base: base),
                                          children: []))
             }
         }
@@ -66,8 +76,23 @@ public struct MailStore {
     func tocURL(_ base: URL) -> URL { base.appendingPathExtension("toc") }
 
     public func messageCount(base: URL) -> Int {
+        // Prefer the .toc's entry count, derived from its file *size* alone
+        // ((size − header) / entrySize) — a stat, no file read. This is Eudora's
+        // own count (matches the reconciled listing) and avoids reading every
+        // .mbx in the tree at launch, which is what made opening a large archive
+        // take ~a minute. Only a mailbox with no .toc falls back to a scan.
+        if let n = tocEntryCount(base: base) { return n }
         guard let data = try? Data(contentsOf: mbxURL(base)) else { return 0 }
         return Mbox.findRecords([UInt8](data)).count
+    }
+
+    /// Message count from the `.toc` file size, without reading its contents.
+    private func tocEntryCount(base: URL) -> Int? {
+        let path = tocURL(base).path
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = (attrs[.size] as? NSNumber)?.intValue,
+              size >= Toc.folderSize else { return nil }
+        return (size - Toc.folderSize) / Toc.entrySize
     }
 
     /// Accept "In" or "Projects/Music"; fall back to display/filename match.
@@ -97,7 +122,22 @@ public struct MailStore {
 
     // MARK: listing
 
-    static let statusGlyphs: [Int: String] = [0: " ", 1: "•", 2: " ", 3: "R", 4: "D", 8: "S"]
+    /// Message-list glyph for a Eudora status byte (values from the Windows
+    /// Eudora source, `summary.h`). The state is a single value per message
+    /// (replied implies read, etc.), so one glyph suffices.
+    static let statusGlyphs: [Int: String] = [
+        0: "•",   // MS_UNREAD
+        1: " ",   // MS_READ
+        2: "R",   // MS_REPLIED
+        3: "F",   // MS_FORWARDED
+        4: "→",   // MS_REDIRECT
+        5: " ",   // MS_UNSENDABLE
+        6: " ",   // MS_SENDABLE
+        7: "Q",   // MS_QUEUED
+        8: "S",   // MS_SENT
+        9: " ",   // MS_UNSENT
+        12: " ",  // MS_RECOVERED
+    ]
 
     public func list(_ name: String) -> Listing? {
         guard let base = locate(name) else { return nil }
@@ -113,34 +153,42 @@ public struct MailStore {
         let bytes = [UInt8](data)
         let recs = Mbox.findRecords(bytes)
 
-        var toc = Toc.read(tocURL(base))
-        var source: IndexSource = .toc
-        if toc == nil {
-            source = .scanNoToc
-        } else if toc!.count != recs.count
-                    || zip(toc!, recs).contains(where: { $0.0.offset != $0.1.offset }) {
-            source = .scanStale
-            toc = nil
+        // Each real message's byte offset → its 1-based position in the .mbx.
+        var indexByOffset: [Int: Int] = [:]
+        for (i, rec) in recs.enumerated() { indexByOffset[rec.offset] = i + 1 }
+
+        let toc = Toc.read(tocURL(base))
+
+        // Trust the .toc when every entry points at a real message (by offset).
+        // That covers an exact match *and* the common "deleted but not
+        // compacted" case, where the .mbx keeps message bodies the .toc no
+        // longer lists — we then show exactly what Eudora showed, with status,
+        // and hide the deleted ghosts. Only a .toc that genuinely disagrees
+        // (offsets not found in the .mbx) falls back to a status-less scan.
+        if let t = toc, !t.isEmpty, t.allSatisfy({ indexByOffset[$0.offset] != nil }) {
+            let source: IndexSource = (t.count == recs.count) ? .toc : .tocCompacted
+            let rows = t.map { e -> ListingRow in
+                let idx = indexByOffset[e.offset]!
+                return ListingRow(index: idx,
+                                  statusGlyph: Self.statusGlyphs[e.status] ?? "?",
+                                  priority: String(e.priority),
+                                  date: e.date, size: recs[idx - 1].length,
+                                  who: e.to, subject: e.subject)
+            }
+            return Listing(name: label, source: source, rows: rows)
         }
 
-        var rows: [ListingRow] = []
-        for (i, rec) in recs.enumerated() {
-            if let t = toc {
-                let e = t[i]
-                rows.append(ListingRow(index: i + 1,
-                                       statusGlyph: Self.statusGlyphs[e.status] ?? "?",
-                                       priority: String(e.priority),
-                                       date: e.date, size: rec.length,
-                                       who: e.to, subject: e.subject))
-            } else {
-                let msg = MIMEParser.parse(Mbox.messageBytes(bytes, rec))
-                rows.append(ListingRow(index: i + 1,
-                                       statusGlyph: "?", priority: "-",
-                                       date: msg.header("Date") ?? "",
-                                       size: rec.length,
-                                       who: msg.header("From") ?? msg.header("To") ?? "",
-                                       subject: HeaderDecoder.decode(msg.header("Subject") ?? "")))
-            }
+        // No .toc, or one that disagrees with the .mbx → scan the mailbox
+        // directly. Read/replied/forwarded status isn't recoverable this way.
+        let source: IndexSource = (toc == nil) ? .scanNoToc : .scanStale
+        let rows = recs.enumerated().map { (i, rec) -> ListingRow in
+            let msg = MIMEParser.parse(Mbox.messageBytes(bytes, rec))
+            return ListingRow(index: i + 1,
+                              statusGlyph: "?", priority: "-",
+                              date: msg.header("Date") ?? "",
+                              size: rec.length,
+                              who: msg.header("From") ?? msg.header("To") ?? "",
+                              subject: HeaderDecoder.decode(msg.header("Subject") ?? ""))
         }
         return Listing(name: label, source: source, rows: rows)
     }

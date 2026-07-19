@@ -104,7 +104,12 @@ public struct SearchQuery: Sendable {
 /// tree. It reads through `MailStore`, so it knows nothing about the on-disk
 /// format itself. FTS5 gives prefix/phrase/boolean/negation search plus bm25
 /// ranking and snippets — a superset of Eudora 7's old X1 engine.
-public final class SearchIndex {
+/// `@unchecked Sendable`: holds one SQLite connection. We build it on a
+/// background task and then query it on the main actor, but never concurrently
+/// — the app hands the finished index to the main actor only after indexing
+/// completes — so the single connection is never touched from two threads at
+/// once. (The system sqlite3 is serialized-threadsafe regardless.)
+public final class SearchIndex: @unchecked Sendable {
     private let db: SQLiteDB
 
     // Column order matters for snippet()/bm25(): indexed text columns are
@@ -132,10 +137,12 @@ public final class SearchIndex {
         try db.exec(Self.createSQL)
     }
 
-    /// Wipe and rebuild the whole index from the store (the "add or update
-    /// scan", simplified). For large stores this would move to a background
-    /// queue; here it's synchronous.
-    public func rebuild(from store: MailStore) throws {
+    /// Wipe and rebuild the whole index from the store. `progress`, if given, is
+    /// called as `(mailboxesDone, mailboxesTotal)` — throttled to ~100 calls —
+    /// so a caller can drive a progress bar. The caller runs this off the main
+    /// thread; the callback is invoked on that same (background) thread.
+    public func rebuild(from store: MailStore,
+                        progress: ((Int, Int) -> Void)? = nil) throws {
         try db.exec("DELETE FROM messages;")
         try db.exec("BEGIN;")
         let insert = try db.prepare("""
@@ -143,7 +150,10 @@ public final class SearchIndex {
             (mailbox, offset, date, epoch, headers, sender, recipients, subject, body, attachments)
         VALUES (?,?,?,?,?,?,?,?,?,?);
         """)
-        for mailbox in store.allMailboxes() {
+        let mailboxes = store.allMailboxes()
+        let total = mailboxes.count
+        let step = max(1, total / 100)
+        for (i, mailbox) in mailboxes.enumerated() {
             for message in store.loadMessages(at: mailbox.base) {
                 let c = ContentExtractor.extract(message.part)
                 insert.reset()
@@ -158,6 +168,10 @@ public final class SearchIndex {
                 insert.bind(9, c.body)
                 insert.bind(10, c.attachments)
                 try insert.execute()
+            }
+            let done = i + 1
+            if let progress, done == total || done % step == 0 {
+                progress(done, total)
             }
         }
         try db.exec("COMMIT;")
@@ -341,6 +355,13 @@ public final class SearchIndex {
         let prefixEllipsis = startOffset > 0 ? "…" : ""
         let suffixEllipsis = flat.distance(from: startIdx, to: flat.endIndex) > window ? "…" : ""
         return prefixEllipsis + String(slice) + suffixEllipsis
+    }
+
+    /// True if the on-disk table has the current column set. An index written by
+    /// an older build (before `headers`/`epoch` existed) lacks these columns and
+    /// must be rebuilt rather than reused.
+    public func hasCurrentSchema() -> Bool {
+        (try? db.prepare("SELECT headers, epoch FROM messages LIMIT 0;")) != nil
     }
 
     /// Number of indexed messages (mostly for tests/diagnostics).

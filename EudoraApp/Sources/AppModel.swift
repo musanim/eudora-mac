@@ -112,6 +112,13 @@ struct ComposeDraft: Identifiable {
     var references: [String] = []
 }
 
+/// Progress of a background index build, in mailboxes.
+struct IndexProgress: Equatable {
+    var done: Int
+    var total: Int
+    var fraction: Double { total > 0 ? Double(done) / Double(total) : 0 }
+}
+
 // MARK: - App model
 
 @MainActor
@@ -144,12 +151,23 @@ final class AppModel: ObservableObject {
     @Published var searchResults: [SearchHit] = []
     /// Status line for the Find window ("Indexed N messages.", "12 results.", …).
     @Published var searchStatus: String = ""
+    /// True while the search index is (re)building in the background.
+    @Published var isIndexing = false
+    /// Indexing progress, in mailboxes.
+    @Published var indexProgress = IndexProgress(done: 0, total: 0)
 
     private var store: MailStore?
     private var itemsByID: [MailboxItem.ID: MailboxItem] = [:]
 
     /// The full-text index for the open tree (nil until a tree is opened/built).
     private var searchIndex: SearchIndex?
+    /// Bumped on each (re)index; a background build applies its result only if it
+    /// still matches — so a superseded build (e.g. a different tree opened
+    /// meanwhile) is discarded.
+    private var indexGeneration = 0
+    /// Index-file path of the build currently in flight, to avoid launching a
+    /// second concurrent build against the *same* file.
+    private var indexingPath: String?
     /// When opening a search hit into a not-yet-loaded mailbox, the message to
     /// select once that mailbox's listing has been rebuilt (see loadListing()).
     private var pendingMessageID: MessageRow.ID?
@@ -194,11 +212,17 @@ final class AppModel: ObservableObject {
             ? "No descmap.pce found at \(url.lastPathComponent)."
             : "\(url.lastPathComponent) — \(itemsByID.values.filter { !$0.isFolder }.count) mailboxes."
 
-        // Build (or rebuild) the search index for this tree. Synchronous for
-        // now — instant on the fixture. Backgrounding this for a large real
-        // store is a known follow-up (see handoff).
+        // Reuse a completed index for this tree if one exists (instant), else
+        // build it off the main thread with progress.
         searchResults = []
-        if tree.isEmpty { searchIndex = nil; searchStatus = "" } else { buildIndex(for: url) }
+        if tree.isEmpty {
+            indexGeneration += 1        // cancel any in-flight build's result
+            searchIndex = nil
+            searchStatus = ""
+            isIndexing = false
+        } else {
+            openOrBuildIndex(for: url)
+        }
     }
 
     private func indexItems(_ items: [MailboxItem]) {
@@ -697,26 +721,84 @@ final class AppModel: ObservableObject {
         return String(hash, radix: 16)
     }
 
-    /// Build (wipe + rebuild) the index for the given tree.
-    private func buildIndex(for root: URL) {
+    /// On open: reuse a previously completed index for this tree if one is on
+    /// disk (instant), otherwise build it. A finished build is all-or-nothing (a
+    /// single transaction), so a non-empty index with the current schema is a
+    /// complete one. Tools ▸ Rebuild Search Index refreshes after new mail.
+    private func openOrBuildIndex(for root: URL) {
+        if let path = indexURL(for: root)?.path, let reuse = reusableIndex(at: path) {
+            indexGeneration += 1        // supersede any in-flight build's result
+            searchIndex = reuse.index
+            isIndexing = false
+            indexingPath = nil
+            searchStatus = "Search index ready — \(reuse.count) messages (Rebuild to refresh)."
+            return
+        }
+        startIndexing(for: root)
+    }
+
+    /// A ready-to-use existing index at `path`, or nil if none is present, it's
+    /// empty, or it was written by an older schema (→ rebuild).
+    private func reusableIndex(at path: String) -> (index: SearchIndex, count: Int)? {
+        guard FileManager.default.fileExists(atPath: path),
+              let idx = try? SearchIndex(path: path),
+              idx.hasCurrentSchema(),
+              let n = try? idx.count(), n > 0 else { return nil }
+        return (idx, n)
+    }
+
+    /// Build (wipe + rebuild) the index for the given tree on a background task,
+    /// publishing progress. All @Published mutations happen on the main actor
+    /// *after* the current view-update pass (via the enclosing `Task { @MainActor }`
+    /// and the awaited hop back), so this never mutates state mid-render.
+    private func startIndexing(for root: URL) {
         guard let store else { return }
-        do {
-            let path = indexURL(for: root)?.path ?? ":memory:"
-            let idx = try SearchIndex(path: path)
-            try idx.rebuild(from: store)
-            searchIndex = idx
-            searchStatus = "Indexed \(try idx.count()) messages."
-        } catch {
-            searchIndex = nil
-            searchStatus = "Index error: \(error)"
+        let path = indexURL(for: root)?.path ?? ":memory:"
+        // Already building this same index file? Let it finish — don't open a
+        // second writer to the same path.
+        if isIndexing, indexingPath == path { return }
+        indexGeneration += 1
+        let gen = indexGeneration
+        indexingPath = path
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.isIndexing = true
+            self.indexProgress = IndexProgress(done: 0, total: 0)
+            self.searchStatus = "Indexing…"
+            self.searchIndex = nil
+
+            // Heavy work off the main thread; awaiting keeps the UI responsive.
+            let outcome = await Task.detached(priority: .userInitiated) { () -> (SearchIndex?, String) in
+                do {
+                    let idx = try SearchIndex(path: path)
+                    try idx.rebuild(from: store) { done, total in
+                        Task { @MainActor [weak self] in
+                            guard let self, self.indexGeneration == gen else { return }
+                            self.indexProgress = IndexProgress(done: done, total: total)
+                        }
+                    }
+                    return (idx, "Indexed \(try idx.count()) messages.")
+                } catch {
+                    return (nil, "Index error: \(error)")
+                }
+            }.value
+
+            // Apply only if this build wasn't superseded by a newer one.
+            guard self.indexGeneration == gen else { return }
+            self.searchIndex = outcome.0
+            self.searchStatus = outcome.1
+            self.isIndexing = false
+            self.indexingPath = nil
         }
     }
 
-    /// Menu/command "Rebuild Index".
+    /// Menu/command "Rebuild Search Index".
     func rebuildIndex() {
         guard let rootURL else { banner = "Open a Eudora folder first."; return }
-        buildIndex(for: rootURL)
-        banner = searchStatus
+        guard !isIndexing else { banner = "Already indexing…"; return }
+        banner = "Rebuilding search index…"
+        startIndexing(for: rootURL)
     }
 
     /// Run a Find query and publish the hits.

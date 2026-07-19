@@ -121,6 +121,7 @@ struct FindView: View {
             }
             .keyboardShortcut(.defaultAction)
             .buttonStyle(.borderedProminent)
+            .disabled(model.isIndexing)
         }
     }
 

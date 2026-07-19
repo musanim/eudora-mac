@@ -160,10 +160,19 @@ encodings — with labels that often lie. The plan:
 - **Outgoing stays UTF-8** (or ASCII when possible) — the one place we choose
   rather than guess, and already better than Eudora's hardcoded Latin-1.
 
-Status: **[partial]** — the tolerant decoder, UTF-8-mislabel repair, never-fail
-Latin-1 fallback, RFC 2047 B/Q header decoding, and UTF-8 outgoing exist. Full
-IANA coverage, cp1252-preferred fallback, the manual override menu, and RFC 2231
-are **[planned]**.
+Status: **[partial → mostly done, pending Stephen's build/test]** — the tolerant
+decoder, UTF-8-mislabel repair, never-fail Latin-1 fallback, RFC 2047 B/Q header
+decoding, and UTF-8 outgoing already existed. Now added (this session):
+**full IANA coverage** (`encoding(for:)` falls through to
+`CFStringConvertIANACharSetNameToEncoding`, so every OS-known charset —
+ISO-8859-*, Windows-125x, Shift-JIS/EUC-JP/ISO-2022-JP, GB2312/GBK/GB18030, Big5,
+KOI8-R, Mac Roman — decodes), **cp1252-preferred single-byte fallback** (Western
+single-byte/undeclared bodies render via Windows-1252 with Latin-1 as backstop),
+and **RFC 2231 attachment filenames** (`filename*=charset'lang'pct` and
+`filename*0*/filename*1` continuations, via `MIMEPart.paramValue`). New unit
+tests cover each. The only remaining **[planned]** piece is the **per-message
+Text Encoding override menu** (curated common list + Auto, transient per-message,
+surfacing the auto-chosen encoding via `DecodedText.charsetUsed`).
 
 ---
 
@@ -203,8 +212,25 @@ Implementation:
 - Index is an **app-owned sidecar** in `Application Support/Eudora/Indexes/`,
   keyed per-tree by a stable hash of the root path — never inside the Eudora
   folder (consistent with the store's existing stance). Built on open; a manual
-  **Tools ▸ Rebuild Search Index** forces a rebuild. Background/incremental
-  indexing for a large tree is a later refinement.
+  **Tools ▸ Rebuild Search Index** forces a rebuild.
+- **Background indexing [done].** The build runs off the main thread
+  (`Task.detached`) with a live **"Indexing… X of N mailboxes"** progress bar
+  under the menu strip; the window stays responsive and search is disabled until
+  it finishes. A generation token discards a superseded build's result if a
+  different tree is opened mid-index, an `indexingPath` guard + SQLite
+  `busy_timeout` prevent two writers on one index file, and all `@Published`
+  updates are deferred to main-actor hops (which also cleared the "Publishing
+  changes from within view updates" warning). `SearchIndex.rebuild(from:progress:)`
+  reports throttled per-mailbox progress.
+- **Reuse on open [done].** Opening a tree *reuses* a previously completed index
+  if one is on disk (file present, current schema via
+  `SearchIndex.hasCurrentSchema()`, count > 0), so only the first open pays the
+  build cost and later launches are instant. A build is all-or-nothing (single
+  transaction), so an interrupted first build leaves nothing to reuse and
+  restarts — there is no partial-progress resume (deliberately deferred). New
+  mail isn't searchable until a manual **Tools ▸ Rebuild Search Index**. Still a
+  later refinement: **incremental** update on Check Mail / delivery (today any
+  change is a full rebuild) and the FTS5-MATCH query acceleration noted above.
 
 Status: **[done — pending Stephen's build & real-mail testing]** — code written
 and passed two review agents (one compile/API-availability pass, one SQL/logic

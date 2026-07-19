@@ -40,6 +40,80 @@ final class EudoraStoreTests: XCTestCase {
         XCTAssertEqual(listing.rows.count, 2)
         XCTAssertEqual(listing.rows[0].subject, "Hello")   // from TOC cache
         XCTAssertEqual(listing.rows[1].subject, "Cafe")
+        XCTAssertEqual(listing.rows[0].statusGlyph, "R")   // status 2 = replied
+    }
+
+    // MARK: status glyphs (real Eudora summary.h codes)
+
+    func testStatusGlyphsMatchEudoraCodes() throws {
+        // 0 unread, 2 replied, 3 forwarded, 4 redirect, 8 sent.
+        let subjects = ["u", "r", "f", "d", "s"]
+        let (data, recs) = buildMbox(subjects.map {
+            message(from: "a@x.com", subject: $0,
+                    ctype: "text/plain; charset=us-ascii", body: "x")
+        })
+        try data.write(to: mbx("Glyphs"))
+        try writeToc(url: toc("Glyphs"), entries: [
+            tocEntry(recs[0], status: 0, priority: 4, subject: "u"),
+            tocEntry(recs[1], status: 2, priority: 4, subject: "r"),
+            tocEntry(recs[2], status: 3, priority: 4, subject: "f"),
+            tocEntry(recs[3], status: 4, priority: 4, subject: "d"),
+            tocEntry(recs[4], status: 8, priority: 4, subject: "s"),
+        ])
+        let store = MailStore(root: root)
+        let rows = store.list(at: root.appendingPathComponent("Glyphs"), name: "Glyphs")!.rows
+        XCTAssertEqual(rows.map(\.statusGlyph), ["•", "R", "F", "→", "S"])
+    }
+
+    // MARK: deleted-but-not-compacted (.toc lists a subset of the .mbx)
+
+    func testStaleTocHidesDeletedGhosts() throws {
+        // mbx has 3 messages; the .toc lists only #0 and #2 (message #1 deleted
+        // but not compacted). Show those 2 with status; hide the ghost.
+        let (data, recs) = buildMbox([
+            message(from: "a@x.com", subject: "First",
+                    ctype: "text/plain; charset=us-ascii", body: "1"),
+            message(from: "b@x.com", subject: "GhostDeleted",
+                    ctype: "text/plain; charset=us-ascii", body: "2"),
+            message(from: "c@x.com", subject: "Third",
+                    ctype: "text/plain; charset=us-ascii", body: "3"),
+        ])
+        try data.write(to: mbx("Ghosts"))
+        try writeToc(url: toc("Ghosts"), entries: [
+            tocEntry(recs[0], status: 1, priority: 4, subject: "First"),   // READ
+            tocEntry(recs[2], status: 2, priority: 4, subject: "Third"),   // REPLIED
+        ])
+        let store = MailStore(root: root)
+        let listing = store.list(at: root.appendingPathComponent("Ghosts"), name: "Ghosts")!
+        XCTAssertEqual(listing.source, .tocCompacted)
+        XCTAssertEqual(listing.rows.map(\.subject), ["First", "Third"])  // ghost hidden
+        XCTAssertEqual(listing.rows[1].statusGlyph, "R")                 // status preserved
+        XCTAssertEqual(listing.rows[1].index, 3)                         // maps to 3rd mbx msg
+    }
+
+    // MARK: message counts (from .toc size, not an .mbx read)
+
+    func testMessageCountFromTocSize() throws {
+        // Count should come from the .toc's size. Give an .mbx with NO Eudora
+        // separators (a scan would find 0); the count must still be 3 (the .toc).
+        let entries = (0..<3).map {
+            tocEntry(MboxRecord(offset: $0 * 10, length: 10),
+                     status: 1, priority: 4, subject: "s\($0)")
+        }
+        try writeToc(url: toc("Counted"), entries: entries)
+        try Data("not a mailbox".utf8).write(to: mbx("Counted"))
+        let store = MailStore(root: root)
+        XCTAssertEqual(store.messageCount(base: root.appendingPathComponent("Counted")), 3)
+    }
+
+    func testMessageCountScanFallbackNoToc() throws {
+        let (data, _) = buildMbox([
+            message(from: "a@x.com", subject: "a", ctype: "text/plain; charset=us-ascii", body: "1"),
+            message(from: "b@x.com", subject: "b", ctype: "text/plain; charset=us-ascii", body: "2"),
+        ])
+        try data.write(to: mbx("NoToc2"))
+        let store = MailStore(root: root)
+        XCTAssertEqual(store.messageCount(base: root.appendingPathComponent("NoToc2")), 2)
     }
 
     // MARK: scan fallback (no .toc)
@@ -88,6 +162,219 @@ final class EudoraStoreTests: XCTestCase {
         XCTAssertTrue(String(decoding: html.body, as: UTF8.self).contains("<b>html</b>"))
     }
 
+    // MARK: Eudora flattened bodies (<x-html> / <x-flowed>)
+
+    func testEudoraXHtmlBody() {
+        // Eudora keeps a multipart Content-Type header but stores HTML in
+        // <x-html>…</x-html> with no MIME parts. We recover it as a text/html leaf.
+        let raw = [
+            "From: a@b.com",
+            "Subject: Hi",
+            "Content-Type: multipart/alternative; boundary=\"XYZ\"",
+            "",
+            "<x-html>",
+            "<div>Hello &amp; welcome</div>",
+            "</x-html>",
+        ].joined(separator: "\r\n")
+        let part = MIMEParser.parse([UInt8](Data(raw.utf8)))
+        XCTAssertFalse(part.isMultipart)          // recovered as a leaf, not multipart
+        XCTAssertEqual(part.mainType, "text")
+        XCTAssertEqual(part.subType, "html")
+        XCTAssertTrue(String(decoding: part.decodedPayload(), as: UTF8.self)
+            .contains("<div>Hello &amp; welcome</div>"))
+    }
+
+    func testEudoraXFlowedBody() {
+        let raw = [
+            "Subject: p",
+            "Content-Type: text/plain",
+            "",
+            "<x-flowed>",
+            "plain flowed body",
+            "</x-flowed>",
+        ].joined(separator: "\r\n")
+        let part = MIMEParser.parse([UInt8](Data(raw.utf8)))
+        XCTAssertEqual(part.contentType, "text/plain")
+        XCTAssertFalse(part.isMultipart)
+        XCTAssertTrue(String(decoding: part.decodedPayload(), as: UTF8.self)
+            .contains("plain flowed body"))
+    }
+
+    // MARK: real Windows-Eudora descmap format (extensions, S/M/F, .fol dirs)
+
+    func testRealDescmapFormat() throws {
+        // Real descmap: filenames carry the extension, system mailboxes use "S",
+        // folders are ".fol" subdirectories with their own descmap, "Y" = unread.
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("eudora-real-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        // Top-level In.mbx (system inbox), one message.
+        let (inData, _) = buildMbox([
+            message(from: "a@x.com", subject: "Hi",
+                    ctype: "text/plain; charset=us-ascii", body: "hello"),
+        ])
+        try inData.write(to: base.appendingPathComponent("In.mbx"))
+
+        // A ".fol" folder subdirectory with its own descmap + a mailbox.
+        let fol = base.appendingPathComponent("Proj.fol", isDirectory: true)
+        try FileManager.default.createDirectory(at: fol, withIntermediateDirectories: true)
+        let (workData, _) = buildMbox([
+            message(from: "b@x.com", subject: "Task",
+                    ctype: "text/plain; charset=us-ascii", body: "world"),
+        ])
+        try workData.write(to: fol.appendingPathComponent("Work.mbx"))
+        try Data("Work,Work.mbx,M,N\r\n".utf8).write(to: fol.appendingPathComponent("descmap.pce"))
+
+        try Data("In,In.mbx,S,Y\r\nProj,Proj.fol,F,N\r\n".utf8)
+            .write(to: base.appendingPathComponent("descmap.pce"))
+
+        let store = MailStore(root: base)
+        let nodes = store.tree()
+        XCTAssertEqual(nodes.count, 2)
+
+        let inNode = nodes.first { $0.entry.display == "In" }
+        XCTAssertEqual(inNode?.entry.type, .inbox)     // "S" + name "In"
+        XCTAssertEqual(inNode?.messageCount, 1)        // In.mbx was actually found
+        XCTAssertEqual(inNode?.entry.hasUnread, true)  // "Y"
+
+        let proj = nodes.first { $0.entry.display == "Proj" }
+        XCTAssertEqual(proj?.isFolder, true)
+        XCTAssertEqual(proj?.children.count, 1)        // recursed into Proj.fol
+        XCTAssertEqual(proj?.children.first?.messageCount, 1)
+
+        // Listing the inbox now returns the message (was "No messages").
+        XCTAssertEqual(store.list(at: inNode!.base, name: "In")?.rows.count, 1)
+        // System role resolves (Check Mail / delete-to-Trash rely on this).
+        XCTAssertNotNil(store.mailboxBase(ofType: .inbox))
+    }
+
+    // MARK: charset — Windows-1252 preferred for Western single-byte
+
+    func testCP1252Preferred() {
+        // 0x93/0x94 are curly double-quotes in Windows-1252; Latin-1 would show
+        // control chars. Declared iso-8859-1 → we render as cp1252.
+        let raw = Data([0x93, 0x48, 0x69, 0x94])   // "Hi" in curly quotes
+        let d = CharsetDecoder.smartDecode(raw, declared: "iso-8859-1")
+        XCTAssertEqual(d.charsetUsed, "windows-1252")
+        XCTAssertTrue(d.text.contains("\u{201C}"))  // “
+        XCTAssertTrue(d.text.contains("\u{201D}"))  // ”
+    }
+
+    func testPureASCIIStaysClean() {
+        let d = CharsetDecoder.smartDecode(Data("plain".utf8), declared: "us-ascii")
+        XCTAssertEqual(d.text, "plain")
+        XCTAssertEqual(d.note, "")
+    }
+
+    // MARK: charset — full IANA coverage (beyond the fast-path switch)
+
+    func testIANACyrillic() {
+        // Windows-1251 isn't in the fast-path switch; it must resolve via CF.
+        let raw = Data([0xC0, 0xE0])               // А а in Windows-1251
+        let d = CharsetDecoder.smartDecode(raw, declared: "windows-1251")
+        XCTAssertEqual(d.charsetUsed, "windows-1251")
+        XCTAssertTrue(d.text.contains("\u{0410}")) // А
+        XCTAssertTrue(d.text.contains("\u{0430}")) // а
+    }
+
+    func testUnknownCharsetNeverFails() {
+        let d = CharsetDecoder.smartDecode(Data([0x41, 0xE9]), declared: "totally-bogus-xyz")
+        XCTAssertFalse(d.text.isEmpty)             // Latin-1 backstop
+    }
+
+    // MARK: RFC 2231 attachment filenames
+
+    func testRFC2231ExtendedFilename() {
+        let v = MIMEPart.paramValue("filename",
+                                    in: "attachment; filename*=UTF-8''%E2%82%AC%20rate.txt")
+        XCTAssertEqual(v, "€ rate.txt")
+    }
+
+    func testRFC2231Continuation() {
+        let header = "attachment; filename*0*=UTF-8''%E2%82%AC; filename*1=rate.txt"
+        XCTAssertEqual(MIMEPart.paramValue("filename", in: header), "€rate.txt")
+    }
+
+    func testPlainFilenameStillWorks() {
+        XCTAssertEqual(MIMEPart.paramValue("filename", in: "attachment; filename=\"note.txt\""),
+                       "note.txt")
+    }
+
+    // MARK: mutations (move / delete / mark-status) — one message, ghost-aware
+
+    func testMoveAppendsToDestThenRemovesFromSource() throws {
+        let (aData, aRecs) = buildMbox([
+            message(from: "a@x.com", subject: "A1", ctype: "text/plain; charset=us-ascii", body: "1"),
+            message(from: "b@x.com", subject: "A2", ctype: "text/plain; charset=us-ascii", body: "2"),
+        ])
+        try aData.write(to: mbx("A"))
+        try writeToc(url: toc("A"), entries: [
+            tocEntry(aRecs[0], status: 2, priority: 4, subject: "A1"),
+            tocEntry(aRecs[1], status: 3, priority: 4, subject: "A2"),   // forwarded
+        ])
+        let (bData, bRecs) = buildMbox([
+            message(from: "c@x.com", subject: "B1", ctype: "text/plain; charset=us-ascii", body: "3"),
+        ])
+        try bData.write(to: mbx("B"))
+        try writeToc(url: toc("B"), entries: [
+            tocEntry(bRecs[0], status: 1, priority: 4, subject: "B1"),
+        ])
+
+        let store = MailStore(root: root)
+        let aBase = root.appendingPathComponent("A")
+        let bBase = root.appendingPathComponent("B")
+        try MailboxMutator.move(from: aBase, index: 2, to: bBase)
+
+        XCTAssertEqual(store.list(at: aBase, name: "A")!.rows.map(\.subject), ["A1"])
+        let bRows = store.list(at: bBase, name: "B")!.rows
+        XCTAssertEqual(bRows.map(\.subject), ["B1", "A2"])
+        XCTAssertEqual(bRows.last?.statusGlyph, "F")   // forwarded status carried across
+    }
+
+    func testSetStatusUpdatesOneEntry() throws {
+        let (data, recs) = buildMbox([
+            message(from: "a@x.com", subject: "m", ctype: "text/plain; charset=us-ascii", body: "x"),
+            message(from: "b@x.com", subject: "n", ctype: "text/plain; charset=us-ascii", body: "y"),
+        ])
+        try data.write(to: mbx("S1"))
+        try writeToc(url: toc("S1"), entries: [
+            tocEntry(recs[0], status: 1, priority: 4, subject: "m"),   // read
+            tocEntry(recs[1], status: 1, priority: 4, subject: "n"),
+        ])
+        let base = root.appendingPathComponent("S1")
+        try MailboxMutator.setStatus(base: base, index: 1, status: 0)   // → unread
+        let rows = MailStore(root: root).list(at: base, name: "S1")!.rows
+        XCTAssertEqual(rows[0].statusGlyph, "•")   // now unread
+        XCTAssertEqual(rows[1].statusGlyph, " ")   // untouched
+    }
+
+    func testRemoveKeepsTocForGhostyMailbox() throws {
+        // mbx has 3 messages; the .toc lists only #1 and #3 (a ghost at #2).
+        // Deleting the first listed message must keep the .toc (so the survivor
+        // keeps its status) rather than dropping it to a status-less scan.
+        let (data, recs) = buildMbox([
+            message(from: "a@x.com", subject: "First", ctype: "text/plain; charset=us-ascii", body: "1"),
+            message(from: "b@x.com", subject: "Ghost", ctype: "text/plain; charset=us-ascii", body: "2"),
+            message(from: "c@x.com", subject: "Third", ctype: "text/plain; charset=us-ascii", body: "3"),
+        ])
+        try data.write(to: mbx("G2"))
+        try writeToc(url: toc("G2"), entries: [
+            tocEntry(recs[0], status: 1, priority: 4, subject: "First"),
+            tocEntry(recs[2], status: 2, priority: 4, subject: "Third"),   // replied
+        ])
+        let base = root.appendingPathComponent("G2")
+        let store = MailStore(root: root)
+        XCTAssertEqual(store.list(at: base, name: "G2")!.rows.map(\.subject), ["First", "Third"])
+
+        try MailboxMutator.remove(base: base, index: 1)   // delete "First" (mbx pos 1)
+
+        let after = store.list(at: base, name: "G2")!
+        XCTAssertEqual(after.rows.map(\.subject), ["Third"])
+        XCTAssertEqual(after.rows[0].statusGlyph, "R")     // status preserved, not "?"
+    }
+
     // MARK: - fixture construction
 
     private func buildFixture() throws {
@@ -133,7 +420,7 @@ final class EudoraStoreTests: XCTestCase {
 
         // descmap.pce
         let descmap = [
-            "In,In,I,N",
+            "In,In,I,Y",          // Y = has unread
             "Loose,Loose,M,R",
             "Stale,Stale,M,R",
             "MP,MP,M,R",

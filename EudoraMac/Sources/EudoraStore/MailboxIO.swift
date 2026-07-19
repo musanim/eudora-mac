@@ -16,6 +16,32 @@ enum MailboxIO {
         return true
     }
 
+    /// Append `data` to the end of the file at `url` (creating it if absent),
+    /// streaming — without reading the existing (possibly huge) file. O(data).
+    static func appendData(_ data: Data, to url: URL) throws {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else {
+            try data.write(to: url)
+            return
+        }
+        let fh = try FileHandle(forWritingTo: url)
+        defer { try? fh.close() }
+        try fh.seekToEnd()
+        try fh.write(contentsOf: data)
+    }
+
+    /// The final byte of a file (or nil if empty/missing), read without loading
+    /// the whole file — used to decide whether an appended record needs a
+    /// leading CRLF to sit at a line start.
+    static func lastByte(of url: URL) -> UInt8? {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? fh.close() }
+        guard let end = try? fh.seekToEnd(), end > 0,
+              (try? fh.seek(toOffset: end - 1)) != nil,
+              let d = try? fh.read(upToCount: 1) else { return nil }
+        return d.first
+    }
+
     /// Write `data` to `url` via a temp file + atomic replace (or move if the
     /// destination doesn't exist yet).
     static func atomicWrite(_ data: Data, to url: URL) throws {

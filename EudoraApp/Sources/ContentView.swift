@@ -10,6 +10,7 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             MenuBarView()
+            if model.isIndexing { IndexingBar() }
             splitView
         }
     }
@@ -325,6 +326,35 @@ struct AttachmentChip: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help("Save this attachment" + (attachment.isImage ? " or view it" : ""))
+    }
+}
+
+// MARK: - Indexing progress bar
+
+/// A slim bar under the menu strip shown while the search index (re)builds in
+/// the background. Determinate once the mailbox total is known.
+struct IndexingBar: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ProgressView().controlSize(.small)
+            Text(label).font(.caption)
+            if model.indexProgress.total > 0 {
+                ProgressView(value: model.indexProgress.fraction)
+                    .frame(width: 140)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(Color.accentColor.opacity(0.12))
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+    private var label: String {
+        let p = model.indexProgress
+        return p.total > 0 ? "Indexing… \(p.done) of \(p.total) mailboxes" : "Indexing…"
     }
 }
 

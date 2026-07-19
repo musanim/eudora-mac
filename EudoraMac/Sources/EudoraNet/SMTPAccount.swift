@@ -2,7 +2,7 @@ import Foundation
 
 /// Non-secret SMTP account settings (the password lives in the Keychain).
 public struct SMTPAccount: Codable, Equatable, Sendable {
-    public enum Security: String, Codable, CaseIterable, Identifiable {
+    public enum Security: String, Codable, CaseIterable, Identifiable, Sendable {
         case tls        // implicit TLS (SMTPS), typically port 465 — supported now
         case startTLS   // STARTTLS, typically 587 — not yet implemented
         case plain      // no encryption (discouraged)
