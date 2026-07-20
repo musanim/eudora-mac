@@ -58,6 +58,15 @@ struct MessageRow: Identifiable, Hashable, Sendable {
     var date: String        // Eudora-style short date/time
     var hasAttachment: Bool
 
+    /// `date` as an instant, for the Date column's sort. Nil when neither the
+    /// TOC's cached string nor the message's own header could be parsed.
+    ///
+    /// Carried rather than derived on demand because sorting 22,515 rows would
+    /// otherwise re-parse each string ~15 times over, and because the displayed
+    /// string changes format when enrichment lands (see `EudoraDateFormat`) —
+    /// a comparator working from the text would silently change its mind.
+    var sortDate: Date?
+
     /// Size in K, rounded up, minimum 1K — as Eudora showed it.
     var sizeK: String { "\(max(1, (size + 1023) / 1024))K" }
 
@@ -144,7 +153,7 @@ struct ComposeDraft: Identifiable {
 struct RowEnrichment: Sendable {
     let index: Int          // 1-based, matches MessageRow.id
     let who: String
-    let date: String
+    let date: Date?         // nil when the Date header is missing or unparseable
     let hasAttachment: Bool
 }
 
@@ -279,6 +288,11 @@ final class AppModel: ObservableObject {
     /// switch reads as instant even though the new listing is seconds away.
     private func beginMailboxSwitch() {
         cancelBackgroundWork()
+        // Drop the outgoing mailbox's sort with its rows. `rebuildRows` will
+        // adopt the incoming one's before the listing lands; clearing here keeps
+        // "rows are ordered by `sort`" true in the gap between, rather than only
+        // by the accident of the rows being empty.
+        sort = nil
         setRows([])
         preview = nil
         mailboxSummary = ""
@@ -293,7 +307,22 @@ final class AppModel: ObservableObject {
                 })
     }
 
+    /// The message list, **in display order** — `rows[n]` is the nth row on
+    /// screen, sorted or not.
+    ///
+    /// That is load-bearing. The `Table` has no `sortOrder` binding (SwiftUI's
+    /// would only report a desired order back to us anyway, not reorder
+    /// anything), so everything that maps a table row number to a message — the
+    /// right-click menu's `resolveClickedID`, the remembered scroll position —
+    /// indexes straight into this array. Sorting the array itself is what keeps
+    /// those correct for free; presenting a different order in the view while
+    /// leaving this one alone is what would break them.
     @Published var rows: [MessageRow] = []
+
+    /// How `rows` is ordered, or nil for mailbox order. Per mailbox, and
+    /// remembered across launches (see `ViewState.sortByMailbox`).
+    @Published private(set) var sort: MessageSort?
+
     @Published var listingSource: String = ""
     @Published var mailboxSummary: String = ""
     @Published var preview: MessagePreview?
@@ -421,6 +450,9 @@ final class AppModel: ObservableObject {
         selectedMailboxID = nil
         selectedMessageID = nil
         listedMailboxID = nil
+        // Before `setRows`, so the (empty) rows aren't run through a sort
+        // belonging to a mailbox in the tree being closed.
+        sort = nil
         setRows([])
         preview = nil
         status = tree.isEmpty
@@ -534,6 +566,18 @@ final class AppModel: ObservableObject {
 
     /// Called by the bridge once the scroll position has been applied.
     func clearPendingScroll() { pendingScrollTopRow = nil }
+
+    /// A row to bring into view, scrolling the least amount that does it — as
+    /// opposed to `pendingScrollTopRow`, which puts a row *at the top*. Set after
+    /// a re-sort so the selection doesn't vanish; cleared by the bridge.
+    ///
+    /// Unlike a restore, this is not suppressed from the scroll recorder: it
+    /// moves the list the way the user would have, so the position it lands on is
+    /// worth remembering.
+    @Published var pendingRevealRow: Int?
+
+    /// Called by the bridge once the row has been revealed.
+    func clearPendingReveal() { pendingRevealRow = nil }
 
     /// Set when a restored selection should also take keyboard focus, so the
     /// highlight is the active (not washed-out) one and the arrow keys move from
@@ -671,6 +715,10 @@ final class AppModel: ObservableObject {
         guard let store,
               let id = selectedMailboxID,
               let item = itemsByID[id], !item.isFolder else {
+            // No mailbox, so no sort: leaving the last one set would put a stale
+            // indicator on the header and apply that order to whatever is listed
+            // next before its own remembered sort could be adopted.
+            sort = nil
             setRows([])
             listingSource = ""
             mailboxSummary = ""
@@ -683,6 +731,21 @@ final class AppModel: ObservableObject {
         let base = item.base
         let display = item.display
         let outgoing = (item.type == .outbox)
+        // This mailbox's remembered sort, adopted *before* the listing lands so
+        // `setRows` orders it on arrival rather than reordering it a frame later.
+        // Assigned directly rather than through `setSort`, which would try to
+        // re-sort rows belonging to the mailbox being left and write the value
+        // straight back to where it came from.
+        //
+        // PRECONDITION: `rows` is either empty or already belongs to `id`. Every
+        // caller satisfies that today — `loadListing` and `afterRemoval` clear
+        // the rows first, and `markSelected`'s fallback re-lists the mailbox it
+        // is already showing. A new caller that left another mailbox's rows in
+        // place would leave them in one order with `sort` claiming another, and
+        // `rowPositionByID` would still be right, so nothing would look wrong
+        // until a click landed on the wrong message. Clear the rows, or follow
+        // this with `setRows(rows)`.
+        sort = viewState.sortByMailbox[id]
         isListing = true
 
         listingGeneration &+= 1
@@ -735,11 +798,68 @@ final class AppModel: ObservableObject {
     /// disagree. Enrichment looks rows up by message index, which is not the same
     /// as their position (a compacted mailbox has gaps), and rebuilding that map
     /// per batch was 113 × 22,515 dictionary inserts on the main actor.
+    ///
+    /// The current sort is applied here, so there is exactly one place rows can
+    /// enter the model and exactly one place they can be ordered — a caller that
+    /// forgot to sort would leave `rowPositionByID` describing an order the table
+    /// isn't in, which is the bug class this method exists to prevent.
     private func setRows(_ new: [MessageRow]) {
-        rows = new
+        let ordered = MessageSort.apply(sort, to: new)
+        rows = ordered
         rowPositionByID.removeAll(keepingCapacity: true)
-        rowPositionByID.reserveCapacity(new.count)
-        for (pos, row) in new.enumerated() { rowPositionByID[row.id] = pos }
+        rowPositionByID.reserveCapacity(ordered.count)
+        for (pos, row) in ordered.enumerated() { rowPositionByID[row.id] = pos }
+    }
+
+    // MARK: sorting
+
+    /// Sort by a column, reversing if it is already the sorted one — the whole
+    /// behaviour of a header click.
+    func toggleSort(_ column: MessageSortColumn) {
+        if sort?.column == column {
+            setSort(MessageSort(column: column, ascending: !(sort?.ascending ?? true)))
+        } else {
+            // A new column starts ascending, except Date, which starts newest
+            // first: that is the order anyone clicking a date column is asking
+            // for, and it's what Eudora's own descending-by-default date sort did.
+            setSort(MessageSort(column: column, ascending: column != .date))
+        }
+    }
+
+    /// Set the sort (or nil for mailbox order), reorder what's on screen, and
+    /// remember it for this mailbox.
+    func setSort(_ new: MessageSort?) {
+        guard sort != new else { return }
+        sort = new
+        // Re-run the rows through `setRows`, which is where ordering happens.
+        // Sorting an already-sorted array is not a problem: `MessageSort.apply`
+        // computes the order from the rows' own fields, never from their current
+        // positions, so it is idempotent and reversal is exact rather than
+        // cumulative.
+        setRows(rows)
+        keepSelectionVisible()
+
+        guard let mailbox = selectedMailboxID else { return }
+        // Assigning nil removes the key, which is what `sortByMailbox` wants for
+        // "mailbox order" — see ViewState.
+        viewState.sortByMailbox[mailbox] = new
+        if let root = rootURL?.path { ViewStateStore.save(viewState, forRoot: root) }
+    }
+
+    /// After a reorder, bring the selected message back into view.
+    ///
+    /// Reordering leaves the table's scroll offset alone, so the selected row can
+    /// end up thousands of rows away with nothing on screen having visibly moved
+    /// — the list would just look like it had lost the selection.
+    ///
+    /// `pendingRevealRow`, not `pendingScrollTopRow`: the latter means "make this
+    /// the topmost row", which would yank the list even when the selection was
+    /// already comfortably on screen, and would then write that row back as the
+    /// mailbox's remembered scroll position. Revealing scrolls the minimum
+    /// distance and does nothing at all when the row is already visible.
+    private func keepSelectionVisible() {
+        guard let id = selectedMessageID, let pos = rowPositionByID[id] else { return }
+        pendingRevealRow = pos
     }
 
     /// The TOC-only listing. Pure, and runs off the main actor.
@@ -764,7 +884,10 @@ final class AppModel: ObservableObject {
                               // column while the parse catches up.
                               who: r.who,
                               date: r.date,
-                              hasAttachment: false)
+                              hasAttachment: false,
+                              // The TOC's cached string, read as an instant so
+                              // the Date column can sort before the parse lands.
+                              sortDate: EudoraDateFormat.tocDate(r.date))
         }
         let sizeK = max(1, (rows.reduce(0) { $0 + $1.size } + 1023) / 1024)
         return BuiltListing(rows: rows,
@@ -794,7 +917,7 @@ final class AppModel: ObservableObject {
                         batch.append(RowEnrichment(
                             index: index,
                             who: AppModel.correspondent(part, outgoing: outgoing),
-                            date: AppModel.eudoraDate(part.header("Date")) ?? "",
+                            date: EudoraDateFormat.parse(part.header("Date")),
                             // Both forms count: mail Eudora processed has no MIME
                             // attachment left (it detached the bytes to disk and
                             // wrote an "Attachment Converted:" line into the
@@ -821,6 +944,16 @@ final class AppModel: ObservableObject {
             }
             guard let self, self.listingGeneration == generation else { return }
             self.isEnriching = false
+            // Who, Date and the attachment glyph were provisional until now: the
+            // TOC caches the *recipient* as "who" even for incoming mail, and its
+            // date can differ from the message's own. A sort on one of those was
+            // therefore ordering the wrong values, so redo it once — once, at the
+            // end, rather than per batch, which would shuffle the list under the
+            // pointer every 2,000 messages and cost a full table diff each time.
+            if self.sort?.column.dependsOnEnrichment == true {
+                self.setRows(self.rows)
+                self.keepSelectionVisible()
+            }
         }
     }
 
@@ -846,9 +979,13 @@ final class AppModel: ObservableObject {
             var row = rows[pos]
             row.who = e.who
             row.hasAttachment = e.hasAttachment
-            // An unparseable Date header leaves the TOC's value in place, which
-            // is what the synchronous version did too.
-            if !e.date.isEmpty { row.date = e.date }
+            // An unparseable Date header leaves the TOC's value in place — both
+            // the displayed string and the sort key — which is what the
+            // synchronous version did too.
+            if let date = e.date {
+                row.date = EudoraDateFormat.display(date)
+                row.sortDate = date
+            }
             // One write, not three: each mutation through `rows[pos].x` publishes
             // separately, and there are tens of thousands of rows.
             rows[pos] = row
@@ -1171,6 +1308,12 @@ final class AppModel: ObservableObject {
             // every enriched Who and attachment glyph and restart the whole
             // background parse — on Trash, minutes of re-work to change one
             // character.
+            //
+            // Written in place, so the row keeps its position even when the list
+            // is sorted by status. Deliberate: a message jumping away from under
+            // the pointer the instant it is marked read would be worse than a
+            // list momentarily one row out of order, and the order is restored
+            // the next time the mailbox is listed.
             if let pos = rowPositionByID[sel.index], pos < rows.count {
                 let r = rows[pos]
                 rows[pos] = MessageRow(id: r.id,
@@ -1181,7 +1324,8 @@ final class AppModel: ObservableObject {
                                        subject: r.subject,
                                        who: r.who,
                                        date: r.date,
-                                       hasAttachment: r.hasAttachment)
+                                       hasAttachment: r.hasAttachment,
+                                       sortDate: r.sortDate)
                 refreshMailboxSummary()
             } else {
                 // Rows aren't in hand yet (the listing is still running), so

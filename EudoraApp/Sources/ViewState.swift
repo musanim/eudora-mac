@@ -39,6 +39,19 @@ struct ViewState: Codable {
     /// message. The index is clamped to the row count on restore.
     var scrollTopRowByMailbox: [String: Int] = [:]
 
+    /// Per-mailbox sort column and direction; absent means mailbox order.
+    ///
+    /// Per mailbox rather than one setting for the app, because that is how
+    /// Eudora behaved and because the mailboxes genuinely want different orders —
+    /// In by date, a project mailbox by who, Trash however you last went looking
+    /// through it.
+    ///
+    /// Putting a mailbox back to mailbox order *removes* its entry rather than
+    /// storing a null. A dictionary of optionals round-trips through JSON badly
+    /// enough to be worth avoiding, and there is nothing to distinguish: absent
+    /// and explicitly-unsorted list identically.
+    var sortByMailbox: [String: MessageSort] = [:]
+
     init() {}
 
     init(from decoder: Decoder) throws {
@@ -48,6 +61,8 @@ struct ViewState: Codable {
             try c.decodeIfPresent([String: Int].self, forKey: .selectedMessageOffsetByMailbox) ?? [:]
         scrollTopRowByMailbox =
             try c.decodeIfPresent([String: Int].self, forKey: .scrollTopRowByMailbox) ?? [:]
+        sortByMailbox =
+            try c.decodeIfPresent([String: MessageSort].self, forKey: .sortByMailbox) ?? [:]
     }
 }
 

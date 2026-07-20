@@ -76,9 +76,36 @@ struct MenuBarView: View {
             Button("New…") {}.disabled(true)
             Button("New Folder…") {}.disabled(true)
             Divider()
+            sortMenu
+            Divider()
             Button("Rename…") {}.disabled(true)
             Button("Delete…") {}.disabled(true)
         }.menuBarItem()
+    }
+
+    /// The same sorts the column headers offer, plus the way back to mailbox
+    /// order — which a header click can't give, since it only ever toggles
+    /// between the two directions.
+    ///
+    /// Small enough not to care that SwiftUI builds nested menus eagerly: six
+    /// items over no data, unlike the Transfer menu's 2,657 mailboxes.
+    private var sortMenu: some View {
+        Menu("Sort") {
+            ForEach(MessageSortColumn.allCases, id: \.self) { column in
+                Button(label(for: column)) { model.toggleSort(column) }
+            }
+            Divider()
+            Button("Mailbox Order") { model.setSort(nil) }
+                .disabled(model.sort == nil)
+        }
+        .disabled(model.selectedMailboxID == nil)
+    }
+
+    /// A tick and the direction on the active column, since a SwiftUI `Button` in
+    /// a menu has no checked state to set.
+    private func label(for column: MessageSortColumn) -> String {
+        guard let sort = model.sort, sort.column == column else { return column.title }
+        return "✓ \(column.title) \(sort.ascending ? "▲" : "▼")"
     }
 
     private var messageMenu: some View {

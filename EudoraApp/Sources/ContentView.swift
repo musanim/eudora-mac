@@ -413,6 +413,15 @@ final class ImageHeaderCell: NSTableHeaderCell {
     /// `initTextCell:` it can read back nil — which would silently draw nothing.
     private let icons: [NSImage]
 
+    /// Which of the two icons the list is currently sorted by, and which way, or
+    /// nil when the sort is on another column.
+    ///
+    /// AppKit's own `setIndicatorImage(_:in:)` can't help here: it draws one
+    /// indicator per *column*, and these two sortable things share a column (see
+    /// `HeaderIcon`). So the triangle is drawn here, under the icon it belongs to.
+    var sortedIcon: Int?
+    var sortAscending = true
+
     init(icons: [NSImage]) {
         self.icons = icons
         super.init(textCell: "")
@@ -422,7 +431,15 @@ final class ImageHeaderCell: NSTableHeaderCell {
 
     /// `NSCell`'s inherited copy is a shallow, non-retaining one, which would
     /// leave `icons` dangling. Copy explicitly instead.
-    override func copy(with zone: NSZone? = nil) -> Any { ImageHeaderCell(icons: icons) }
+    ///
+    /// The sort state has to be carried across: AppKit draws through a copy on
+    /// some paths, and a copy that lost it would drop the indicator at random.
+    override func copy(with zone: NSZone? = nil) -> Any {
+        let clone = ImageHeaderCell(icons: icons)
+        clone.sortedIcon = sortedIcon
+        clone.sortAscending = sortAscending
+        return clone
+    }
 
     override func draw(withFrame cellFrame: NSRect, in controlView: NSView) {
         drawInterior(withFrame: cellFrame, in: controlView)
@@ -431,11 +448,12 @@ final class ImageHeaderCell: NSTableHeaderCell {
     override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {
         // Lay the icons left to right at their native widths, so they touch.
         var x = cellFrame.minX
-        for icon in icons {
+        for (index, icon) in icons.enumerated() {
+            let slot = NSRect(x: x, y: cellFrame.minY,
+                              width: icon.size.width, height: cellFrame.height)
             let target: NSRect
             if Self.fillsHeader {
-                target = NSRect(x: x, y: cellFrame.minY,
-                                width: icon.size.width, height: cellFrame.height)
+                target = slot
             } else {
                 target = NSRect(x: x, y: cellFrame.midY - icon.size.height / 2,
                                 width: icon.size.width, height: icon.size.height)
@@ -444,8 +462,40 @@ final class ImageHeaderCell: NSTableHeaderCell {
             // it the icons would draw upside down.
             icon.draw(in: target, from: .zero, operation: .sourceOver,
                       fraction: 1, respectFlipped: true, hints: nil)
+            if index == sortedIcon { drawSortIndicator(in: slot) }
             x += icon.size.width
         }
+    }
+
+    /// A small triangle in the bottom-right of one icon's slot, standing in for
+    /// the indicator AppKit would draw if these were separate columns.
+    ///
+    /// Drawn rather than stamped from `NSImage(named: "NSAscendingSortIndicator")`
+    /// because the system art is sized for a text header and, laid over artwork
+    /// only 21 px wide, covers the icon it is meant to annotate.
+    private func drawSortIndicator(in slot: NSRect) {
+        let size: CGFloat = 5
+        let inset: CGFloat = 1.5
+        let right = slot.maxX - inset
+        let left = right - size
+        // NSTableHeaderView is flipped, so minY is the *top* edge: "up" here
+        // means toward minY.
+        let bottom = slot.maxY - inset
+        let top = bottom - size
+
+        let path = NSBezierPath()
+        if sortAscending {
+            path.move(to: NSPoint(x: (left + right) / 2, y: top))
+            path.line(to: NSPoint(x: right, y: bottom))
+            path.line(to: NSPoint(x: left, y: bottom))
+        } else {
+            path.move(to: NSPoint(x: (left + right) / 2, y: bottom))
+            path.line(to: NSPoint(x: right, y: top))
+            path.line(to: NSPoint(x: left, y: top))
+        }
+        path.close()
+        NSColor.secondaryLabelColor.setFill()
+        path.fill()
     }
 
     override func cellSize(forBounds rect: NSRect) -> NSSize {
@@ -570,6 +620,18 @@ struct TableHeaderIconStyler: NSViewRepresentable {
             retry()
             return
         }
+
+        // Before the art guard below, which returns for good if an asset is
+        // missing. Dragging a column to a new position would break more than it
+        // looks: cell content is offset onto its header by *index*
+        // (`tableCell(column:)`) and the header-click sort maps index to sort key
+        // the same way, so a reorder would leave both pointing at the wrong
+        // column — and the pinned widths would then be applied to whatever column
+        // had moved into each slot. Nothing here supports reordering, so it must
+        // not survive a missing icon. `enforce` re-asserts it on every relayout,
+        // since this path only runs when SwiftUI state changes. No `tile()`: the
+        // flag is behavioural, not geometric.
+        if table.allowsColumnReordering { table.allowsColumnReordering = false }
 
         // Note this bails out of the width pinning too, not just the art: a
         // missing asset means the headers can drift from the content on resize,
@@ -782,6 +844,13 @@ struct TableHeaderIconStyler: NSViewRepresentable {
             }
         }
 
+        // Re-asserted here as well as in `apply`, because this is the path the
+        // frame-change observer takes: a relayout that re-enabled column dragging
+        // would otherwise leave it enabled until the next model change. Outside
+        // `geometryChanged` deliberately — it moves nothing, so it must not cause
+        // a `tile()`.
+        if table.allowsColumnReordering { table.allowsColumnReordering = false }
+
         // One re-tile, after every input is final, or none at all. `tile()`
         // recomputes the column origins *and* the header view's frame and marks
         // both for display, so no separate header invalidation is needed.
@@ -837,6 +906,10 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         var scrollRemainder: CGFloat = 0
         /// Bumped per focus attempt, so overlapping attempts don't fight.
         var focusGeneration = 0
+        /// The same, for reveal-after-sort attempts: `updateNSView` runs on any
+        /// published change, so several chains can be in flight, and a stale one
+        /// exhausting its attempts would clear a newer reveal.
+        var revealGeneration = 0
         /// True while we're programmatically scrolling, so the bounds
         /// notification that results isn't recorded as a user scroll.
         var isRestoring = false
@@ -861,7 +934,54 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         DispatchQueue.main.async {
             attach(near: nsView, coordinator: coordinator, attemptsLeft: 5)
             applyPendingScroll(coordinator: coordinator, attemptsLeft: 5)
+            applyPendingReveal(coordinator: coordinator, attemptsLeft: 5)
             applyPendingFocus(coordinator: coordinator, attemptsLeft: 5)
+        }
+    }
+
+    /// Scrolls just far enough to show a row, if the model is asking for one.
+    ///
+    /// Distinct from `applyPendingScroll` in both effect and bookkeeping: that
+    /// one restores a remembered *top* row and suppresses the scroll recorder
+    /// while it does, so the restore can't overwrite what it is restoring. This
+    /// one is a reveal after a re-sort — it moves the list the way the user would
+    /// have, so the resulting position is left to be recorded normally.
+    @MainActor
+    private func applyPendingReveal(coordinator: Coordinator, attemptsLeft: Int) {
+        guard let row = model.pendingRevealRow else { return }
+        // Never during a restore. `applyPendingScroll` runs first in this same
+        // turn and only clears `isRestoring` a turn later, so scrolling now would
+        // both override the restore and have its own bounds notification
+        // swallowed by the recorder — leaving the remembered position describing
+        // somewhere the list isn't. Waiting costs nothing: clearing the pending
+        // scroll republishes, which brings us straight back here.
+        guard model.pendingScrollTopRow == nil, !coordinator.isRestoring else { return }
+
+        coordinator.revealGeneration += 1
+        let generation = coordinator.revealGeneration
+
+        guard let table = coordinator.table, table.numberOfRows > row else {
+            // The reorder has been published but the table hasn't caught up.
+            if attemptsLeft > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    guard coordinator.revealGeneration == generation else { return }
+                    applyPendingReveal(coordinator: coordinator, attemptsLeft: attemptsLeft - 1)
+                }
+            } else {
+                model.clearPendingReveal()
+            }
+            return
+        }
+
+        // One turn later, not now: the row *count* doesn't change across a
+        // re-sort, so the readiness check above passes even when SwiftUI hasn't
+        // committed the reordered rows yet, and scrolling here would reveal the
+        // row that used to be at this position.
+        DispatchQueue.main.async {
+            guard coordinator.revealGeneration == generation,
+                  let table = coordinator.table, table.numberOfRows > row else { return }
+            table.scrollRowToVisible(row)
+            model.clearPendingReveal()
         }
     }
 
@@ -1140,8 +1260,10 @@ struct MessageListView: View {
                     .tableCell(column: 0)
                 }.width(HeaderIcon.leadingColumnWidth)
                 // Explicit content closures rather than the `value:` keypath
-                // form, so the text can carry the offset. Nothing is lost: with
-                // no sortOrder binding, `value:` only supplied the text.
+                // form, so the text can carry the offset. Nothing is lost:
+                // sorting is done on `model.rows` and the header clicks come from
+                // `MessageHeaderSortInstaller`, so this table still has no
+                // `sortOrder` binding and `value:` would supply only the text.
                 // Fixed widths, not flexible: see MessageColumnWidths for why.
                 // Subject alone is left to flex, and nothing's origin depends on
                 // its width because it is last.
@@ -1159,6 +1281,7 @@ struct MessageListView: View {
             // MessageContextMenuInstaller. SwiftUI builds nested menus eagerly,
             // which made every right-click construct all 2,657 mailboxes.
             .background(MessageContextMenuInstaller(model: model))
+            .background(MessageHeaderSortInstaller(model: model))
             .background(TableHeaderIconStyler(icons: HeaderIcon.leadingColumns))
             .background(TableScrollStateSyncer(model: model))
         }
