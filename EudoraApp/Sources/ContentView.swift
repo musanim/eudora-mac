@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import EudoraStore
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
@@ -1155,6 +1157,21 @@ struct PreviewView: View {
                             .padding(12)
                     }
                 }
+                // After the body, where Eudora put them — but *pinned* below it
+                // rather than inline, and outside the web view. Native views keep
+                // them out of reach of the message's own CSS, which could restyle
+                // or hide them inside the WKWebView's document; pinning means a
+                // long message doesn't bury the attachment list off-screen. The
+                // height cap is what stops a message with many attachments from
+                // squeezing the body to nothing.
+                if !p.detached.isEmpty {
+                    Divider()
+                    ScrollView {
+                        DetachedAttachmentBar(items: p.detached)
+                    }
+                    .frame(maxHeight: 120)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
             }
         } else {
             Text("Select a message")
@@ -1223,6 +1240,87 @@ struct AttachmentChip: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help("Save this attachment" + (attachment.isImage ? " or view it" : ""))
+    }
+}
+
+/// The attachments Eudora detached to disk, listed after the body the way
+/// Eudora 7 listed them: a file icon and the filename.
+///
+/// Unlike `AttachmentChip` these have no bytes in the message — the file is out
+/// in the Attachments folder — so the actions differ: **Reveal in Finder** and
+/// **Save a Copy**, plus **View** for images through the existing native viewer.
+/// Never open-in-default-app, per the "dumb client" stance (design-decisions §3):
+/// handing a `.doc` to Word is exactly the message-triggered behaviour that stance
+/// exists to prevent, and it would be no less dangerous for the file having been
+/// unpacked to disk by Eudora years ago.
+///
+/// A file Eudora recorded but that isn't on disk is still listed, greyed and
+/// unclickable, with the recorded Windows path as its tooltip — that path is the
+/// only remaining clue to where it went, and silently dropping the row would
+/// misrepresent the message as having had no attachment.
+struct DetachedAttachmentBar: View {
+    let items: [LocatedAttachment]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            // Keyed by position, not by value: a forwarded message can record the
+            // same file twice, and identical values would collide as IDs.
+            ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                if item.isFound {
+                    Menu {
+                        Button("Reveal in Finder") { DetachedAttachmentActions.reveal(item) }
+                        Button("Save a Copy…") { DetachedAttachmentActions.saveCopy(item) }
+                        if DetachedAttachmentActions.isImage(item) {
+                            Button("View") { DetachedAttachmentActions.viewImage(item) }
+                        }
+                    } label: {
+                        row(item, enabled: true)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help(item.url?.path ?? item.filename)
+                } else {
+                    row(item, enabled: false)
+                        .help("Not found in the Attachments folder. Eudora recorded it as: "
+                                + item.recordedPath)
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func row(_ item: LocatedAttachment, enabled: Bool) -> some View {
+        HStack(spacing: 6) {
+            Image(nsImage: icon(for: item))
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 16, height: 16)
+                .opacity(enabled ? 1 : 0.4)
+            // `.underline` before `.lineLimit`, so this uses `Text`'s own
+            // underline rather than the `View` one that needs macOS 13.
+            Text(item.filename)
+                .underline(enabled)
+                .lineLimit(1)
+                .foregroundStyle(enabled ? Color.accentColor : Color.secondary)
+        }
+        .font(.callout)
+    }
+
+    /// The system's icon for the file, so a .doc looks like a Word document and
+    /// a .pdf like a PDF — as Eudora's own list did. Looked up from the *path*
+    /// for files that exist, and from the extension otherwise, so a missing file
+    /// still gets a plausible icon rather than a blank.
+    private func icon(for item: LocatedAttachment) -> NSImage {
+        if let url = item.url {
+            return NSWorkspace.shared.icon(forFile: url.path)
+        }
+        let ext = (item.filename as NSString).pathExtension
+        if !ext.isEmpty, let type = UTType(filenameExtension: ext) {
+            return NSWorkspace.shared.icon(for: type)
+        }
+        return NSWorkspace.shared.icon(for: .data)
     }
 }
 

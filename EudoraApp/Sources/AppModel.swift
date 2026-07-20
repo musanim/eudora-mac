@@ -73,6 +73,9 @@ struct MessagePreview {
     let content: String          // HTML string when isHTML, else plain text
     let images: [String: EmbeddedImage]  // eudora-image:<id> -> bytes (HTML only)
     let attachments: [MessageAttachment]
+    /// Attachments Eudora detached to disk. Shown after the body, as Eudora did,
+    /// rather than as header chips — their bytes aren't in the message.
+    let detached: [LocatedAttachment]
     let indexSourceNote: String  // shown subtly so we can see toc vs scan
 }
 
@@ -87,11 +90,17 @@ struct MessageAttachment: Identifiable, Hashable {
 
     var fileExtension: String { (filename as NSString).pathExtension.lowercased() }
 
+    /// Extensions the native image viewer can display. One list, shared with
+    /// `DetachedAttachmentActions` — two copies would drift.
+    static let imageExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff",
+        "webp", "heic", "heif", "ico",
+    ]
+
     /// Whether this attachment can open in the existing native image viewer.
     var isImage: Bool {
         if mimeType.lowercased().hasPrefix("image/") { return true }
-        return ["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff",
-                "webp", "heic", "heif", "ico"].contains(fileExtension)
+        return Self.imageExtensions.contains(fileExtension)
     }
 
     /// Human-readable size for the chip.
@@ -564,13 +573,17 @@ final class AppModel: ObservableObject {
             preview = nil
             return
         }
-        preview = Self.render(msg.part, sourceNote: listingSource)
+        preview = Self.render(msg.part,
+                              sourceNote: listingSource,
+                              locator: AttachmentLocator(mailRoot: store.root))
         rememberSelection(messageOffset: msg.record.offset)
     }
 
     /// Choose the best displayable body (prefer text/html, else text/plain),
     /// decode it tolerantly, and collect attachment filenames.
-    static func render(_ part: MIMEPart, sourceNote: String) -> MessagePreview {
+    static func render(_ part: MIMEPart,
+                       sourceNote: String,
+                       locator: AttachmentLocator? = nil) -> MessagePreview {
         let subject = HeaderDecoder.decode(part.header("Subject") ?? "")
         let from = HeaderDecoder.decode(part.header("From") ?? "")
         let to = HeaderDecoder.decode(part.header("To") ?? "")
@@ -597,6 +610,9 @@ final class AppModel: ObservableObject {
             }
         }
 
+        // Eudora's detached attachments: recorded in the body, bytes on disk.
+        let detached = locator?.locateAll(in: part) ?? []
+
         if let h = htmlPart {
             let dec = CharsetDecoder.smartDecode(h.decodedPayload(), declared: h.charset)
             // Turn every <img> into a safe box and collect the embedded-image
@@ -605,7 +621,8 @@ final class AppModel: ObservableObject {
             return MessagePreview(subject: subject, from: from, to: to, date: date,
                                   isHTML: true, content: rendered.html,
                                   images: rendered.images,
-                                  attachments: attachments, indexSourceNote: sourceNote)
+                                  attachments: attachments, detached: detached,
+                                  indexSourceNote: sourceNote)
         }
         let text = textPart.map {
             CharsetDecoder.smartDecode($0.decodedPayload(), declared: $0.charset).text
@@ -613,7 +630,8 @@ final class AppModel: ObservableObject {
         return MessagePreview(subject: subject, from: from, to: to, date: date,
                               isHTML: false, content: text,
                               images: [:],
-                              attachments: attachments, indexSourceNote: sourceNote)
+                              attachments: attachments, detached: detached,
+                              indexSourceNote: sourceNote)
     }
 
     /// Build an attachment descriptor (with decoded bytes) from a MIME part.
