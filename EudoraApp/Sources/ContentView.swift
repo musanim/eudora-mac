@@ -167,51 +167,95 @@ struct MailboxRow: View {
 
 /// The one place the message table's horizontal geometry is decided.
 ///
-/// Two layout systems share this table and neither knows about the other:
-/// AppKit places the column *headers* from `NSTableView.intercellSpacing`, while
-/// SwiftUI places the cell *content* on a grid of its own that assumes AppKit's
-/// default 17 pt spacing whatever we set. Left alone, the columns sit 17 pt
-/// apart with another ~8 pt of SwiftUI cell padding on top — a visible trench
-/// between the status icons and "Who".
+/// Two layout systems share this table: AppKit places the column *headers* from
+/// `NSTableView.intercellSpacing`, and SwiftUI places the cell *content* on a
+/// grid it derives from that same property. They agree — but only as long as
+/// nobody changes the property behind SwiftUI's back.
 ///
-/// So the spacing is zeroed on the AppKit side and the SwiftUI content is drawn
-/// back to where the headers now are: column *i*'s content is displaced by the
-/// spacing it still thinks precedes it (17 × i) plus its own padding.
+/// **Why we no longer zero `intercellSpacing`.** An earlier version set it to 0
+/// to butt the columns up, from an async callback because the `NSTableView`
+/// doesn't exist during SwiftUI's layout pass. By then SwiftUI had already laid
+/// out at the old spacing, so AppKit's headers collapsed and SwiftUI's content
+/// did not, and per-column offsets of −17 × i were added to drag the content
+/// back. That worked at launch and *only* at launch: the first window resize
+/// made SwiftUI relayout, it re-read the now-zero spacing, its grid collapsed
+/// onto AppKit's — and the offsets, no longer cancelling anything, threw every
+/// column 17 × i too far left. Instrumentation caught it directly:
+///
+///     SwiftUI grid at launch    16   78  370  527   (read spacing 17)
+///     SwiftUI grid after resize 16   61  336  476   (read spacing 0)
+///     AppKit headers            10   61  336  476
+///
+/// No constant can be right in both states, so the spacing is now left alone.
+/// Both sides stay on the 17 pt grid, and all that remains is a flat inset
+/// SwiftUI adds inside each cell — 6 pt on the glyph column, 8 pt on the text
+/// columns, the same at launch, after a resize, and at every window width.
+///
+/// The closed-up look is preserved through `MessageColumnWidths` instead: the
+/// widths are chosen so the columns land where zeroing the spacing used to put
+/// them. Those widths are a layout choice and safe to retune; the two insets
+/// below are measured, and changing them means re-measuring.
 ///
 /// The displacement is an `.offset`, not `.padding`: padding would take the
 /// space out of the cell's width and start truncating long subjects, whereas an
 /// offset only moves the drawing.
 ///
-/// **These values are measured, not chosen.** If a future macOS changes
-/// SwiftUI's internal spacing, headers and content drift apart again, linearly
-/// left to right — that symptom means `swiftUISpacing` is stale.
+/// If headers and content ever drift apart again, note *which way*: a constant
+/// error across all columns is one of the insets below, whereas an error growing
+/// linearly left to right means something has started changing the intercell
+/// spacing again, and the history above is the thing to re-read.
 enum MessageTableMetrics {
-    /// What we set AppKit's intercell spacing to. Zero butts the columns up.
-    static let appKitSpacing: CGFloat = 0
-
-    /// The spacing SwiftUI lays cell content out with regardless (macOS 13).
-    static let swiftUISpacing: CGFloat = 17
-
-    /// Extra inset carried by the leading glyph column only.
+    /// SwiftUI's inset inside the leading glyph cell. Measured.
     ///
-    /// Measured, and it applies to that column alone: with it added to the text
-    /// columns as well they landed ~8 pt left of their headers, while the glyph
-    /// column needs it to line up. The likely reason is that the glyph cell is an
-    /// `HStack` of fixed-width frames while the text cells are bare `Text`, and
-    /// SwiftUI treats the two differently.
-    static let leadingGlyphInset: CGFloat = 8
+    /// It differs from the text columns' because that cell is an `HStack` of
+    /// fixed-width frames while the text cells are a bare `Text`, and SwiftUI
+    /// treats the two differently.
+    static let leadingGlyphInset: CGFloat = 6
 
-    /// The text columns' headers sit this far right of where the spacing
-    /// arithmetic alone puts their content — AppKit's own inset on a text header
-    /// cell, which the icon column doesn't have because its header is drawn by
-    /// `ImageHeaderCell` edge to edge. Measured.
-    static let textHeaderInset: CGFloat = 2
+    /// SwiftUI's inset inside a text cell. Measured.
+    static let textCellInset: CGFloat = 8
 
     /// How far left column `index`'s content must be drawn to meet its header.
     static func contentOffset(column index: Int) -> CGFloat {
-        let spacing = (swiftUISpacing - appKitSpacing) * CGFloat(index)
-        if index == 0 { return -(spacing + leadingGlyphInset) }
-        return -spacing + textHeaderInset
+        index == 0 ? -leadingGlyphInset : -textCellInset
+    }
+}
+
+/// The message list's column widths, as a single table both sides read from.
+///
+/// **Why these are fixed rather than flexible.** SwiftUI's `Table` and the
+/// `NSTableView` backing it each negotiate flexible column widths *separately*,
+/// and they do not arrive at the same answer: instrumentation showed AppKit's
+/// columns 73 pt short of filling the table at launch but only 20 pt short after
+/// a window resize, while SwiftUI's content grid filled the width throughout.
+/// Headers are drawn from AppKit's widths and content from SwiftUI's, so the two
+/// drifted apart by an amount that *changed when the window was resized* — the
+/// symptom being one misalignment at launch and a different one afterwards.
+///
+/// No constant in `MessageTableMetrics` can fix that, because there is no single
+/// error to cancel. Pinning the widths removes the negotiation instead: a column's
+/// origin depends only on the widths *before* it, so with every column but the
+/// last one fixed, both grids compute identical origins in every state. Only the
+/// trailing column is left flexible, and nothing's origin depends on its width.
+///
+/// `TableHeaderIconStyler.enforce` pins the same numbers on the AppKit side. The
+/// two must agree, or the sides will overwrite each other on every layout pass.
+///
+/// **Why these particular numbers.** With the 17 pt intercell spacing left in
+/// place (see `MessageTableMetrics`), each column starts 17 pt further right than
+/// it would have with the spacing zeroed. These widths give that back, so Date
+/// and Subject land at 336 and 476 — exactly where the old zeroed-spacing layout
+/// put them. Who alone starts ~11 pt further right, because the only way to
+/// recover that last gap would be to shrink the glyph column below its 45 pt of
+/// artwork. Retune freely: unlike the metrics, these are taste, not measurement.
+enum MessageColumnWidths {
+    static let who: CGFloat = 247
+    static let date: CGFloat = 123
+
+    /// Per column, in `TableColumn` order; `nil` means "let it flex".
+    /// Only the trailing column may be `nil`.
+    static var pinned: [CGFloat?] {
+        [HeaderIcon.leadingColumnWidth, who, date, nil]
     }
 }
 
@@ -231,10 +275,12 @@ extension View {
 /// Both icons live in a *single* table column, and that's deliberate.
 ///
 /// As separate columns they were pushed apart by the table's 17 pt intercell
-/// spacing, and that spacing can't be reduced: SwiftUI positions cell content on
-/// a grid that assumes the default value, so changing it slides every header out
-/// of line with its content, cumulatively, left to right. Drawing the icons out
-/// into the gap doesn't work either — AppKit clips the header cell to its frame.
+/// spacing, and that spacing can't be reduced: SwiftUI derives its cell grid from
+/// that property but only re-reads it on a relayout, so changing it slides every
+/// header out of line with its content, cumulatively, left to right, until
+/// something forces SwiftUI to catch up (see `MessageTableMetrics`). Drawing the
+/// icons out into the gap doesn't work either — AppKit clips the header cell to
+/// its frame.
 ///
 /// One column sidesteps all of it. There is no gap *within* a column, so the two
 /// icons sit flush against each other in the header and the two glyphs line up
@@ -339,6 +385,10 @@ final class ImageHeaderCell: NSTableHeaderCell {
 /// backing view also biases toward the adjacent table.
 enum MessageTableFinder {
     /// Minimum columns to be the message table rather than the sidebar.
+    ///
+    /// The table has four; three is deliberate slack, so that adding or removing
+    /// a column doesn't silently stop the table being found — which would show up
+    /// as blank headers and drifting columns rather than as an obvious failure.
     static let columnsAtLeast = 3
 
     static func table(near view: NSView) -> NSTableView? {
@@ -361,8 +411,9 @@ enum MessageTableFinder {
     }
 }
 
-/// Installs `ImageHeaderCell` on the leading columns of the `Table` it is
-/// attached to (as a `.background`).
+/// Installs `ImageHeaderCell` on the leading column of the `Table` it is attached
+/// to (as a `.background`), and pins the fixed column widths on the AppKit side
+/// so they can't drift from the ones SwiftUI was given.
 ///
 /// This is deliberate SwiftUI-to-AppKit reach-through: from the backing view we
 /// find the enclosing window's `NSTableView` and replace the header cells. It is
@@ -371,48 +422,278 @@ enum MessageTableFinder {
 struct TableHeaderIconStyler: NSViewRepresentable {
     let icons: [HeaderIcon]
 
+    /// `@unchecked Sendable` for the same reason as `TableScrollStateSyncer`'s:
+    /// the frame-change block below is `@Sendable` and captures this, but every
+    /// access is on the main thread and the compiler can't see that through
+    /// `addObserver`'s queue argument.
+    final class Coordinator: @unchecked Sendable {
+        weak var table: NSTableView?
+        var observer: NSObjectProtocol?
+        /// The resolved header art, kept so the frame-change block can re-assert
+        /// the geometry without reaching back into the (non-`Sendable`) struct.
+        var art: [NSImage] = []
+
+        deinit {
+            if let observer = observer { NotificationCenter.default.removeObserver(observer) }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
 
     func updateNSView(_ nsView: NSView, context: Context) {
+        let coordinator = context.coordinator
         // The table doesn't exist yet during this pass of layout, so apply once
         // SwiftUI has committed the hierarchy — and retry a few times, since the
         // backing view can be in the tree before the Table's NSTableView is.
-        DispatchQueue.main.async { apply(near: nsView, attemptsLeft: 5) }
+        // The budget is generous because `openDefaultIfAvailable` blocks the main
+        // thread for several seconds at launch, and the table isn't there until
+        // it returns. The retries are chained rather than scheduled up front, so
+        // 20 attempts is ~4 s of real waiting; it stops as soon as it succeeds,
+        // so the ceiling only costs anything in the case where it was needed.
+        DispatchQueue.main.async {
+            apply(near: nsView, coordinator: coordinator, attemptsLeft: 20)
+        }
     }
 
-    private func apply(near view: NSView, attemptsLeft: Int) {
-        let found = MessageTableFinder.table(near: view)
-        if found == nil, attemptsLeft > 0 {
+    // Deliberately not `@MainActor`: it is only ever called from `DispatchQueue
+    // .main`, but annotating it makes those non-isolated closures illegal call
+    // sites. Left nonisolated, as the rest of this file's AppKit reach-through is.
+    private func apply(near view: NSView, coordinator: Coordinator, attemptsLeft: Int) {
+        func retry() {
+            guard attemptsLeft > 0 else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                apply(near: view, attemptsLeft: attemptsLeft - 1)
+                apply(near: view, coordinator: coordinator, attemptsLeft: attemptsLeft - 1)
             }
+        }
+
+        guard let table = MessageTableFinder.table(near: view) else {
+            retry()
             return
         }
-        guard let table = found else { return }
 
-        // Close up the columns. AppKit lays the *headers* out from this property,
-        // but SwiftUI positions cell content on its own grid that still assumes
-        // the default spacing — so zeroing this alone slides every header 17 pt
-        // per column left of its content. `MessageTableMetrics` cancels that on
-        // the SwiftUI side; the two must be changed together.
-        table.intercellSpacing = NSSize(width: MessageTableMetrics.appKitSpacing,
-                                        height: table.intercellSpacing.height)
-        let art = icons.compactMap(\.nsImage)
-        guard !art.isEmpty, let column = table.tableColumns.first else { return }
-
-        if !(column.headerCell is ImageHeaderCell) {
-            column.headerCell = ImageHeaderCell(icons: art)
+        // A table that hasn't been sized yet would tile its flexible columns over
+        // nothing, and the first window resize would then redistribute them
+        // differently — which looks exactly like a stale metric but isn't. Wait
+        // for a real width. (The splash hides the main window with `alphaValue`
+        // rather than `orderOut`, so the window is on screen at full size the
+        // whole time; a zero width here is SwiftUI not having sized the table
+        // yet, not the splash.)
+        guard table.bounds.width > 1 else {
+            retry()
+            return
         }
-        // Pin the width so AppKit can't resize the art away. This must agree with
-        // the SwiftUI `.width(HeaderIcon.leadingColumnWidth)` on the same column —
-        // both are the summed icon widths — or the two sides will overwrite each
-        // other on every layout pass.
-        let width = art.reduce(0) { $0 + $1.size.width }
-        column.minWidth = width
-        column.maxWidth = width
-        column.width = width
-        column.resizingMask = []
-        table.headerView?.needsDisplay = true
+
+        // Note this bails out of the width pinning too, not just the art: a
+        // missing asset means the headers can drift from the content on resize,
+        // rather than merely leaving the header blank. Deliberate — and it
+        // doesn't `retry()`, because an asset that failed to load won't appear on
+        // a later attempt.
+        let art = icons.compactMap(\.nsImage)
+        guard !art.isEmpty else { return }
+
+        let previousTable = coordinator.table
+        coordinator.table = table
+        coordinator.art = art
+        Self.enforce(table: table, art: art)
+        // The listing takes 6-7 s to build behind the splash, so a dump taken now
+        // would measure an empty table; this one lands after the rows exist.
+        // Costs nothing when `diagnoseGeometry` is off.
+        if Self.diagnoseGeometry {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                Self.dump(table: table, stage: "launch + 10s, rows loaded")
+            }
+        }
+
+        // Re-assert on every relayout, not just on `updateNSView`, which runs only
+        // when SwiftUI *state* changes — and resizing the window changes no state.
+        // Without this, anything AppKit resets during a relayout (notably the
+        // pinned column widths) would stay reset until the next model change.
+        //
+        // `enforce` is idempotent and only tiles when it actually changed
+        // something, so the `tile()` it does can't feed itself a second frame
+        // change.
+        //
+        // A rebuilt Table means a *new* NSTableView, and an observer registered
+        // against the old one never fires again — which would look exactly like
+        // this bug returning, but only after switching mailboxes. So re-register
+        // on a swap rather than returning early on a token pointed at nothing.
+        if previousTable !== table, let observer = coordinator.observer {
+            NotificationCenter.default.removeObserver(observer)
+            coordinator.observer = nil
+        }
+        guard coordinator.observer == nil else { return }
+
+        // The enclosing scroll view rather than the table itself: its frame
+        // changes on every window or split resize just the same, but `tile()`
+        // cannot change it, so this hook can't feed itself the way observing the
+        // table's own frame can. The flag is additive — several observers may
+        // want it, so it is only ever turned on, never off in teardown.
+        let source: NSView = table.enclosingScrollView ?? table
+        source.postsFrameChangedNotifications = true
+        // Captures the coordinator weakly: it owns the token and the token owns
+        // this block, so a strong capture would be a cycle and the observer would
+        // outlive every teardown of the Table (which happens whenever a mailbox
+        // lists empty), accumulating one per rebuild.
+        coordinator.observer = NotificationCenter.default.addObserver(
+            forName: NSView.frameDidChangeNotification,
+            object: source,
+            queue: .main
+        ) { [weak coordinator] _ in
+            guard let coordinator = coordinator, let table = coordinator.table else { return }
+            Self.dump(table: table, stage: "frame change")
+            Self.enforce(table: table, art: coordinator.art)
+            // Again on the next runloop turn, in case SwiftUI resets the column
+            // widths *after* this notification within the same layout pass — we
+            // can't order ourselves against its internal relayout. `enforce`
+            // no-ops when nothing has drifted, so the second pass is almost free.
+            DispatchQueue.main.async {
+                guard let table = coordinator.table else { return }
+                Self.enforce(table: table, art: coordinator.art)
+                Self.dump(table: table, stage: "after resize, settled")
+            }
+        }
+    }
+
+    /// Instrumentation for the header/content alignment work. Flip
+    /// `diagnoseGeometry` to true to re-enable it.
+    ///
+    /// Kept rather than deleted because the alignment has now needed measuring
+    /// twice, and pixel-measuring a screenshot cannot distinguish "AppKit moved
+    /// the header" from "SwiftUI moved the content" — which was exactly the
+    /// distinction that finally identified the bug. The `drew` lines are the
+    /// valuable part: they report where SwiftUI actually placed each cell, which
+    /// no AppKit query will tell you.
+    ///
+    /// The number that matters is **header − cell** on each column: that is the
+    /// gap `MessageTableMetrics` is trying to cancel. If it is identical at launch
+    /// and after a resize, the remaining error is a constant to be dialled out. If
+    /// it differs, something is still moving and no constant can fix both states.
+    static let diagnoseGeometry = false
+
+    private static func dump(table: NSTableView, stage: String) {
+        guard diagnoseGeometry else { return }
+        func f(_ v: CGFloat) -> String { String(format: "%.1f", v) }
+
+        var lines = ["[geometry] \(stage)",
+                     "  table.bounds.width \(f(table.bounds.width))"
+                        + "  intercellSpacing \(f(table.intercellSpacing.width))"
+                        + "  scale \(f(table.window?.backingScaleFactor ?? 0))"]
+        for index in table.tableColumns.indices {
+            let cell = table.rect(ofColumn: index)
+            let header = table.headerView?.headerRect(ofColumn: index) ?? .zero
+            let title = table.tableColumns[index].title
+            lines.append("  col \(index) \(title.isEmpty ? "(icons)" : title)"
+                            + "  width \(f(table.tableColumns[index].width))"
+                            + "  cell.x \(f(cell.minX))"
+                            + "  header.x \(f(header.minX))"
+                            + "  header-cell \(f(header.minX - cell.minX))"
+                            + "  swiftUIOffset \(f(MessageTableMetrics.contentOffset(column: index)))")
+        }
+        // Where SwiftUI actually *drew* the first row's content, as opposed to
+        // where AppKit's column rects say it should be. This is the measurement
+        // the AppKit numbers above cannot give: `Table` positions its cell views
+        // on its own grid, so a drift between the two shows up here and nowhere
+        // else. Compare `drew.x` against the matching `cell.x` — the difference,
+        // minus that column's `swiftUIOffset`, is the raw error to cancel.
+        // Walk the table's own view tree rather than asking for row 0 via
+        // `rowView(atRow:makeIfNecessary:)`: that returned nil every time, so
+        // SwiftUI's outline view either reports no rows or doesn't vend them
+        // through that API. The real views are in the hierarchy regardless.
+        lines.append("  numberOfRows \(table.numberOfRows)"
+                        + "  subviews \(table.subviews.count)")
+        // No filtering by position: the table is flipped *and* scrolled, so the
+        // visible rows are nowhere near y = 0. AppKit recycles row views, so the
+        // whole tree is only a few dozen nodes and can just be dumped.
+        var emitted = 0
+        func walk(_ view: NSView, depth: Int) {
+            for sub in view.subviews where sub.frame.width > 1 && sub.frame.height > 1 {
+                guard emitted < 60 else { return }
+                emitted += 1
+                let box = sub.convert(sub.bounds, to: table)
+                lines.append("  drew"
+                                + String(repeating: ">", count: depth)
+                                + " \(type(of: sub))"
+                                + "  x \(f(box.minX))  w \(f(box.width))"
+                                + "  y \(f(box.minY))")
+                if depth < 4 { walk(sub, depth: depth + 1) }
+            }
+        }
+        walk(table, depth: 0)
+        if emitted == 0 { lines.append("  (no subviews with a drawable size)") }
+
+        print(lines.joined(separator: "\n"))
+    }
+
+    /// Pins the fixed column widths on the AppKit side, and puts the art in the
+    /// leading header.
+    ///
+    /// The widths must match the ones SwiftUI was given in `MessageColumnWidths`
+    /// exactly. Headers are drawn from AppKit's widths and content from SwiftUI's,
+    /// so any disagreement shows up as misalignment that changes with the window
+    /// width. Note this does *not* touch `intercellSpacing` — see
+    /// `MessageTableMetrics` for why that would reintroduce the original bug.
+    ///
+    /// Every write is guarded on the *live AppKit value* rather than a stored
+    /// "already applied" flag, which is what makes this safe to call from a frame
+    /// -change notification: it is a no-op unless something has actually drifted,
+    /// so it neither thrashes layout nor retriggers its own notification. Reading
+    /// the table itself also means a rebuilt `Table`, or anything that resets
+    /// these behind our back, is picked up rather than latched off forever.
+    private static func enforce(table: NSTableView, art: [NSImage]) {
+        // AppKit rounds and clamps these, so exact equality can read "changed"
+        // forever — which would tile on every notification, post another frame
+        // change, and loop at low grade for as long as the app is open. Half a
+        // point is far below anything visible.
+        func differs(_ a: CGFloat, _ b: CGFloat) -> Bool { abs(a - b) > 0.5 }
+
+        // `intercellSpacing` is deliberately NOT touched here — see
+        // MessageTableMetrics. Writing it from this async callback is what caused
+        // the launch-vs-resize misalignment, because SwiftUI has already laid out
+        // by the time this runs and only re-reads the property on its next
+        // relayout. Leave it alone and both sides stay on the same grid.
+        var geometryChanged = false
+
+        // An `if`, not a `guard ... else { return }`: returning here would skip
+        // the tile below.
+        if let column = table.tableColumns.first, !(column.headerCell is ImageHeaderCell) {
+            column.headerCell = ImageHeaderCell(icons: art)
+            geometryChanged = true
+        }
+
+        // Pin every fixed column to the same width SwiftUI was given, so the two
+        // grids can't negotiate different answers and drift apart. Each column's
+        // origin depends only on the widths before it, so pinning all but the
+        // trailing one is enough to fix every origin. A `nil` entry is a column
+        // deliberately left flexible; extra columns beyond the table are ignored,
+        // so the two can be edited independently without crashing.
+        for (index, target) in MessageColumnWidths.pinned.enumerated() {
+            guard let target = target, index < table.tableColumns.count else { continue }
+            let column = table.tableColumns[index]
+            if differs(column.minWidth, target) || differs(column.maxWidth, target)
+                || differs(column.width, target) {
+                // Raise the ceiling before the floor, so `minWidth` never briefly
+                // exceeds `maxWidth`.
+                column.maxWidth = .greatestFiniteMagnitude
+                column.minWidth = target
+                column.maxWidth = target
+                column.width = target
+                geometryChanged = true
+            }
+            if !column.resizingMask.isEmpty {
+                column.resizingMask = []
+                geometryChanged = true
+            }
+        }
+
+        // One re-tile, after every input is final, or none at all. `tile()`
+        // recomputes the column origins *and* the header view's frame and marks
+        // both for display, so no separate header invalidation is needed.
+        if geometryChanged {
+            table.tile()
+            table.headerView?.needsDisplay = true
+        }
     }
 }
 
@@ -752,12 +1033,15 @@ struct MessageListView: View {
                 // Explicit content closures rather than the `value:` keypath
                 // form, so the text can carry the offset. Nothing is lost: with
                 // no sortOrder binding, `value:` only supplied the text.
+                // Fixed widths, not flexible: see MessageColumnWidths for why.
+                // Subject alone is left to flex, and nothing's origin depends on
+                // its width because it is last.
                 TableColumn("Who") { r in
                     Text(r.who).tableCell(column: 1)
-                }
+                }.width(MessageColumnWidths.who)
                 TableColumn("Date") { r in
                     Text(r.date).tableCell(column: 2)
-                }.width(min: 110, ideal: 132)
+                }.width(MessageColumnWidths.date)
                 TableColumn("Subject") { r in
                     Text(r.subject).tableCell(column: 3)
                 }
