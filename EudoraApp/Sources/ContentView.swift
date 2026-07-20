@@ -51,12 +51,13 @@ struct ContentView: View {
                 }.disabled(!hasSelection)
 
                 Menu {
-                    ForEach(model.moveTargets) { t in
-                        Button(t.display) { model.moveSelected(to: t.id) }
+                    MoveToMenuItems(items: model.tree,
+                                    excluding: model.selectedMailboxID) {
+                        model.moveSelected(to: $0)
                     }
                 } label: {
                     Label("Move", systemImage: "tray.and.arrow.up")
-                }.disabled(!hasSelection || model.moveTargets.isEmpty)
+                }.disabled(!hasSelection || !model.hasMoveTargets)
 
                 Button { model.deleteSelected() } label: {
                     Label("Delete", systemImage: "trash")
@@ -1114,8 +1115,10 @@ struct MessageListView: View {
                     Button("Mark as Read") { model.selectedMessageID = id; model.markSelected(read: true) }
                     Button("Mark as Unread") { model.selectedMessageID = id; model.markSelected(read: false) }
                     Menu("Move to") {
-                        ForEach(model.moveTargets) { t in
-                            Button(t.display) { model.selectedMessageID = id; model.moveSelected(to: t.id) }
+                        MoveToMenuItems(items: model.tree,
+                                        excluding: model.selectedMailboxID) { dest in
+                            model.selectedMessageID = id
+                            model.moveSelected(to: dest)
                         }
                     }
                     Divider()

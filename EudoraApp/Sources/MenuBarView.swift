@@ -110,13 +110,14 @@ struct MenuBarView: View {
 
     private var transferMenu: some View {
         Menu("Transfer") {
-            if model.moveTargets.isEmpty {
+            if !model.hasMoveTargets {
                 Button("No other mailboxes") {}.disabled(true)
             } else {
-                ForEach(model.moveTargets) { t in
-                    Button(t.display) { model.moveSelected(to: t.id) }
-                        .disabled(!model.canActOnMessage)
+                MoveToMenuItems(items: model.tree,
+                                excluding: model.selectedMailboxID) {
+                    model.moveSelected(to: $0)
                 }
+                .disabled(!model.canActOnMessage)
             }
         }.menuBarItem()
     }

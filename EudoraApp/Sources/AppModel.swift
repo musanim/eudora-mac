@@ -779,12 +779,16 @@ final class AppModel: ObservableObject {
         return (item, idx)
     }
 
-    /// Non-folder mailboxes other than the current one — move destinations.
-    var moveTargets: [MailboxItem] {
+    /// Whether anywhere exists to move a message to.
+    ///
+    /// Only the yes/no is needed — the menus themselves walk `tree` so they can
+    /// mirror the sidebar's hierarchy (see `MoveToMenuItems`). This used to build
+    /// and alphabetically sort every mailbox in the tree just to ask whether the
+    /// result was empty, which on a real folder is 2,657 items re-sorted every
+    /// time a toolbar button re-evaluated `disabled`.
+    var hasMoveTargets: Bool {
         let current = selectedMailboxID
-        return itemsByID.values
-            .filter { !$0.isFolder && $0.id != current }
-            .sorted { $0.display.localizedCaseInsensitiveCompare($1.display) == .orderedAscending }
+        return itemsByID.values.contains { !$0.isFolder && $0.id != current }
     }
 
     var canActOnMessage: Bool { currentSelection() != nil }
