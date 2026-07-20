@@ -113,10 +113,11 @@ struct MenuBarView: View {
             if !model.hasMoveTargets {
                 Button("No other mailboxes") {}.disabled(true)
             } else {
-                MoveToMenuItems(items: model.tree,
-                                excluding: model.selectedMailboxID) {
+                MoveToMenuContent(tree: model.tree,
+                                  treeVersion: model.treeVersion) {
                     model.moveSelected(to: $0)
                 }
+                .equatable()
                 .disabled(!model.canActOnMessage)
             }
         }.menuBarItem()

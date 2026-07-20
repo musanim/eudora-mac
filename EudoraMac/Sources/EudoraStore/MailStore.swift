@@ -218,6 +218,32 @@ public struct MailStore: Sendable {
     }
 
     /// All messages in a mailbox (read once, parsed), 1-based index.
+    /// Parse each message in turn, handing it to `body`, which returns false to
+    /// stop early.
+    ///
+    /// Preferred over `loadMessages(at:)` for anything that only needs to *look*
+    /// at each message: it holds one `MIMEPart` at a time instead of one per
+    /// message, which on a mailbox like the 613 MB / 22,515-message Trash is the
+    /// difference between a bounded working set and parsing the lot into memory.
+    /// Stopping early also makes it cancellable.
+    /// `isCancelled` is consulted before each expensive step as well as between
+    /// messages. That matters because the read and the record scan happen *before*
+    /// the first callback and are O(file): without a hook here, abandoning a
+    /// 613 MB mailbox still costs the full read, and several could overlap.
+    public func forEachMessage(at base: URL,
+                               isCancelled: () -> Bool = { false },
+                               body: (_ index: Int, _ record: MboxRecord, _ part: MIMEPart) -> Bool) {
+        if isCancelled() { return }
+        guard let data = try? Data(contentsOf: mbxURL(base)) else { return }
+        if isCancelled() { return }
+        let bytes = [UInt8](data)
+        let records = Mbox.findRecords(bytes)
+        if isCancelled() { return }
+        for (i, rec) in records.enumerated() {
+            if !body(i + 1, rec, MIMEParser.parse(Mbox.messageBytes(bytes, rec))) { return }
+        }
+    }
+
     public func loadMessages(at base: URL) -> [(index: Int, record: MboxRecord, part: MIMEPart)] {
         guard let data = try? Data(contentsOf: mbxURL(base)) else { return [] }
         let bytes = [UInt8](data)

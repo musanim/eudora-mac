@@ -51,10 +51,11 @@ struct ContentView: View {
                 }.disabled(!hasSelection)
 
                 Menu {
-                    MoveToMenuItems(items: model.tree,
-                                    excluding: model.selectedMailboxID) {
+                    MoveToMenuContent(tree: model.tree,
+                                      treeVersion: model.treeVersion) {
                         model.moveSelected(to: $0)
                     }
+                    .equatable()
                 } label: {
                     Label("Move", systemImage: "tray.and.arrow.up")
                 }.disabled(!hasSelection || !model.hasMoveTargets)
@@ -135,12 +136,49 @@ struct SidebarView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(selection: model.mailboxSelection) {
-                    OutlineGroup(model.tree, children: \.children) { item in
-                        MailboxRow(item: item)
-                            .tag(item.id)
-                    }
-                }
+                MailboxTree(tree: model.tree,
+                            treeVersion: model.treeVersion,
+                            selected: model.selectedMailboxID,
+                            selection: model.mailboxSelection)
+                    .equatable()
+            }
+        }
+    }
+}
+
+/// The mailbox tree, deliberately insulated from the rest of the model.
+///
+/// `SidebarView` observes `AppModel` through `@EnvironmentObject`, which means
+/// *any* published change — a row arriving, a preview rendering, a banner
+/// appearing — invalidates it and rebuilds this `OutlineGroup` over every
+/// mailbox in the tree. On a real Eudora folder that is 2,723 nodes, and it was
+/// costing ~0.7 s of main-thread render on **every** state change: the reason a
+/// click took a perceptible moment to blank the message list even when both
+/// mailboxes held a single message.
+///
+/// Taking the tree as plain values and declaring `Equatable` lets SwiftUI skip
+/// the rebuild entirely unless something this view actually shows has changed.
+/// Equality is on `treeVersion` rather than the tree itself: comparing 2,723
+/// nested structs on every render would just move the cost around.
+///
+/// `selected` is compared even though the `List` reads selection through the
+/// binding, because a *programmatic* selection change (restoring at launch,
+/// opening a search hit) must still be able to move the highlight.
+struct MailboxTree: View, Equatable {
+    let tree: [MailboxItem]
+    let treeVersion: Int
+    let selected: MailboxItem.ID?
+    let selection: Binding<MailboxItem.ID?>
+
+    static func == (a: MailboxTree, b: MailboxTree) -> Bool {
+        a.treeVersion == b.treeVersion && a.selected == b.selected
+    }
+
+    var body: some View {
+        List(selection: selection) {
+            OutlineGroup(tree, children: \.children) { item in
+                MailboxRow(item: item)
+                    .tag(item.id)
             }
         }
     }
@@ -155,6 +193,7 @@ struct MailboxRow: View {
                 .foregroundStyle(item.isFolder ? .secondary : .primary)
                 .frame(width: 18)
             Text(item.display)
+                .font(EudoraFont.list)
                 .fontWeight(item.hasUnread ? .semibold : .regular)
             Spacer()
             if !item.isFolder && item.messageCount > 0 {
@@ -709,6 +748,15 @@ struct TableHeaderIconStyler: NSViewRepresentable {
             geometryChanged = true
         }
 
+        // Headers are `NSTableHeaderCell`s drawn by AppKit, not SwiftUI text, so
+        // they don't inherit the font set on the cells and have to be told.
+        // Guarded like everything else here: this runs on every relayout.
+        for column in table.tableColumns.dropFirst()
+        where column.headerCell.font != EudoraFont.listNSFont {
+            column.headerCell.font = EudoraFont.listNSFont
+            geometryChanged = true
+        }
+
         // Pin every fixed column to the same width SwiftUI was given, so the two
         // grids can't negotiate different answers and drift apart. Each column's
         // origin depends only on the widths before it, so pinning all but the
@@ -1076,7 +1124,7 @@ struct MessageListView: View {
                                              width: HeaderIcon.status.width)
                             } else if !r.statusGlyph.trimmingCharacters(in: .whitespaces).isEmpty {
                                 Text(r.statusGlyph)
-                                    .font(.system(.body, design: .monospaced))
+                                    .font(EudoraFont.list)
                                     .frame(width: HeaderIcon.status.width,
                                            height: RowIcon.height)
                             } else {
@@ -1098,33 +1146,19 @@ struct MessageListView: View {
                 // Subject alone is left to flex, and nothing's origin depends on
                 // its width because it is last.
                 TableColumn("Who") { r in
-                    Text(r.who).tableCell(column: 1)
+                    Text(r.who).font(EudoraFont.list).tableCell(column: 1)
                 }.width(MessageColumnWidths.who)
                 TableColumn("Date") { r in
-                    Text(r.date).tableCell(column: 2)
+                    Text(r.date).font(EudoraFont.list).tableCell(column: 2)
                 }.width(MessageColumnWidths.date)
                 TableColumn("Subject") { r in
-                    Text(r.subject).tableCell(column: 3)
+                    Text(r.subject).font(EudoraFont.list).tableCell(column: 3)
                 }
             }
-            .contextMenu(forSelectionType: MessageRow.ID.self) { ids in
-                if let id = ids.first {
-                    Button("Reply") { model.selectedMessageID = id; model.reply(all: false) }
-                    Button("Forward") { model.selectedMessageID = id; model.forward() }
-                    Divider()
-                    Button("Mark as Read") { model.selectedMessageID = id; model.markSelected(read: true) }
-                    Button("Mark as Unread") { model.selectedMessageID = id; model.markSelected(read: false) }
-                    Menu("Move to") {
-                        MoveToMenuItems(items: model.tree,
-                                        excluding: model.selectedMailboxID) { dest in
-                            model.selectedMessageID = id
-                            model.moveSelected(to: dest)
-                        }
-                    }
-                    Divider()
-                    Button("Delete") { model.selectedMessageID = id; model.deleteSelected() }
-                }
-            }
+            // The right-click menu is AppKit, not `.contextMenu` — see
+            // MessageContextMenuInstaller. SwiftUI builds nested menus eagerly,
+            // which made every right-click construct all 2,657 mailboxes.
+            .background(MessageContextMenuInstaller(model: model))
             .background(TableHeaderIconStyler(icons: HeaderIcon.leadingColumns))
             .background(TableScrollStateSyncer(model: model))
         }

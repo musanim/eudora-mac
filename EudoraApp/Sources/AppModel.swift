@@ -43,16 +43,20 @@ struct MailboxItem: Identifiable, Hashable {
 /// parse can give us on this fixture: the real correspondent (the TOC "to"
 /// field caches the recipient for every incoming message) and whether the
 /// message carries an attachment.
-struct MessageRow: Identifiable, Hashable {
+struct MessageRow: Identifiable, Hashable, Sendable {
     let id: Int             // 1-based message index within the mailbox
     let statusGlyph: String
     let priority: Int       // Eudora: 1=highest … 4=normal … 7=lowest; 0=unknown
-    let hasAttachment: Bool
     let label: String       // color-label placeholder (not parsed yet)
-    let who: String         // From for incoming, To for outgoing (display name)
-    let date: String        // Eudora-style short date/time
     let size: Int
     let subject: String
+
+    // Filled in by the background pass — see `RowEnrichment`. The rows appear
+    // immediately from the TOC, which knows all of these approximately, and they
+    // settle to the message's own values as the parse catches up.
+    var who: String         // From for incoming, To for outgoing (display name)
+    var date: String        // Eudora-style short date/time
+    var hasAttachment: Bool
 
     /// Size in K, rounded up, minimum 1K — as Eudora showed it.
     var sizeK: String { "\(max(1, (size + 1023) / 1024))K" }
@@ -64,7 +68,12 @@ struct MessageRow: Identifiable, Hashable {
 }
 
 /// The rendered preview of a single message.
-struct MessagePreview {
+///
+/// `Sendable` because rendering happens off the main actor now — a message is
+/// parsed and rendered on a background task, and only this finished value
+/// crosses back. The `MIMEPart` never does: it's a class, and it stays inside
+/// the task that made it.
+struct MessagePreview: Sendable {
     let subject: String
     let from: String
     let to: String
@@ -82,7 +91,7 @@ struct MessagePreview {
 /// One attached file whose bytes are present in the message. Carried so the
 /// preview can offer **Save As…** (and, for images, View) — never auto-opened,
 /// per the "dumb client" stance (design-decisions §3).
-struct MessageAttachment: Identifiable, Hashable {
+struct MessageAttachment: Identifiable, Hashable, Sendable {
     let id: String            // stable within one rendered message, e.g. "eu-att-1"
     let filename: String      // sanitized display / save name
     let mimeType: String
@@ -126,6 +135,91 @@ struct ComposeDraft: Identifiable {
     var references: [String] = []
 }
 
+/// What parsing a message adds to the row the TOC already gave us.
+///
+/// The TOC caches status, date, subject and size, so a listing can be shown from
+/// it alone. It does *not* record who the message is actually from (its "to"
+/// field caches the recipient even for incoming mail) and knows nothing about
+/// attachments, so those two need the message itself.
+struct RowEnrichment: Sendable {
+    let index: Int          // 1-based, matches MessageRow.id
+    let who: String
+    let date: String
+    let hasAttachment: Bool
+}
+
+/// A finished render, ready to hand back to the main actor.
+struct RenderedMessage: Sendable {
+    let preview: MessagePreview
+    let offset: Int         // byte offset, for remembering the selection
+}
+
+/// A listing built off the main actor, before enrichment.
+struct BuiltListing: Sendable {
+    let rows: [MessageRow]
+    let source: String
+    let summary: String
+}
+
+/// How many messages one enrichment batch covers.
+///
+/// Each batch costs one full SwiftUI `Table` diff, and Trash has 22,515 rows, so
+/// this trades granularity against render cost: 2,000 gives ~11 visible steps
+/// there instead of ~113 re-renders. Small mailboxes finish in a single batch.
+///
+/// Top-level rather than a static on `AppModel`, because that class is
+/// `@MainActor` and its static stored properties are isolated with it — which
+/// the background parse could not then read.
+let enrichBatchSize = 2_000
+
+/// How long a selection must hold still before anything is read from disk —
+/// used by both the mailbox listing and the message preview. Long enough to skip
+/// everything an arrow-key repeat passes over, short enough to feel immediate
+/// when you stop.
+let selectionSettleDelay: UInt64 = 150_000_000  // 150 ms
+
+/// Timestamped marks for performance work. Off by default.
+///
+/// Kept rather than deleted: this is how the mailbox-switch latency was chased,
+/// and parts 2 and 3 of the performance work will want it again. Set `enabled`
+/// to true to use it.
+///
+/// Lines are buffered and printed three seconds after the last mark, never
+/// inline. `print()` to Xcode's console goes through LLDB's stdout pipe, which
+/// is slow enough to distort the very timings being measured — logging must not
+/// sit inside the measurement.
+///
+/// **A caution learned the hard way.** In-app instrumentation kept reporting
+/// "main thread idle, nothing happening" while the app was plainly stalling: a
+/// `CFRunLoopObserver` at order 0 fires *before* CoreAnimation's commit (order
+/// 2000000), which is where AppKit and SwiftUI actually lay out and draw, so it
+/// measured every turn as ~0 ms. `sample $(pgrep -x Eudora) 10 -file out.txt`
+/// found the real cause — a toolbar menu building 2,657 items — in one shot.
+/// Reach for the OS sampler before writing more counters.
+enum PerfLog {
+    static var enabled = false
+
+    private static let start = DispatchTime.now()
+    private static var last: UInt64 = DispatchTime.now().uptimeNanoseconds
+    private static var buffer: [String] = []
+    private static var flushTimer: Timer?
+
+    static func mark(_ label: String) {
+        guard enabled else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        let sinceLast = Double(now &- last) / 1_000_000
+        let sinceStart = Double(now &- start.uptimeNanoseconds) / 1_000_000
+        last = now
+        buffer.append(String(format: "[perf] %8.1f ms  (+%7.1f)  %@",
+                             sinceStart, sinceLast, label))
+        flushTimer?.invalidate()
+        flushTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { _ in
+            for line in buffer { print(line) }
+            buffer.removeAll()
+        }
+    }
+}
+
 /// Progress of a background index build, in mailboxes.
 struct IndexProgress: Equatable {
     var done: Int
@@ -139,6 +233,11 @@ struct IndexProgress: Equatable {
 final class AppModel: ObservableObject {
     @Published var rootURL: URL?
     @Published var tree: [MailboxItem] = []
+
+    /// Bumped whenever `tree` is replaced. The sidebar compares this instead of
+    /// the tree itself — see `MailboxTree` — because a structural comparison of
+    /// 2,723 nested items on every render would cost as much as it saves.
+    @Published private(set) var treeVersion = 0
     @Published var status: String = "No Eudora folder open."
 
     // Selected mailbox (sidebar) and message (table), by their ids. Reactions
@@ -157,8 +256,34 @@ final class AppModel: ObservableObject {
     var mailboxSelection: Binding<MailboxItem.ID?> {
         Binding(get: { [weak self] in self?.selectedMailboxID },
                 set: { [weak self] new in
-                    DispatchQueue.main.async { self?.selectedMailboxID = new }
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        PerfLog.mark("sidebar selection -> \(new ?? "nil")")
+                        // Blank here rather than waiting for `loadListing`, which
+                        // is two runloop hops away (this one, then `onChange`'s).
+                        // More importantly this stops the enrichment *now*: each
+                        // of its batches re-diffs the whole table on the main
+                        // actor, and a click arriving mid-batch waits behind it.
+                        // Only for a real switch. The List also writes nil
+                        // through this binding while reconciling against a
+                        // freshly replaced tree (see `rememberSelection`), and
+                        // treating that as a switch would blank the list and
+                        // cancel live work for no reason.
+                        if let new, new != self.selectedMailboxID { self.beginMailboxSwitch() }
+                        self.selectedMailboxID = new
+                    }
                 })
+    }
+
+    /// Abandon the outgoing mailbox's work and clear what's on screen, so the
+    /// switch reads as instant even though the new listing is seconds away.
+    private func beginMailboxSwitch() {
+        cancelBackgroundWork()
+        setRows([])
+        preview = nil
+        mailboxSummary = ""
+        listingSource = ""
+        PerfLog.mark("cleared for switch")
     }
 
     var messageSelection: Binding<MessageRow.ID?> {
@@ -172,6 +297,30 @@ final class AppModel: ObservableObject {
     @Published var listingSource: String = ""
     @Published var mailboxSummary: String = ""
     @Published var preview: MessagePreview?
+
+    /// True while the mailbox's rows are being built (reading and scanning the
+    /// .mbx, which is O(file)).
+    @Published private(set) var isListing = false
+    /// True while the background parse is still filling in Who, Date and the
+    /// attachment glyph. The rows are usable throughout.
+    @Published private(set) var isEnriching = false
+    /// True between selecting a message and its preview being ready.
+    @Published private(set) var isLoadingPreview = false
+
+    // In-flight background work, cancelled whenever it is superseded. Selection
+    // must stay instant no matter how slow the mailbox is, so nothing that
+    // touches the disk runs on the main actor any more.
+    private var listingTask: Task<Void, Never>?
+    private var enrichTask: Task<Void, Never>?
+    private var previewTask: Task<Void, Never>?
+
+    /// Bumped per listing. Late work checks it before touching anything, which is
+    /// sturdier than comparing `selectedMailboxID` — the sidebar's deferred
+    /// binding writes nil through that transiently while reconciling.
+    private var listingGeneration = 0
+
+    /// Message index → position in `rows`, maintained by `setRows`.
+    private var rowPositionByID: [Int: Int] = [:]
 
     /// Non-nil while a compose sheet is open.
     @Published var composing: ComposeDraft?
@@ -259,12 +408,20 @@ final class AppModel: ObservableObject {
         rootURL = url
         let nodes = s.tree()
         tree = Self.buildItems(nodes, prefix: "")
+        treeVersion &+= 1
         itemsByID = [:]
         indexItems(tree)
+        // Abandon anything still running against the *previous* tree. Without
+        // this, a listing already in flight resumes, finds its generation still
+        // current, and installs the old tree's rows into the new one — then runs
+        // its completion, which persists the wrong selection and takes the splash
+        // down over a message list that belongs to a folder we just closed.
+        cancelBackgroundWork()
+
         selectedMailboxID = nil
         selectedMessageID = nil
         listedMailboxID = nil
-        rows = []
+        setRows([])
         preview = nil
         status = tree.isEmpty
             ? "No descmap.pce found at \(url.lastPathComponent)."
@@ -296,12 +453,10 @@ final class AppModel: ObservableObject {
         guard let saved = viewState.selectedMailbox,
               let item = itemsByID[saved], !item.isFolder else { return }
 
-        // Resolve the remembered byte offset to today's index, exactly as
-        // openHit does for a search hit. nil means that message is gone.
-        if let offset = viewState.selectedMessageOffsetByMailbox[saved] {
-            pendingMessageID = store?.indexOfRecord(at: item.base, offset: offset)
-        }
-        pendingListFocus = (pendingMessageID != nil)
+        let savedOffset = viewState.selectedMessageOffsetByMailbox[saved]
+        // `pendingListFocus` is set once the rows exist, not here: the focus
+        // helper retries for about a second and then gives up, and the listing
+        // can now take longer than that to arrive.
         selectedMailboxID = saved
         // Keep the splash up past the end of open(): the listing is built on the
         // next runloop turn, and revealing the window before then shows an empty
@@ -315,13 +470,31 @@ final class AppModel: ObservableObject {
         // already showing (say "In" in both trees), onChange sees no change and
         // never fires — leaving an empty list under a selected mailbox and a
         // pendingMessageID that leaks into whatever the user clicks next.
-        DispatchQueue.main.async { [weak self] in
-            self?.loadListing()
-            // One more turn so SwiftUI draws the rows just built, then reveal.
-            DispatchQueue.main.async {
-                self?.splashHeldForRestore = false
-                SplashWindow.hide()
-            }
+        // Resolving the remembered byte offset to today's index means reading and
+        // scanning the whole .mbx — the very thing this change moved off the main
+        // thread, and at launch it lands on whichever mailbox was last open. Do
+        // it in the background, then list. nil means that message is gone.
+        let base = item.base
+        let mailStore = store
+        Task { [weak self] in
+            let resolved: Int? = await Task.detached(priority: .userInitiated) {
+                savedOffset.flatMap { mailStore?.indexOfRecord(at: base, offset: $0) }
+            }.value
+            guard let self else { return }
+            self.pendingMessageID = resolved
+            self.loadListing()
+        }
+
+        // The splash comes down when the rows land (from `loadListing`'s
+        // completion), not a runloop turn later: the listing is no longer built
+        // synchronously, so revealing on a fixed delay would show exactly the
+        // empty message list this is here to hide. The timeout is the backstop —
+        // a mailbox that fails to list must not strand the splash on screen
+        // forever, which would look like a hang with no window at all.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self, self.splashHeldForRestore else { return }
+            self.splashHeldForRestore = false
+            SplashWindow.hide()
         }
     }
 
@@ -425,93 +598,267 @@ final class AppModel: ObservableObject {
         guard force || listedMailboxID != selectedMailboxID || pendingMessageID != nil else {
             return
         }
+        PerfLog.mark("loadListing begins")
         listedMailboxID = selectedMailboxID
         preview = nil
-        if let pending = pendingMessageID {
-            pendingMessageID = nil
-            rebuildRows()
-            // The index may no longer exist — a restored selection can outlive
-            // the messages it pointed at (deleted, or a mailbox that shrank).
-            if rows.contains(where: { $0.id == pending }) {
-                selectedMessageID = pending
-                // Render directly: onChange(selectedMessageID) won't fire if
-                // `pending` equals the previously selected index (e.g. row 2 →
-                // row 2 in another mailbox), which would leave the preview blank.
-                loadMessage()
-            } else {
-                selectedMessageID = nil
-            }
-        } else {
-            selectedMessageID = nil
-            rebuildRows()
-        }
-        rememberSelection()
+        previewTask?.cancel()
+        isLoadingPreview = false
 
-        // Hand the remembered scroll position to the AppKit bridge, clamped to
-        // what this mailbox now holds.
-        if let mailbox = selectedMailboxID,
-           let top = viewState.scrollTopRowByMailbox[mailbox], !rows.isEmpty {
-            pendingScrollTopRow = min(top, rows.count - 1)
-        } else {
-            pendingScrollTopRow = nil
+        let pending = pendingMessageID
+        pendingMessageID = nil
+        selectedMessageID = nil
+        // Clear immediately: the old mailbox's rows must not linger under the
+        // new mailbox's name while the listing is built.
+        setRows([])
+
+        // Everything that depends on the rows now has to wait for them — the
+        // listing is built off the main actor and lands later.
+        rebuildRows { [weak self] in
+            guard let self else { return }
+            if let pending {
+                // The index may no longer exist — a restored selection can
+                // outlive the messages it pointed at (deleted, or a mailbox that
+                // shrank).
+                if self.rows.contains(where: { $0.id == pending }) {
+                    self.selectedMessageID = pending
+                    // Ask for keyboard focus now the rows are real. Asking in
+                    // restoreSelection would start the retry clock before the
+                    // listing existed, and it expires after about a second.
+                    self.pendingListFocus = true
+                    // Render directly: onChange(selectedMessageID) won't fire if
+                    // `pending` equals the previously selected index (e.g. row 2
+                    // → row 2 in another mailbox), which would leave the preview
+                    // blank.
+                    self.loadMessage()
+                } else {
+                    self.selectedMessageID = nil
+                }
+            }
+            self.rememberSelection()
+
+            // Hand the remembered scroll position to the AppKit bridge, clamped
+            // to what this mailbox now holds.
+            if let mailbox = self.selectedMailboxID,
+               let top = self.viewState.scrollTopRowByMailbox[mailbox], !self.rows.isEmpty {
+                self.pendingScrollTopRow = min(top, self.rows.count - 1)
+            } else {
+                self.pendingScrollTopRow = nil
+            }
+
+            // Rows are on screen; it is safe to uncover the window.
+            if self.splashHeldForRestore {
+                self.splashHeldForRestore = false
+                SplashWindow.hide()
+            }
         }
     }
 
     /// Rebuild the row list for the current mailbox WITHOUT clearing the message
     /// selection (used after an in-place change like mark-as-read).
-    private func rebuildRows() {
+    ///
+    /// Two phases, because the mailbox has to appear before it can be complete.
+    /// The TOC alone gives status, date, subject and size, so the list is built
+    /// and shown from that; the correspondent and the attachment glyph need the
+    /// messages themselves, and arrive afterwards (see `startEnrichment`).
+    ///
+    /// Both phases run off the main actor. Reading and record-scanning a mailbox
+    /// is O(file), and Trash here is 613 MB — this used to block the main thread
+    /// for seconds, *and* parse all 22,515 messages before drawing a single row.
+    private func rebuildRows(completion: (() -> Void)? = nil) {
+        listingTask?.cancel()
+        enrichTask?.cancel()
+
         guard let store,
               let id = selectedMailboxID,
-              let item = itemsByID[id], !item.isFolder,
-              let listing = store.list(at: item.base, name: item.display) else {
-            rows = []
+              let item = itemsByID[id], !item.isFolder else {
+            setRows([])
             listingSource = ""
             mailboxSummary = ""
+            isListing = false
+            isEnriching = false
+            completion?()
             return
         }
 
-        // Parse the messages once so Who and the attachment glyph reflect the
-        // real message, not the TOC's cached recipient. Fixture-small; a real
-        // store would push this onto a background queue.
-        let parts = Dictionary(uniqueKeysWithValues:
-            store.loadMessages(at: item.base).map { ($0.index, $0.part) })
+        let base = item.base
+        let display = item.display
         let outgoing = (item.type == .outbox)
+        isListing = true
 
+        listingGeneration &+= 1
+        let generation = listingGeneration
+
+        listingTask = Task { [weak self] in
+            // Settle first, for the same reason the preview does — and here it
+            // matters more. Arrowing down the sidebar fires one of these per
+            // keypress, each a detached read of a whole .mbx that cannot be
+            // interrupted once it has begun. Without this, holding a key would
+            // stack up overlapping 613 MB reads.
+            try? await Task.sleep(nanoseconds: selectionSettleDelay)
+            guard !Task.isCancelled else { return }
+            PerfLog.mark("settled, starting read of \(display)")
+
+            let built = await Task.detached(priority: .userInitiated) { () -> BuiltListing? in
+                AppModel.buildListing(store: store, base: base, display: display)
+            }.value
+            PerfLog.mark("read+scan done: \(built?.rows.count ?? 0) rows")
+
+            guard !Task.isCancelled, let self, self.listingGeneration == generation else { return }
+            self.setRows(built?.rows ?? [])
+            PerfLog.mark("rows published")
+            self.listingSource = built?.source ?? ""
+            self.mailboxSummary = built?.summary ?? ""
+            self.isListing = false
+            self.isEnriching = false
+            completion?()
+            if built != nil {
+                self.startEnrichment(store: store, base: base,
+                                     outgoing: outgoing, generation: generation)
+            }
+        }
+    }
+
+    /// Stop every background task and invalidate anything still in flight, so a
+    /// late result can't install itself. Bumping the generation is what makes the
+    /// already-suspended tasks stand down when they resume.
+    private func cancelBackgroundWork() {
+        listingTask?.cancel();  listingTask = nil
+        enrichTask?.cancel();   enrichTask = nil
+        previewTask?.cancel();  previewTask = nil
+        listingGeneration &+= 1
+        isListing = false
+        isEnriching = false
+        isLoadingPreview = false
+    }
+
+    /// Replace the rows and the id→position index together, so the two can never
+    /// disagree. Enrichment looks rows up by message index, which is not the same
+    /// as their position (a compacted mailbox has gaps), and rebuilding that map
+    /// per batch was 113 × 22,515 dictionary inserts on the main actor.
+    private func setRows(_ new: [MessageRow]) {
+        rows = new
+        rowPositionByID.removeAll(keepingCapacity: true)
+        rowPositionByID.reserveCapacity(new.count)
+        for (pos, row) in new.enumerated() { rowPositionByID[row.id] = pos }
+    }
+
+    /// The TOC-only listing. Pure, and runs off the main actor.
+    nonisolated private static func buildListing(store: MailStore,
+                                                 base: URL,
+                                                 display: String) -> BuiltListing? {
+        guard let listing = store.list(at: base, name: display) else { return nil }
         var unread = 0
-        rows = listing.rows.map { r in
-            let part = parts[r.index]
-            let who = part.map { Self.correspondent($0, outgoing: outgoing) } ?? r.who
-            // Both forms count. Mail Eudora processed has no MIME attachment
-            // left — it detached the bytes to disk and wrote an "Attachment
-            // Converted:" line into the body — while mail it never touched, and
-            // everything outgoing, still carries real MIME parts.
-            let hasAtt = part.map { message in
-                message.walk().contains(where: { $0.isAttachment })
-                    || DetachedAttachment.isPresent(in: message)
-            } ?? false
-            let date = part.flatMap { Self.eudoraDate($0.header("Date")) } ?? r.date
+        let rows = listing.rows.map { r -> MessageRow in
             if r.statusGlyph == MailStore.unreadGlyph { unread += 1 }
             return MessageRow(id: r.index,
                               statusGlyph: r.statusGlyph,
                               priority: Int(r.priority) ?? 0,
-                              hasAttachment: hasAtt,
                               label: "",
-                              who: who,
-                              date: date,
                               size: r.size,
-                              subject: r.subject)
+                              subject: r.subject,
+                              // The TOC's own values, until the parse lands.
+                              // `who` is right for outgoing mail and often wrong
+                              // for incoming (the TOC caches the recipient
+                              // either way) — but it is what Eudora itself shows
+                              // from that cache, and far better than a blank
+                              // column while the parse catches up.
+                              who: r.who,
+                              date: r.date,
+                              hasAttachment: false)
         }
-        listingSource = listing.source.rawValue
+        let sizeK = max(1, (rows.reduce(0) { $0 + $1.size } + 1023) / 1024)
+        return BuiltListing(rows: rows,
+                            source: listing.source.rawValue,
+                            summary: "\(rows.count) messages"
+                                + (unread > 0 ? ", \(unread) unread" : "")
+                                + " · \(sizeK)K")
+    }
+
+    /// Parse the mailbox in the background and fill in Who and the attachment
+    /// glyph, applying results in batches so the list settles progressively
+    /// rather than in one jump at the end.
+    private func startEnrichment(store: MailStore, base: URL,
+                                 outgoing: Bool, generation: Int) {
+        isEnriching = true
+
+        enrichTask = Task { [weak self] in
+            // Unbounded on purpose: a buffering policy would silently *drop*
+            // batches, and a dropped batch means rows left un-enriched with
+            // nothing to notice it. The buffer is bounded by the mailbox anyway.
+            let stream = AsyncStream<[RowEnrichment]> { continuation in
+                let work = Task.detached(priority: .utility) {
+                    var batch: [RowEnrichment] = []
+                    store.forEachMessage(at: base, isCancelled: { Task.isCancelled }) { index, _, part in
+                        if Task.isCancelled { return false }
+                        // Argument order follows RowEnrichment's declaration.
+                        batch.append(RowEnrichment(
+                            index: index,
+                            who: AppModel.correspondent(part, outgoing: outgoing),
+                            date: AppModel.eudoraDate(part.header("Date")) ?? "",
+                            // Both forms count: mail Eudora processed has no MIME
+                            // attachment left (it detached the bytes to disk and
+                            // wrote an "Attachment Converted:" line into the
+                            // body), while mail it never touched, and everything
+                            // outgoing, still carries real MIME parts.
+                            hasAttachment: part.walk().contains(where: { $0.isAttachment })
+                                || DetachedAttachment.isPresent(in: part)))
+                        if batch.count >= enrichBatchSize {
+                            continuation.yield(batch)
+                            batch = []
+                        }
+                        return true
+                    }
+                    if !batch.isEmpty { continuation.yield(batch) }
+                    continuation.finish()
+                }
+                continuation.onTermination = { _ in work.cancel() }
+            }
+
+            for await batch in stream {
+                guard !Task.isCancelled, let self,
+                      self.listingGeneration == generation else { return }
+                self.applyEnrichment(batch)
+            }
+            guard let self, self.listingGeneration == generation else { return }
+            self.isEnriching = false
+        }
+    }
+
+    /// Recompute the "N messages, M unread · sizeK" line from the rows in hand.
+    /// Cheap, and avoids a re-list just because one status changed.
+    private func refreshMailboxSummary() {
+        let unread = rows.reduce(0) { $0 + ($1.isUnread ? 1 : 0) }
         let sizeK = max(1, (rows.reduce(0) { $0 + $1.size } + 1023) / 1024)
         mailboxSummary = "\(rows.count) messages"
             + (unread > 0 ? ", \(unread) unread" : "")
             + " · \(sizeK)K"
     }
 
+    private func applyEnrichment(_ batch: [RowEnrichment]) {
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        defer {
+            let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000
+            PerfLog.mark(String(format: "enrich batch of %d applied in %.1f ms",
+                                batch.count, ms))
+        }
+        for e in batch {
+            guard let pos = rowPositionByID[e.index], pos < rows.count else { continue }
+            var row = rows[pos]
+            row.who = e.who
+            row.hasAttachment = e.hasAttachment
+            // An unparseable Date header leaves the TOC's value in place, which
+            // is what the synchronous version did too.
+            if !e.date.isEmpty { row.date = e.date }
+            // One write, not three: each mutation through `rows[pos].x` publishes
+            // separately, and there are tens of thousands of rows.
+            rows[pos] = row
+        }
+    }
+
     // MARK: display helpers
 
     /// From (incoming) or To (outgoing), reduced to a display name.
-    static func correspondent(_ part: MIMEPart, outgoing: Bool) -> String {
+    nonisolated static func correspondent(_ part: MIMEPart, outgoing: Bool) -> String {
         let primary = outgoing ? "To" : "From"
         let fallback = outgoing ? "From" : "To"
         let raw = HeaderDecoder.decode(part.header(primary) ?? part.header(fallback) ?? "")
@@ -520,7 +867,7 @@ final class AppModel: ObservableObject {
 
     /// "Steve Dorner <d@x>" → "Steve Dorner"; "a@b (Name)" → "Name"; else the
     /// address. Strips surrounding quotes.
-    static func displayName(_ raw: String) -> String {
+    nonisolated static func displayName(_ raw: String) -> String {
         let s = raw.trimmingCharacters(in: .whitespaces)
         if let lt = s.firstIndex(of: "<") {
             let name = s[..<lt].trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
@@ -536,52 +883,72 @@ final class AppModel: ObservableObject {
         return s
     }
 
-    private static let rfc822In: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "EEE, d MMM yyyy HH:mm:ss Z"
-        return f
-    }()
-    private static let rfc822InNoDay: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "d MMM yyyy HH:mm:ss Z"
-        return f
-    }()
-    private static let eudoraOut: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "M/d/yy h:mm a"
-        return f
-    }()
+    // The date formatters live in `EudoraDateFormat`, outside this class:
+    // `AppModel` is `@MainActor`, so a static stored property here would be
+    // main-actor isolated and unreachable from the background parsing that now
+    // builds the message list.
 
     /// Parse an RFC-822 Date header and render it Eudora-style ("12/17/02 9:04 AM").
-    static func eudoraDate(_ header: String?) -> String? {
-        guard let h = header?.trimmingCharacters(in: .whitespaces), !h.isEmpty else { return nil }
-        let date = rfc822In.date(from: h) ?? rfc822InNoDay.date(from: h)
-        return date.map { eudoraOut.string(from: $0) }
+    nonisolated static func eudoraDate(_ header: String?) -> String? {
+        EudoraDateFormat.eudoraDate(header)
     }
 
     // MARK: rendering one message
 
+    /// Render the selected message, off the main actor.
+    ///
+    /// Selection itself is instant — it's an `Int` — and this is what used to
+    /// make it feel otherwise: reading and record-scanning the whole .mbx, then
+    /// parsing and rendering, all on the main thread, per arrow-key press.
+    ///
+    /// Two behaviours matter for the feel of it. The preview is cleared at once,
+    /// so the pane never shows the *previous* message's text while the next one
+    /// loads. And the work waits out `selectionSettleDelay` first, so holding an arrow key
+    /// down doesn't queue a render for every message passed through — only the
+    /// one landed on is ever read from disk.
     func loadMessage() {
+        previewTask?.cancel()
+
         guard let store,
               let mid = selectedMailboxID,
               let item = itemsByID[mid], !item.isFolder,
-              let index = selectedMessageID,
-              let msg = store.message(at: item.base, index: index) else {
+              let index = selectedMessageID else {
             preview = nil
+            isLoadingPreview = false
             return
         }
-        preview = Self.render(msg.part,
-                              sourceNote: listingSource,
-                              locator: AttachmentLocator(mailRoot: store.root))
-        rememberSelection(messageOffset: msg.record.offset)
+
+        preview = nil
+        isLoadingPreview = true
+
+        let base = item.base
+        let root = store.root
+        let note = listingSource
+
+        previewTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: selectionSettleDelay)
+            guard !Task.isCancelled else { return }
+
+            let rendered = await Task.detached(priority: .userInitiated) { () -> RenderedMessage? in
+                guard let msg = store.message(at: base, index: index) else { return nil }
+                return RenderedMessage(
+                    preview: AppModel.render(msg.part,
+                                             sourceNote: note,
+                                             locator: AttachmentLocator(mailRoot: root)),
+                    offset: msg.record.offset)
+            }.value
+
+            guard !Task.isCancelled, let self else { return }
+            self.preview = rendered?.preview
+            self.isLoadingPreview = false
+            if let offset = rendered?.offset { self.rememberSelection(messageOffset: offset) }
+        }
     }
+
 
     /// Choose the best displayable body (prefer text/html, else text/plain),
     /// decode it tolerantly, and collect attachment filenames.
-    static func render(_ part: MIMEPart,
+    nonisolated static func render(_ part: MIMEPart,
                        sourceNote: String,
                        locator: AttachmentLocator? = nil) -> MessagePreview {
         let subject = HeaderDecoder.decode(part.header("Subject") ?? "")
@@ -635,7 +1002,7 @@ final class AppModel: ObservableObject {
     }
 
     /// Build an attachment descriptor (with decoded bytes) from a MIME part.
-    static func attachment(from part: MIMEPart, index: Int) -> MessageAttachment {
+    nonisolated static func attachment(from part: MIMEPart, index: Int) -> MessageAttachment {
         let name = sanitizedFilename(part.filename) ?? "attachment-\(index)"
         return MessageAttachment(id: "eu-att-\(index)",
                                  filename: name,
@@ -645,7 +1012,7 @@ final class AppModel: ObservableObject {
 
     /// Decode (RFC 2047) then strip path separators and control characters from
     /// the attacker-controlled MIME filename, for a safe Save-panel default.
-    static func sanitizedFilename(_ raw: String?) -> String? {
+    nonisolated static func sanitizedFilename(_ raw: String?) -> String? {
         guard let raw, !raw.isEmpty else { return nil }
         let decoded = HeaderDecoder.decode(raw)
         let cleaned = decoded.map { ch -> Character in
@@ -766,6 +1133,7 @@ final class AppModel: ObservableObject {
     private func reloadTree() {
         guard let store else { return }
         tree = Self.buildItems(store.tree(), prefix: "")
+        treeVersion &+= 1
         itemsByID = [:]
         indexItems(tree)
     }
@@ -799,7 +1167,28 @@ final class AppModel: ObservableObject {
             try MailboxMutator.setStatus(base: sel.item.base, index: sel.index,
                                          status: read ? MailboxMutator.statusRead
                                                       : MailboxMutator.statusUnread)
-            rebuildRows()                 // keep selection + preview
+            // Patch the one row rather than re-listing. A rebuild would discard
+            // every enriched Who and attachment glyph and restart the whole
+            // background parse — on Trash, minutes of re-work to change one
+            // character.
+            if let pos = rowPositionByID[sel.index], pos < rows.count {
+                let r = rows[pos]
+                rows[pos] = MessageRow(id: r.id,
+                                       statusGlyph: read ? " " : MailStore.unreadGlyph,
+                                       priority: r.priority,
+                                       label: r.label,
+                                       size: r.size,
+                                       subject: r.subject,
+                                       who: r.who,
+                                       date: r.date,
+                                       hasAttachment: r.hasAttachment)
+                refreshMailboxSummary()
+            } else {
+                // Rows aren't in hand yet (the listing is still running), so
+                // there is nothing to patch — fall back to a re-list, or the
+                // change would be on disk but invisible.
+                rebuildRows()
+            }
             reloadTree()                  // unread badge may change
         } catch {
             banner = "Couldn't update status: \(error.localizedDescription)"
@@ -828,6 +1217,10 @@ final class AppModel: ObservableObject {
 
     func moveSelected(to destID: MailboxItem.ID) {
         guard let sel = currentSelection(), let dest = itemsByID[destID] else { return }
+        // The menu lists every mailbox, including this one — see MoveToMenuItems
+        // for why it can't depend on the selection. Moving a message to where it
+        // already is should do nothing rather than rewrite two mailboxes.
+        guard destID != selectedMailboxID else { return }
         do {
             try MailboxMutator.move(from: sel.item.base, index: sel.index, to: dest.base)
             banner = "Moved to \(dest.display)."
@@ -841,6 +1234,12 @@ final class AppModel: ObservableObject {
     private func afterRemoval() {
         selectedMessageID = nil
         preview = nil
+        // Clear the rows rather than leaving them up during the re-list.
+        // Removing a message shifts every later index, so the rows on screen no
+        // longer describe the mailbox: clicking one would select a different
+        // message than the one shown. A blank list for the duration is honest;
+        // a stale one is not.
+        setRows([])
         rebuildRows()
         reloadTree()
     }

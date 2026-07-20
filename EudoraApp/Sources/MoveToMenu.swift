@@ -4,22 +4,52 @@ import SwiftUI
 /// message somewhere": the toolbar Move button, the message-list context menu,
 /// and Transfer in the menu bar.
 ///
-/// Mirrors the sidebar's nesting and order, with one deliberate difference: a
-/// folder containing nothing you could move to is omitted here, whereas the
-/// sidebar shows it. Earlier this was a
-/// flat, alphabetically sorted list of every mailbox in the tree, which in a real
-/// Eudora folder means hundreds of entries in one column with the folder
-/// structure thrown away, so two mailboxes of the same name in different folders
-/// were indistinguishable. Eudora 7's own Transfer menu is hierarchical.
+/// Earlier this was a flat, alphabetically sorted list of every mailbox in the
+/// tree, which in a real Eudora folder means hundreds of entries in one column
+/// with the folder structure thrown away, so two mailboxes of the same name in
+/// different folders were indistinguishable. Eudora 7's own Transfer menu is
+/// hierarchical.
+///
+/// Two deliberate differences from the sidebar: a folder containing no mailboxes
+/// is omitted (the sidebar shows it), and the current mailbox *is* listed.
+/// Excluding it would make this menu depend on the selection, and rebuilding
+/// 2,657 items on every click is what made switching mailboxes slow —
+/// `moveSelected` ignores a move to where you already are.
 ///
 /// Order is deliberately *not* re-sorted: it comes from `descmap.pce` by way of
 /// `AppModel.tree`, which is the order Eudora itself shows, and the whole point
 /// is that this menu and the sidebar agree.
+/// The whole menu, wrapped so SwiftUI can skip rebuilding it.
+///
+/// **Why this wrapper exists.** These items live in the toolbar, and a `Menu`'s
+/// content is built eagerly as part of its enclosing view — so all 2,657
+/// mailboxes were being constructed during `NSToolbarItemViewer` layout. Sampling
+/// the running app found 39% of wall time there, which is what made clicking a
+/// mailbox feel slow: the click waited behind a toolbar re-layout.
+///
+/// It was rebuilt on every mailbox switch because the items used to depend on
+/// the current selection (to exclude it). They no longer do — `moveSelected`
+/// ignores a move to the mailbox you're already in — so the content depends only
+/// on the tree, and `treeVersion` lets SwiftUI skip it the rest of the time.
+struct MoveToMenuContent: View, Equatable {
+    let tree: [MailboxItem]
+    let treeVersion: Int
+    let action: (MailboxItem.ID) -> Void
+
+    /// Deliberately ignores `action`: closures aren't comparable, and the ones
+    /// passed here only ever call back into the model.
+    static func == (a: MoveToMenuContent, b: MoveToMenuContent) -> Bool {
+        a.treeVersion == b.treeVersion
+    }
+
+    var body: some View {
+        MoveToMenuItems(items: tree, action: action)
+    }
+}
+
 struct MoveToMenuItems: View {
     /// Usually `model.tree` — recursion passes a folder's children.
     let items: [MailboxItem]
-    /// The mailbox the message is already in; never a destination.
-    let excluding: MailboxItem.ID?
     let action: (MailboxItem.ID) -> Void
 
     var body: some View {
@@ -30,25 +60,20 @@ struct MoveToMenuItems: View {
                 // Without that test, a tree full of empty folders (common: Eudora
                 // leaves `.fol` directories behind) would fill the menu with
                 // submenus that open onto nothing.
-                if let kids = item.children,
-                   Self.containsDestination(kids, excluding: excluding) {
+                if let kids = item.children, Self.containsDestination(kids) {
                     Menu(item.display) {
-                        MoveToMenuItems(items: kids, excluding: excluding, action: action)
+                        MoveToMenuItems(items: kids, action: action)
                     }
                 }
-            } else if item.id != excluding {
+            } else {
                 Button(item.display) { action(item.id) }
             }
         }
     }
 
-    /// Whether this subtree holds any mailbox that could be moved to.
-    static func containsDestination(_ items: [MailboxItem],
-                                    excluding: MailboxItem.ID?) -> Bool {
-        items.contains { item in
-            item.isFolder
-                ? containsDestination(item.children ?? [], excluding: excluding)
-                : item.id != excluding
-        }
+    /// Whether this subtree holds any mailbox at all — an empty folder is shown
+    /// as a submenu opening onto nothing otherwise.
+    static func containsDestination(_ items: [MailboxItem]) -> Bool {
+        items.contains { $0.isFolder ? containsDestination($0.children ?? []) : true }
     }
 }
