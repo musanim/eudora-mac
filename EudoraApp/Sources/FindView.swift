@@ -112,6 +112,7 @@ struct FindView: View {
             Spacer()
 
             Text(model.searchStatus)
+                .copyable(model.searchStatus)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)

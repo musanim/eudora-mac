@@ -353,8 +353,49 @@ final class AppModel: ObservableObject {
 
     /// Non-nil while a compose sheet is open.
     @Published var composing: ComposeDraft?
-    /// Transient banner (e.g. "Message sent", or a send error).
-    @Published var banner: String?
+    /// Banner text (e.g. "Message sent", or why Check Mail failed).
+    ///
+    /// Write through `showBanner`/`showError`/`dismissBanner` rather than
+    /// assigning, so `bannerIsError` can't be left describing the previous one.
+    @Published private(set) var banner: String?
+
+    /// True when `banner` is reporting a failure.
+    ///
+    /// Errors don't time out — see the overlay in `ContentView`. A failure you
+    /// can't finish reading, let alone right-click and copy, before it erases
+    /// itself may as well not have been shown, and these are the messages most
+    /// worth quoting verbatim: "Check mail failed: …" carries the server's own
+    /// numeric code and explanation.
+    @Published private(set) var bannerIsError = false
+
+    /// Bumped per banner, and used as the dismissal timer's identity.
+    ///
+    /// Keying that timer on the banner *text* would be almost right: a second
+    /// message restarts it, and one that goes away and comes back rebuilds the
+    /// view anyway. But an error replaced by a success carrying the same string
+    /// would change only `bannerIsError`, leaving the timer torn down and the
+    /// success sitting there forever. A counter has no such case to reason about.
+    @Published private(set) var bannerGeneration = 0
+
+    /// Something worked. Says so briefly, then gets out of the way.
+    func showBanner(_ text: String) {
+        banner = text
+        bannerIsError = false
+        bannerGeneration &+= 1
+    }
+
+    /// Something failed. Stays up until dismissed.
+    func showError(_ text: String) {
+        banner = text
+        bannerIsError = true
+        bannerGeneration &+= 1
+    }
+
+    func dismissBanner() {
+        banner = nil
+        bannerIsError = false
+    }
+
     /// True while a Check Mail fetch is in flight.
     @Published var isChecking = false
 
@@ -1335,7 +1376,7 @@ final class AppModel: ObservableObject {
             }
             reloadTree()                  // unread badge may change
         } catch {
-            banner = "Couldn't update status: \(error.localizedDescription)"
+            showError("Couldn't update status: \(error.localizedDescription)")
         }
     }
 
@@ -1345,17 +1386,17 @@ final class AppModel: ObservableObject {
         do {
             if sel.item.type == .trash {
                 try MailboxMutator.remove(base: sel.item.base, index: sel.index)
-                banner = "Message deleted."
+                showBanner("Message deleted.")
             } else if let trash = store.mailboxBase(ofType: .trash) {
                 try MailboxMutator.move(from: sel.item.base, index: sel.index, to: trash)
-                banner = "Moved to Trash."
+                showBanner("Moved to Trash.")
             } else {
                 try MailboxMutator.remove(base: sel.item.base, index: sel.index)
-                banner = "Message deleted (no Trash mailbox)."
+                showBanner("Message deleted (no Trash mailbox).")
             }
             afterRemoval()
         } catch {
-            banner = "Delete failed: \(error.localizedDescription)"
+            showError("Delete failed: \(error.localizedDescription)")
         }
     }
 
@@ -1367,10 +1408,10 @@ final class AppModel: ObservableObject {
         guard destID != selectedMailboxID else { return }
         do {
             try MailboxMutator.move(from: sel.item.base, index: sel.index, to: dest.base)
-            banner = "Moved to \(dest.display)."
+            showBanner("Moved to \(dest.display).")
             afterRemoval()
         } catch {
-            banner = "Move failed: \(error.localizedDescription)"
+            showError("Move failed: \(error.localizedDescription)")
         }
     }
 
@@ -1395,17 +1436,17 @@ final class AppModel: ObservableObject {
     /// safely written locally.
     func receiveMail(accounts: AccountStore) async {
         guard let store, let inbox = store.mailboxBase(ofType: .inbox) else {
-            banner = "No In mailbox in this tree."
+            showError("No In mailbox in this tree.")
             return
         }
         guard accounts.pop.isConfigured else {
-            banner = "Incoming mail not set up: server=\"\(accounts.pop.host)\", "
+            showError("Incoming mail not set up: server=\"\(accounts.pop.host)\", "
                 + "user=\"\(accounts.pop.username)\", port=\(accounts.pop.port). "
-                + "Fill these in Settings ▸ Incoming mail (POP3), then Save."
+                + "Fill these in Settings ▸ Incoming mail (POP3), then Save.")
             return
         }
         guard !accounts.incomingPassword.isEmpty else {
-            banner = "Incoming password is empty — enter it in Settings ▸ Incoming mail (POP3), then Save."
+            showError("Incoming password is empty — enter it in Settings ▸ Incoming mail (POP3), then Save.")
             return
         }
         guard !isChecking else { return }
@@ -1437,11 +1478,11 @@ final class AppModel: ObservableObject {
 
             reloadTree()
             if let id = selectedMailboxID, itemsByID[id]?.type == .inbox { loadListing(force: true) }
-            banner = fetched.isEmpty
-                ? "No new mail."
-                : "Received \(fetched.count) message\(fetched.count == 1 ? "" : "s")."
+            showBanner(fetched.isEmpty
+                        ? "No new mail."
+                        : "Received \(fetched.count) message\(fetched.count == 1 ? "" : "s").")
         } catch {
-            banner = "Check mail failed: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
+            showError("Check mail failed: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)")
         }
     }
 
@@ -1548,9 +1589,9 @@ final class AppModel: ObservableObject {
 
     /// Menu/command "Rebuild Search Index".
     func rebuildIndex() {
-        guard let rootURL else { banner = "Open a Eudora folder first."; return }
-        guard !isIndexing else { banner = "Already indexing…"; return }
-        banner = "Rebuilding search index…"
+        guard let rootURL else { showError("Open a Eudora folder first."); return }
+        guard !isIndexing else { showBanner("Already indexing…"); return }
+        showBanner("Rebuilding search index…")
         startIndexing(for: rootURL)
     }
 
@@ -1576,7 +1617,7 @@ final class AppModel: ObservableObject {
     func openHit(_ hit: SearchHit) {
         guard let store, let item = itemsByID[hit.mailbox],
               let index = store.indexOfRecord(at: item.base, offset: hit.offset) else {
-            banner = "Couldn't locate that message (index may be stale — try Rebuild Index)."
+            showError("Couldn't locate that message (index may be stale — try Rebuild Index).")
             return
         }
         NSApp.activate(ignoringOtherApps: true)

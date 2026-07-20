@@ -2,9 +2,17 @@ import SwiftUI
 import AppKit
 
 /// A Windows-Eudora-style menu bar rendered *inside* the window, so the menus
-/// are next to the content instead of at the top of a large display. The system
-/// menu bar keeps only what macOS insists on (the app menu); everything else
-/// lives here.
+/// are next to the content instead of at the top of a large display.
+///
+/// **Every `.keyboardShortcut` in this file is decorative.** A shortcut declared
+/// on a Button inside an in-window `Menu` does not install a key equivalent —
+/// that content belongs to a popup button, not to the menu bar — so these draw
+/// the ⌘ glyphs and nothing more. They looked wired up for a long time precisely
+/// because the glyphs render.
+///
+/// The declarations that actually work are in `EudoraApp.eudoraCommands`, and
+/// the two are meant to stay in step: changing a shortcut here changes only its
+/// label. Read the comment there before touching either.
 struct MenuBarView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var accounts: AccountStore
@@ -110,16 +118,17 @@ struct MenuBarView: View {
 
     private var messageMenu: some View {
         Menu("Message") {
+            // Deliberately unlabelled: File ▸ New Message shows the ⌘N hint, and
+            // two items advertising the same key reads as a mistake.
             Button("New Message") { model.composeNew() }
-                .keyboardShortcut("n", modifiers: .command)
             Button("Reply") { model.reply(all: false) }
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(!model.canActOnMessage)
             Button("Reply to All") { model.reply(all: true) }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
                 .disabled(!model.canActOnMessage)
+            // No ⌘L hint — the real command in `EudoraApp` has no shortcut.
             Button("Forward") { model.forward() }
-                .keyboardShortcut("l", modifiers: .command)
                 .disabled(!model.canActOnMessage)
             Divider()
             Button("Mark as Read") { model.markSelected(read: true) }

@@ -67,10 +67,17 @@ struct ComposeView: View {
             }
             Spacer()
             if let error {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(Color(red: 0.75, green: 0.05, blue: 0.05))
-                    .font(.callout.weight(.semibold))
-                    .lineLimit(2)
+                // An HStack rather than a `Label`, so `.textSelection` in
+                // `copyable` lands on a real `Text` — a Label's title isn't
+                // reliably selectable.
+                HStack(spacing: 5) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text(error)
+                        .lineLimit(3)
+                        .copyable(error)
+                }
+                .foregroundStyle(Color(red: 0.75, green: 0.05, blue: 0.05))
+                .font(.callout.weight(.semibold))
             }
             if sending { ProgressView().controlSize(.small) }
             Button("Send") { send() }
@@ -105,7 +112,7 @@ struct ComposeView: View {
             do {
                 let sent = try await SMTPClient.send(message, account: account, password: password)
                 try model.recordSent(raw: sent.raw, who: toList.first ?? "", subject: subject)
-                model.banner = "Message sent."
+                model.showBanner("Message sent.")
                 sending = false
                 model.composing = nil
             } catch {

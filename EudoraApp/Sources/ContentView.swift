@@ -105,15 +105,43 @@ struct ContentView: View {
         }
         .overlay(alignment: .top) {
             if let banner = model.banner {
-                Text(banner)
-                    .padding(.horizontal, 14).padding(.vertical, 8)
-                    .background(.thinMaterial, in: Capsule())
-                    .shadow(radius: 4)
-                    .padding(.top, 10)
-                    .task {
-                        try? await Task.sleep(nanoseconds: 2_500_000_000)
-                        model.banner = nil
+                HStack(spacing: 8) {
+                    if model.bannerIsError {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(Color(red: 0.75, green: 0.05, blue: 0.05))
                     }
+                    Text(banner)
+                        .copyable(banner)
+                    if model.bannerIsError {
+                        Button {
+                            model.dismissBanner()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .help("Dismiss")
+                    }
+                }
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(.thinMaterial, in: Capsule())
+                .shadow(radius: 4)
+                .padding(.top, 10)
+                // Successes time out; failures don't. A "Check mail failed: …"
+                // that erases itself after two and a half seconds can't be read
+                // to the end, let alone right-clicked and copied — and it's the
+                // one message worth quoting verbatim, since it carries the
+                // server's own code and wording.
+                //
+                // Keyed on `bannerGeneration`, not the text, so a second message
+                // always restarts the timer rather than inheriting the first
+                // one's — see the comment on that property.
+                .task(id: model.bannerGeneration) {
+                    guard !model.bannerIsError else { return }
+                    try? await Task.sleep(nanoseconds: 2_500_000_000)
+                    guard !Task.isCancelled else { return }
+                    model.dismissBanner()
+                }
             }
         }
     }
@@ -306,6 +334,36 @@ extension View {
     /// The column index must match the `TableColumn` order.
     func tableCell(column index: Int) -> some View {
         offset(x: MessageTableMetrics.contentOffset(column: index))
+    }
+
+    /// Makes text the user may need verbatim — error messages above all —
+    /// selectable, right-click-copyable, and readable in full as a tooltip even
+    /// when the layout truncates it.
+    ///
+    /// Errors from the network layer are exactly the strings worth quoting: an
+    /// SMTP rejection carries the server's numeric code and its own explanation,
+    /// and the difference between a 534 and a 535 is the difference between two
+    /// completely different fixes. Text you can't copy is text that gets
+    /// retyped, or paraphrased, or truncated with an ellipsis.
+    ///
+    /// `.textSelection` alone isn't enough: it requires selecting first, and
+    /// these labels are often one truncated line in a crowded footer. The
+    /// explicit Copy item takes the whole `text`, not the visible part of it.
+    ///
+    /// A `.contextMenu` is fine here despite the trouble SwiftUI menus caused
+    /// over the mailbox tree (see `MessageContextMenu`): the problem there was
+    /// SwiftUI eagerly building 2,657 nested items on every right-click. This is
+    /// one button over no data.
+    func copyable(_ text: String) -> some View {
+        self
+            .textSelection(.enabled)
+            .help(text)
+            .contextMenu {
+                Button("Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                }
+            }
     }
 }
 
@@ -1548,7 +1606,7 @@ struct PreviewView: View {
                 Divider()
                 if p.isHTML {
                     HTMLMailView(html: p.content, images: p.images) { url in
-                        model.banner = "Link copied: \(url)"
+                        model.showBanner("Link copied: \(url)")
                     }
                 } else {
                     ScrollView {
