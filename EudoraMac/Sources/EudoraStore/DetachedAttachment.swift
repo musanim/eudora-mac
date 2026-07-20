@@ -78,10 +78,12 @@ public enum DetachedAttachment {
     /// Main types whose leaves are raw bytes and can never hold a Eudora note.
     ///
     /// An exclusion list rather than a `mainType == "text"` inclusion, because
-    /// Eudora leaves some messages claiming `multipart/mixed` with no boundary
-    /// delimiters in the body at all. The parser keeps the raw body on the root
-    /// part in that case, and a text-only test would skip it — which is exactly
-    /// how one of the real messages in `phaseX/In.mbx` hides its marker.
+    /// Eudora flattens messages into leaves whose *declared* type is unreliable.
+    /// (The parser now retypes the worst of those — a part claiming multipart
+    /// with no boundary delimiters becomes a text leaf — but staying permissive
+    /// costs nothing and doesn't depend on that salvage catching every shape.)
+    /// Excluding binary types is still needed on its own account: a base64
+    /// attachment can decode to bytes that happen to contain the marker.
     private static let binaryMainTypes: Set<String> =
         ["image", "audio", "video", "application", "model"]
 

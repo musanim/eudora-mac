@@ -1150,7 +1150,12 @@ struct PreviewView: View {
                     }
                 } else {
                     ScrollView {
-                        Text(p.content.isEmpty ? "(no text body)" : p.content)
+                        // An attachment-only message genuinely has no text, so
+                        // say that rather than implying something failed.
+                        Text(p.content.isEmpty
+                             ? (p.detached.isEmpty ? "(no text body)"
+                                                   : "(no message text — attachment only)")
+                             : p.content)
                             .textSelection(.enabled)
                             .font(.system(.body, design: .monospaced))
                             .frame(maxWidth: .infinity, alignment: .leading)

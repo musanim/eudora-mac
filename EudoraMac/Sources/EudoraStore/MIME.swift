@@ -6,9 +6,11 @@ public final class MIMEPart {
     public var body: [UInt8] = []          // leaf content (undecoded)
     public var children: [MIMEPart] = []    // for multipart/*
 
-    /// Set when the body was stored in Eudora's flattened form (`<x-html>` /
-    /// `<x-flowed>`); overrides the now-inaccurate MIME Content-Type so the part
-    /// displays and indexes as the correct text leaf.
+    /// Set when the declared Content-Type is known to be wrong — either the body
+    /// was stored in Eudora's flattened form (`<x-html>` / `<x-flowed>`), or the
+    /// part claims multipart but has no boundary delimiters (see
+    /// `MIMEParser.parse`). Overrides the header so the part displays and indexes
+    /// as the text leaf it actually is.
     public var eudoraContentType: String? = nil
 
     /// Bytes that followed Eudora's flattened-body wrapper.
@@ -251,12 +253,28 @@ public enum MIMEParser {
             return part
         }
 
-        if part.isMultipart, let boundary = part.boundary {
-            let segs = splitMultipart(bodyBytes, boundary: boundary)
+        if part.isMultipart {
+            let segs = part.boundary.map { splitMultipart(bodyBytes, boundary: $0) } ?? []
             if segs.isEmpty {
-                // Claimed multipart but no boundary delimiters present — keep the
-                // raw body rather than losing it.
-                part.body = bodyBytes
+                // Claimed multipart, but there are no boundary delimiters in the
+                // body (or no boundary parameter at all). This is common in a
+                // real Eudora tree — it strips the MIME structure and keeps one
+                // alternative, leaving the Content-Type header describing a
+                // structure that is no longer there. About 6% of the messages in
+                // `phaseX` are this shape.
+                //
+                // Keep the body, and *also* correct the type: leaving the part
+                // claiming multipart made it invisible to every consumer that
+                // walks parts looking for text, because they all skip multipart
+                // nodes and this node has no children. That is what produced
+                // "(no text body)" in the reader, and silently dropped the same
+                // messages' bodies from the search index.
+                // Split off any trailing "Attachment Converted:" notes, exactly
+                // as the <x-html> path does, so they don't render as body text.
+                let (visible, trailer) = Self.splitTrailingAttachmentNotes(bodyBytes)
+                part.body = visible
+                part.eudoraTrailer = trailer
+                part.eudoraContentType = Self.sniffedTextType(visible)
             } else {
                 for seg in segs { part.children.append(parse(seg)) }
             }
@@ -264,6 +282,63 @@ public enum MIMEParser {
             part.body = bodyBytes
         }
         return part
+    }
+
+    /// Split a salvaged body into what should be displayed and the trailing run
+    /// of Eudora's "Attachment Converted:" notes.
+    ///
+    /// Deliberately conservative: it cuts at the first marker line **only if**
+    /// everything from there to the end is marker lines and blank lines. A
+    /// message that merely mentions the phrase partway through real prose is left
+    /// whole, because truncating a body is far worse than showing one stray line.
+    /// Returns the body unchanged when there is nothing to split.
+    static func splitTrailingAttachmentNotes(_ body: [UInt8]) -> (visible: [UInt8],
+                                                                 trailer: [UInt8]) {
+        let marker = Array(DetachedAttachment.marker.utf8)
+        guard let first = firstLineStart(of: marker, in: body) else { return (body, []) }
+
+        // Walk the remainder: every line must be blank or another marker.
+        var i = first
+        while i < body.count {
+            var end = i
+            while end < body.count, body[end] != 0x0a { end += 1 }
+            var lineEnd = end
+            if lineEnd > i, body[lineEnd - 1] == 0x0d { lineEnd -= 1 }
+            let isBlank = (lineEnd == i)
+            let isMarker = lineEnd - i >= marker.count
+                && Array(body[i..<(i + marker.count)]) == marker
+            if !isBlank && !isMarker { return (body, []) }
+            i = end + 1
+        }
+
+        // Drop the blank line(s) that separated the body from the notes.
+        var cut = first
+        while cut > 0, body[cut - 1] == 0x0a || body[cut - 1] == 0x0d { cut -= 1 }
+        return (Array(body[0..<cut]), Array(body[first...]))
+    }
+
+    /// Index of `needle` where it begins a line, or nil.
+    private static func firstLineStart(of needle: [UInt8], in hay: [UInt8]) -> Int? {
+        var from = 0
+        while let hit = Bytes.find(needle, in: hay, from: from) {
+            if hit == 0 || hay[hit - 1] == 0x0a { return hit }
+            from = hit + 1
+        }
+        return nil
+    }
+
+    /// Guess whether a salvaged body is HTML or plain text.
+    ///
+    /// Only reached for a part whose declared type is known to be wrong, so
+    /// there is nothing better to go on than the bytes. Sniffs a prefix rather
+    /// than the whole body: a plain-text mail quoting `<html>` far down is far
+    /// likelier than an HTML document that doesn't announce itself early.
+    static func sniffedTextType(_ body: [UInt8]) -> String {
+        let head = String(decoding: body.prefix(1024), as: UTF8.self).lowercased()
+        for marker in ["<html", "<!doctype html", "<body", "<table", "<div"] {
+            if head.contains(marker) { return "text/html" }
+        }
+        return "text/plain"
     }
 
     static func splitHeaderBody(_ bytes: [UInt8]) -> ([UInt8], [UInt8]) {

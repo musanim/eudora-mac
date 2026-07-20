@@ -41,9 +41,8 @@ final class DetachedAttachmentTests: XCTestCase {
     }
 
     // The 9th real case: Content-Type claims multipart but the body carries no
-    // boundary delimiters at all, so the parser keeps the raw body on the root
-    // part. A `mainType == "text"` filter would skip it, because the root still
-    // reports multipart/mixed.
+    // boundary delimiters at all. The parser salvages that into a text leaf, and
+    // the marker is found whether it ends up in the body or the trailer.
     func testFindsMarkerInDegenerateMultipart() {
         let msg = parse("""
         Subject: history

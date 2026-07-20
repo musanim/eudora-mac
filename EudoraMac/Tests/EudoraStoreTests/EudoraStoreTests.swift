@@ -184,6 +184,107 @@ final class EudoraStoreTests: XCTestCase {
             .contains("<div>Hello &amp; welcome</div>"))
     }
 
+    // MARK: multipart headers describing a structure that isn't there
+
+    // Eudora also strips the MIME structure WITHOUT wrapping what's left in
+    // <x-html>/<x-flowed>: it keeps one alternative as a bare body and leaves the
+    // multipart Content-Type header in place. The shape of the 1/1/04 eBay bid
+    // confirmation in phaseX/EBAY.mbx, and ~6% of that tree.
+    //
+    // Such a part must not go on claiming multipart: it has no children, and
+    // every consumer that hunts for a body skips multipart nodes — which is what
+    // produced "(no text body)" in the reader and dropped these bodies from the
+    // search index.
+    func testMultipartWithNoBoundaryInBodyBecomesTextLeaf() {
+        let raw = [
+            "From: bidconfirm@ebay.com",
+            "Subject: eBay Bid Confirmed",
+            "Content-Type: multipart/alternative; boundary=1641688202.1072977771104.JavaMail",
+            "",
+            "YOU ARE THE CURRENT HIGH BIDDER",
+            "Item name: SERIOUS GAMES",
+        ].joined(separator: "\r\n")
+        let part = MIMEParser.parse([UInt8](Data(raw.utf8)))
+
+        XCTAssertFalse(part.isMultipart)
+        XCTAssertEqual(part.contentType, "text/plain")
+        XCTAssertTrue(part.children.isEmpty)
+        XCTAssertTrue(String(decoding: part.decodedPayload(), as: UTF8.self)
+            .contains("CURRENT HIGH BIDDER"))
+        // And it is reachable the way the reader and the indexer look for a body.
+        XCTAssertEqual(part.walk().filter { !$0.isMultipart && $0.mainType == "text" }.count, 1)
+    }
+
+    // Same salvage, but the leftover body is HTML — sniffed, since the declared
+    // type is known to be wrong.
+    func testMultipartWithNoBoundarySniffsHTML() {
+        let raw = [
+            "Content-Type: multipart/alternative; boundary=\"NOPE\"",
+            "",
+            "<html><body><b>hi</b></body></html>",
+        ].joined(separator: "\r\n")
+        let part = MIMEParser.parse([UInt8](Data(raw.utf8)))
+
+        XCTAssertEqual(part.contentType, "text/html")
+        XCTAssertFalse(part.isMultipart)
+    }
+
+    // A multipart header with no boundary parameter at all is the same problem.
+    func testMultipartWithNoBoundaryParameterBecomesTextLeaf() {
+        let raw = [
+            "Content-Type: multipart/mixed",
+            "",
+            "just text",
+        ].joined(separator: "\r\n")
+        let part = MIMEParser.parse([UInt8](Data(raw.utf8)))
+
+        XCTAssertFalse(part.isMultipart)
+        XCTAssertEqual(part.contentType, "text/plain")
+        XCTAssertTrue(String(decoding: part.body, as: UTF8.self).contains("just text"))
+    }
+
+    // A real multipart must be unaffected by the salvage path.
+    func testWellFormedMultipartStillSplits() {
+        let part = MIMEParser.parse([UInt8](multipartAlternative()))
+        XCTAssertTrue(part.isMultipart)
+        XCTAssertFalse(part.children.isEmpty)
+    }
+
+    // A salvaged body splits off its trailing "Attachment Converted:" notes, the
+    // same as the <x-html> path, so they don't render as body text.
+    func testSalvagedBodySplitsOffAttachmentNotes() {
+        let raw = [
+            "Content-Type: multipart/mixed; boundary=\"NOPE\"",
+            "",
+            "Here is the picture.",
+            "",
+            "Attachment Converted: \"Y:\\Eudora\\Attachments\\history.jpg\"",
+        ].joined(separator: "\r\n")
+        let part = MIMEParser.parse([UInt8](Data(raw.utf8)))
+
+        let shown = String(decoding: part.body, as: UTF8.self)
+        XCTAssertTrue(shown.contains("Here is the picture."))
+        XCTAssertFalse(shown.contains(DetachedAttachment.marker))
+        XCTAssertEqual(DetachedAttachment.filenames(in: part), ["history.jpg"])
+    }
+
+    // But a marker followed by more prose is NOT a trailing note run, and must
+    // not truncate the body — losing real text is far worse than a stray line.
+    func testMarkerMidBodyDoesNotTruncate() {
+        let raw = [
+            "Content-Type: multipart/mixed; boundary=\"NOPE\"",
+            "",
+            "Attachment Converted: \"Y:\\Eudora\\Attachments\\a.pdf\"",
+            "",
+            "...and here is some more of the message.",
+        ].joined(separator: "\r\n")
+        let part = MIMEParser.parse([UInt8](Data(raw.utf8)))
+
+        let shown = String(decoding: part.body, as: UTF8.self)
+        XCTAssertTrue(shown.contains("more of the message"))
+        XCTAssertTrue(part.eudoraTrailer.isEmpty)
+    }
+
     func testEudoraXFlowedBody() {
         let raw = [
             "Subject: p",
