@@ -11,6 +11,15 @@ public final class MIMEPart {
     /// displays and indexes as the correct text leaf.
     public var eudoraContentType: String? = nil
 
+    /// Bytes that followed Eudora's flattened-body wrapper.
+    ///
+    /// Not displayable content — it is Eudora's record of what it *removed* when
+    /// it flattened the message: "Attachment Converted:" notes, and sometimes
+    /// orphaned headers from the stripped parts. Kept separate from `body` so it
+    /// never renders, but kept, because it is the only surviving evidence that a
+    /// received message had an attachment. See `DetachedAttachment`.
+    public var eudoraTrailer: [UInt8] = []
+
     public init() {}
 
     public func header(_ name: String) -> String? {
@@ -238,6 +247,7 @@ public enum MIMEParser {
         if let eudora = EudoraBody.detect(bodyBytes) {
             part.eudoraContentType = eudora.contentType
             part.body = eudora.body
+            part.eudoraTrailer = eudora.trailer
             return part
         }
 
@@ -326,21 +336,31 @@ public enum MIMEParser {
 /// `<x-html>…</x-html>` and format=flowed plain text as `<x-flowed>…</x-flowed>`.
 /// The bytes between the markers are the real content.
 enum EudoraBody {
-    static func detect(_ body: [UInt8]) -> (contentType: String, body: [UInt8])? {
-        if let inner = between(body, "<x-html>", "</x-html>") {
-            return ("text/html", inner)
+    static func detect(_ body: [UInt8]) -> (contentType: String, body: [UInt8], trailer: [UInt8])? {
+        if let r = between(body, "<x-html>", "</x-html>") {
+            return ("text/html", r.inner, r.trailer)
         }
-        if let inner = between(body, "<x-flowed>", "</x-flowed>") {
-            return ("text/plain", inner)
+        if let r = between(body, "<x-flowed>", "</x-flowed>") {
+            return ("text/plain", r.inner, r.trailer)
         }
         return nil
     }
 
-    private static func between(_ body: [UInt8], _ open: String, _ close: String) -> [UInt8]? {
+    /// The bytes between the markers, plus everything after the closing one.
+    ///
+    /// The trailer is not displayable content, but it is where Eudora records
+    /// what it removed — "Attachment Converted:" notes, and sometimes orphaned
+    /// headers from the parts it stripped — so it must not be discarded. It used
+    /// to be, which meant detached attachments were invisible to the app.
+    private static func between(_ body: [UInt8], _ open: String, _ close: String)
+        -> (inner: [UInt8], trailer: [UInt8])? {
         let openB = Array(open.utf8), closeB = Array(close.utf8)
         guard let o = Bytes.find(openB, in: body) else { return nil }
         let start = o + openB.count
-        let end = Bytes.find(closeB, in: body, from: start) ?? body.count
-        return start <= end ? Array(body[start..<end]) : nil
+        guard let c = Bytes.find(closeB, in: body, from: start) else {
+            // Unterminated wrapper: everything left is content, nothing trails.
+            return start <= body.count ? (Array(body[start...]), []) : nil
+        }
+        return (Array(body[start..<c]), Array(body[(c + closeB.count)...]))
     }
 }

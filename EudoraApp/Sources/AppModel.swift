@@ -56,6 +56,11 @@ struct MessageRow: Identifiable, Hashable {
 
     /// Size in K, rounded up, minimum 1K — as Eudora showed it.
     var sizeK: String { "\(max(1, (size + 1023) / 1024))K" }
+
+    /// Never read — Eudora's TOC status 0 (MS_UNREAD). Every other status
+    /// ("R", "F", "→", "Q", "S", " ") means the message has been opened at
+    /// least once. Named so the list doesn't have to know the glyph.
+    var isUnread: Bool { statusGlyph == MailStore.unreadGlyph }
 }
 
 /// The rendered preview of a single message.
@@ -467,9 +472,16 @@ final class AppModel: ObservableObject {
         rows = listing.rows.map { r in
             let part = parts[r.index]
             let who = part.map { Self.correspondent($0, outgoing: outgoing) } ?? r.who
-            let hasAtt = part?.walk().contains { $0.isAttachment } ?? false
+            // Both forms count. Mail Eudora processed has no MIME attachment
+            // left — it detached the bytes to disk and wrote an "Attachment
+            // Converted:" line into the body — while mail it never touched, and
+            // everything outgoing, still carries real MIME parts.
+            let hasAtt = part.map { message in
+                message.walk().contains(where: { $0.isAttachment })
+                    || DetachedAttachment.isPresent(in: message)
+            } ?? false
             let date = part.flatMap { Self.eudoraDate($0.header("Date")) } ?? r.date
-            if r.statusGlyph == "•" { unread += 1 }
+            if r.statusGlyph == MailStore.unreadGlyph { unread += 1 }
             return MessageRow(id: r.index,
                               statusGlyph: r.statusGlyph,
                               priority: Int(r.priority) ?? 0,

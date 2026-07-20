@@ -314,6 +314,50 @@ struct HeaderIcon {
     }
 }
 
+/// Eudora 7's own row glyphs: the unread dot and the attachment mark that appear
+/// in each message row, under the matching header icon.
+///
+/// Separate art from `HeaderIcon` — these are the smaller in-row marks (14 and 17
+/// px) rather than the header's bezelled buttons (21 and 24 px) — but they sit in
+/// the same two sub-columns, so each is centred in the *header* icon's width and
+/// the two stay in register down the list.
+///
+/// Drawn `.resizable()` at its own native size with `.interpolation(.none)`: the
+/// art is 1x pixel art, and nearest-neighbour keeps it crisp at 2x instead of
+/// smoothing it into mush. The `.resizable()` is load-bearing — `.interpolation`
+/// is silently ignored on a non-resizable `Image`, which is exactly the trap this
+/// comment exists to stop someone falling into again.
+/// The art in the catalog is *not* the art in `assets/`: the originals came with
+/// an opaque near-white background, which showed as a white block on a selected
+/// (blue) row. `assets/make-row-icons.py` regenerates the catalog copies with a
+/// real alpha channel — rerun it if the source art is ever replaced.
+enum RowIcon {
+    static let unread = "RowUnread"
+    static let attachment = "RowAttachment"
+
+    /// Height of the glyph slot.
+    ///
+    /// Given explicitly so a row with no glyph is the same height as one with:
+    /// the cell used to always hold a `Text` (status was `" "` for read mail) and
+    /// so always had a line box, whereas an empty `Group` would collapse to zero
+    /// and leave the table's row height resting on the text columns alone.
+    static let height: CGFloat = 17
+
+    /// A row glyph centred in its sub-column, or empty space of the same size.
+    static func view(_ name: String, show: Bool, width: CGFloat) -> some View {
+        let art = NSImage(named: name)?.size ?? CGSize(width: width, height: height)
+        return Group {
+            if show {
+                Image(name)
+                    .resizable()
+                    .interpolation(.none)
+                    .frame(width: art.width, height: art.height)
+            }
+        }
+        .frame(width: width, height: height)
+    }
+}
+
 /// An `NSTableHeaderCell` that draws an image across its entire frame: no inset,
 /// no title, no separator. The Eudora art carries its own bezel, so the default
 /// header chrome would only fight with it.
@@ -1016,17 +1060,31 @@ struct MessageListView: View {
                 // this column's position.
                 TableColumn("") { r in
                     HStack(spacing: 0) {
-                        Text(r.statusGlyph)
-                            .font(.system(.body, design: .monospaced))
-                            .foregroundStyle(r.statusGlyph == "•" ? Color.accentColor : .primary)
-                            .frame(width: HeaderIcon.status.width)
+                        // Eudora 7's own row art, each centred under its header
+                        // icon. Unread gets the dot; the other states Eudora
+                        // tracks — replied, forwarded, redirected, queued, sent —
+                        // keep their letter, because there is only art for the
+                        // unread case and dropping the letters would lose real
+                        // information from the list.
                         Group {
-                            if r.hasAttachment {
-                                Image(systemName: "paperclip")
-                                    .font(.caption2).foregroundStyle(.secondary)
+                            if r.isUnread {
+                                RowIcon.view(RowIcon.unread,
+                                             show: true,
+                                             width: HeaderIcon.status.width)
+                            } else if !r.statusGlyph.trimmingCharacters(in: .whitespaces).isEmpty {
+                                Text(r.statusGlyph)
+                                    .font(.system(.body, design: .monospaced))
+                                    .frame(width: HeaderIcon.status.width,
+                                           height: RowIcon.height)
+                            } else {
+                                Color.clear
+                                    .frame(width: HeaderIcon.status.width,
+                                           height: RowIcon.height)
                             }
                         }
-                        .frame(width: HeaderIcon.attachment.width)
+                        RowIcon.view(RowIcon.attachment,
+                                     show: r.hasAttachment,
+                                     width: HeaderIcon.attachment.width)
                     }
                     .tableCell(column: 0)
                 }.width(HeaderIcon.leadingColumnWidth)

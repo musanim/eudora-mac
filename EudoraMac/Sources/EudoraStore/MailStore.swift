@@ -122,11 +122,15 @@ public struct MailStore: Sendable {
 
     // MARK: listing
 
+    /// The glyph for MS_UNREAD, named so callers can test for "never read"
+    /// without hard-coding the bullet in several places.
+    public static let unreadGlyph = "•"
+
     /// Message-list glyph for a Eudora status byte (values from the Windows
     /// Eudora source, `summary.h`). The state is a single value per message
     /// (replied implies read, etc.), so one glyph suffices.
     static let statusGlyphs: [Int: String] = [
-        0: "•",   // MS_UNREAD
+        0: unreadGlyph,   // MS_UNREAD
         1: " ",   // MS_READ
         2: "R",   // MS_REPLIED
         3: "F",   // MS_FORWARDED
