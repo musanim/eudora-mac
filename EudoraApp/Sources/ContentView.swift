@@ -872,21 +872,150 @@ struct TableHeaderIconStyler: NSViewRepresentable {
 struct TableScrollStateSyncer: NSViewRepresentable {
     @ObservedObject var model: AppModel
 
-    /// Scroll the message list one row per wheel notch, and reverse the
-    /// direction relative to the system setting.
+    /// Scroll the message list one row per wheel notch, in the system's own
+    /// direction.
     enum Scrolling {
-        /// Flip the direction the wheel moves the list. Set false to follow the
-        /// system's scroll direction.
+        /// Flip the direction the wheel moves the list. False follows the
+        /// system's scroll direction, which is what Stephen wants; set true to
+        /// reverse it.
         ///
         /// In a flipped clip view AppKit's own handling is `origin.y -=
         /// scrollingDeltaY`, so reproducing the system direction means stepping
         /// the row index *down* by the delta; `inverted` steps it up instead.
-        static let inverted = true
+        static let inverted = false
 
         /// Points of precise (trackpad) scrolling worth one row step. Anchoring
         /// to the row height keeps a swipe covering the distance it normally
         /// would, just snapped to rows.
         static func pointsPerRowStep(rowHeight: CGFloat) -> CGFloat { max(rowHeight, 1) }
+
+        /// The row at the top of the visible *content* area.
+        ///
+        /// Deliberately not `table.rows(in: table.visibleRect).location`, which
+        /// is what this used to be and what broke the wheel.
+        ///
+        /// The clip view carries a 28 pt top content inset — the band the column
+        /// header sits over. That band is part of the clip view's bounds, so it
+        /// is part of `visibleRect` too, and the row hidden underneath the header
+        /// still counts as visible. Reading the top row that way while *writing*
+        /// the new position with the inset subtracted (see `originY`) meant the
+        /// two disagreed by 28 pt — a little over one row — so every notch
+        /// computed a target at or behind where the list already was:
+        ///
+        ///     In (134 rows)     rows 0 and 1 map to origins −23 and 2, and the
+        ///                       old `max(0, …)` clamp turned −23 into 0. Two
+        ///                       reachable positions two pixels apart, with
+        ///                       `rows(in:)` reporting row 0 at both — so the
+        ///                       list jittered and never moved.
+        ///     CUSTOMERS (3155)  at origin 5288 the header covered row 218 while
+        ///                       `rows(in:)` still called it the top row, so a
+        ///                       step "down" to 219 resolved to origin 5265 —
+        ///                       above where the list already was. Both
+        ///                       directions scrolled toward the top.
+        ///
+        /// **Do not reach for `row(at:)` here.** It is the obvious API for "which
+        /// row is at this point" and it does not work in this table: the clip
+        /// view is wider than the table (1439 vs 1127 pt), so
+        /// `clipView.bounds.minX` is −312 and any probe point built from it is
+        /// outside the table horizontally. `row(at:)` rejects that and returns −1
+        /// for *every* row, whatever the y, which sends the caller to its
+        /// fallback on every call and pins the list to a single row. That was a
+        /// real bug here, not a hypothetical — it is what the second attempt at
+        /// this did.
+        ///
+        /// So the range comes from `rows(in:)` instead, over a rect built from
+        /// the clip origin with the header band taken off the top.
+        ///
+        /// Two deliberate details in that rect, both removing a dependency this
+        /// would otherwise rest on:
+        ///
+        /// - The y comes from `clipView.bounds`, not from `table.visibleRect`.
+        ///   `visibleRect` is intersected with the table's own bounds, so at the
+        ///   legal top origin (−28 … −23) it reports `minY` 0 and the probe lands
+        ///   28 pt down — inside row 0 *only* because row 0 happens to run to
+        ///   y=30. Two points of margin is not something to rely on; if SwiftUI
+        ///   ever drops the 5 pt leading pad, that spelling would report row 1
+        ///   while row 0 was plainly on screen.
+        /// - The half-point offset puts the probe inside the row rather than on
+        ///   its edge. `rows(in:)` excludes a zero-area intersection at the max
+        ///   edge, so an exactly-aligned origin already resolves to the row below
+        ///   — but if it didn't, `topVisibleRow` and `originY` would stop being
+        ///   inverses and a down-notch would compute the position it is already
+        ///   at. That is the classic stick, and half a point rules it out for
+        ///   free.
+        ///
+        /// - Returns: -1 when there is no top row to report — the table has no
+        ///   rows yet, or the clip is still parked where a previous, longer
+        ///   mailbox left it and the rect intersects nothing. Callers must treat
+        ///   that as "don't touch anything"; recording it would overwrite a good
+        ///   remembered position.
+        static func topVisibleRow(table: NSTableView, clipView: NSClipView) -> Int {
+            let hidden = clipView.contentInsets.top
+            let top = table.convert(NSPoint(x: 0, y: clipView.bounds.minY + hidden),
+                                    from: clipView).y
+            let height = clipView.bounds.height - hidden - clipView.contentInsets.bottom
+            // The table's own x, so this doesn't lean on `rows(in:)` tolerating
+            // the clip's negative one (it does, but there's no reason to depend
+            // on it).
+            let content = NSRect(x: table.bounds.minX, y: top + 0.5,
+                                 width: max(table.bounds.width, 1),
+                                 height: max(height, 1))
+            let visible = table.rows(in: content)
+            guard visible.length > 0, visible.location >= 0 else { return -1 }
+            return visible.location
+        }
+
+        /// The clip origin that puts `row` flush at the top of the visible
+        /// content area, clamped where a normal scroll view would stop.
+        ///
+        /// The floor is `-contentInsets.top`, **not** zero. The inset band is
+        /// inside the clip view's bounds, so an origin of 0 already has the first
+        /// row tucked up under the header; clamping there made the true top
+        /// unreachable, which is half of the `In` symptom above.
+        ///
+        /// The one place this geometry is expressed. The wheel and the
+        /// remembered-position restore both come through here, so they cannot
+        /// drift apart the way the read and the write just did.
+        static func originY(forTopRow row: Int, table: NSTableView,
+                            clipView: NSClipView, document: NSView) -> CGFloat {
+            // Into the clip view's own bounds space rather than assuming the
+            // document sits at its origin. `topVisibleRow` converts clip → table
+            // directly, so without this the two would be exact inverses only
+            // while `document.frame.origin` happens to be zero — which is true
+            // today and is precisely the kind of assumption this pair must not
+            // rest on, given they exist because a read and a write drifted apart.
+            let target = table.convert(table.rect(ofRow: row), to: document)
+            let wanted = clipView.convert(target.origin, from: document).y
+            let minY = -clipView.contentInsets.top
+            let maxY = max(minY, document.frame.maxY + clipView.contentInsets.bottom
+                                    - clipView.bounds.height)
+            return min(max(minY, wanted - clipView.contentInsets.top), maxY)
+        }
+
+        /// One console block per wheel event, reporting every number the monitor
+        /// computes and where the list actually ended up. Off; flip to true.
+        ///
+        /// Kept because it earned its place. The wheel misbehaved *differently
+        /// per mailbox* — a two-pixel jitter in a 134-row one, always-toward-the-
+        /// top in a 3,155-row one — while the scrollbar and arrow keys were both
+        /// fine. Nothing about that can be read off the screen: it looks the same
+        /// whether `rows(in:)` reports the wrong row, `rect(ofRow:)` returns a
+        /// degenerate rect, or the scroll is applied and then reverted.
+        ///
+        /// One run settled it, and not in favour of the obvious suspect.
+        /// `rect(ofRow:)` was perfectly healthy (row 0 at y=5, row 1 at 30, row
+        /// 133 at 3215) — the guess had been that SwiftUI's table subclass didn't
+        /// implement it, since it already doesn't implement
+        /// `rowView(atRow:makeIfNecessary:)`. The culprit was the line nobody was
+        /// looking at, `clip.insets.top 28.0`: see `topVisibleRow`.
+        ///
+        /// Two things to note if this is ever turned on again. `rowHeight`
+        /// reports 24 while the rects are 25 tall, so row offsets must come from
+        /// `rect(ofRow:)` and never from arithmetic on `rowHeight`. And
+        /// `document.frame.height` grows by a few points between consecutive
+        /// events on a long list (76208 → 76228 → 76247…) as SwiftUI refines its
+        /// row estimates — so treat any single height reading as approximate.
+        static let diagnose = false
     }
 
     /// `@unchecked Sendable` because the notification block below is `@Sendable`
@@ -1018,14 +1147,21 @@ struct TableScrollStateSyncer: NSViewRepresentable {
             forName: NSView.boundsDidChangeNotification,
             object: clipView,
             queue: .main
-        ) { [weak table, weak coordinator] _ in
-            guard let table, let coordinator, !coordinator.isRestoring else { return }
-            let visible = table.rows(in: table.visibleRect)
-            // rows(in:) reports {0, 0} — not NSNotFound — when nothing is
-            // visible, which happens mid-reload. Recording that would overwrite
-            // a good remembered position with 0.
-            guard visible.length > 0, visible.location >= 0 else { return }
-            let top = visible.location
+        ) { [weak table, weak clipView, weak coordinator] _ in
+            guard let table, let clipView, let coordinator,
+                  !coordinator.isRestoring else { return }
+            // The same inset-aware reading the wheel uses, so the position that
+            // gets remembered is the one the user sees at the top rather than
+            // the row hidden under the header — otherwise every restore came
+            // back a row higher than where they left off.
+            let top = Scrolling.topVisibleRow(table: table, clipView: clipView)
+            // -1 covers the mid-reload case as well as an empty table: the clip
+            // can still be parked at an origin inherited from the mailbox being
+            // left — a deep position in a 3,155-row mailbox landing on a 134-row
+            // one — and `topVisibleRow` reports the intersection is empty rather
+            // than guessing. Recording a guess would persist a wrong position
+            // for the mailbox just opened.
+            guard top >= 0 else { return }
             // AppModel is @MainActor and this closure is not, so hop rather than
             // assume isolation (MainActor.assumeIsolated is macOS 14+).
             Task { @MainActor in
@@ -1050,22 +1186,35 @@ struct TableScrollStateSyncer: NSViewRepresentable {
             guard let coordinator,
                   let table = coordinator.table,
                   let scrollView = table.enclosingScrollView,
-                  event.window === scrollView.window else { return event }
+                  event.window === scrollView.window else {
+                Self.diagnoseBail("no live table / wrong window",
+                                  table: coordinator?.table)
+                return event
+            }
 
             // Only claim events actually over this list — hit-testing rather
             // than a bounds check, so an overlay or popover in front of the
             // table keeps its own scrolling, and the preview pane and sidebar
             // are unaffected.
             guard let hit = scrollView.window?.contentView?.hitTest(event.locationInWindow),
-                  hit === scrollView || hit.isDescendant(of: scrollView) else { return event }
+                  hit === scrollView || hit.isDescendant(of: scrollView) else {
+                Self.diagnoseBail("hit test missed the scroll view", table: table)
+                return event
+            }
 
             // Horizontal scrolling isn't ours; let the table handle its columns.
-            if event.scrollingDeltaY == 0 { return event }
+            if event.scrollingDeltaY == 0 {
+                Self.diagnoseBail("deltaY == 0", table: table)
+                return event
+            }
 
             // Momentum ("glide" after the fingers lift) would send a long
             // uncontrolled run of row steps. Swallow it: this list steps in whole
             // rows under direct control only.
-            guard event.momentumPhase == [] else { return nil }
+            guard event.momentumPhase == [] else {
+                Self.diagnoseBail("momentum phase", table: table)
+                return nil
+            }
 
             let steps: CGFloat
             if event.hasPreciseScrollingDeltas {
@@ -1084,26 +1233,117 @@ struct TableScrollStateSyncer: NSViewRepresentable {
                 // magnitude: a notch is a row.
                 steps = event.scrollingDeltaY > 0 ? 1 : -1
             }
-            guard steps != 0 else { return nil }
-
-            let visible = table.rows(in: table.visibleRect)
-            guard visible.length > 0 else { return nil }
-
-            let direction: CGFloat = Scrolling.inverted ? 1 : -1
-            let targetRow = min(max(visible.location + Int(steps * direction), 0),
-                                max(table.numberOfRows - 1, 0))
+            guard steps != 0 else {
+                Self.diagnoseBail("steps rounded to 0", table: table)
+                return nil
+            }
 
             let clipView = scrollView.contentView
             let document = scrollView.documentView ?? table
-            let target = table.convert(table.rect(ofRow: targetRow), to: document)
-            // NSClipView.scroll(to:) doesn't constrain, so stop where a normal
-            // scroll view would: with the last row at the bottom, not the top.
-            let maxY = max(0, document.frame.height - clipView.bounds.height)
-            let y = min(max(0, target.minY - clipView.contentInsets.top), maxY)
+
+            // The row you can actually see, not the one under the header — see
+            // `Scrolling.topVisibleRow`, which is where this went wrong.
+            let currentTop = Scrolling.topVisibleRow(table: table, clipView: clipView)
+            guard currentTop >= 0 else {
+                Self.diagnoseBail("no rows", table: table)
+                return nil
+            }
+
+            let direction: CGFloat = Scrolling.inverted ? 1 : -1
+            let targetRow = min(max(currentTop + Int(steps * direction), 0),
+                                max(table.numberOfRows - 1, 0))
+
+            // Already showing that row. Consume the notch and do nothing, rather
+            // than re-deriving the origin: at the very top the clip can sit a few
+            // points above row 0's own origin (−28 vs −23), and recomputing would
+            // nudge the list *down* by that difference — an up-notch visibly
+            // moving the wrong way. Also spares a pointless scroller flash at
+            // both ends of the list.
+            guard targetRow != currentTop else { return nil }
+
+            // NSClipView.scroll(to:) doesn't constrain, so `originY` stops where
+            // a normal scroll view would: the first row clear of the header at
+            // one end, the last row at the bottom at the other.
+            let y = Scrolling.originY(forTopRow: targetRow, table: table,
+                                      clipView: clipView, document: document)
+            let before = clipView.bounds.origin.y
             clipView.scroll(to: NSPoint(x: clipView.bounds.origin.x, y: y))
             scrollView.reflectScrolledClipView(clipView)
             scrollView.flashScrollers()     // consuming the event skips this
+            Self.diagnoseScroll(event: event, table: table,
+                                clipView: clipView, document: document,
+                                steps: steps, currentTop: currentTop,
+                                targetRow: targetRow, y: y, before: before)
             return nil                      // consumed
+        }
+    }
+
+    // MARK: wheel diagnostics
+
+    private static func f(_ v: CGFloat) -> String { String(format: "%.1f", v) }
+    private static func f(_ r: NSRect) -> String {
+        "(\(f(r.minX)),\(f(r.minY)) \(f(r.width))×\(f(r.height)))"
+    }
+
+    /// Why a wheel event was passed through or swallowed without scrolling.
+    private static func diagnoseBail(_ reason: String, table: NSTableView?) {
+        guard Scrolling.diagnose else { return }
+        print("[wheel] BAIL: \(reason)  rows \(table?.numberOfRows ?? -1)")
+    }
+
+    /// Everything the monitor computed, and where the list actually ended up.
+    ///
+    /// Read it in this order:
+    ///
+    /// 1. **`currentTop` across consecutive notches.** It should move by exactly
+    ///    one per notch and in the direction of `steps`. If it stands still, or
+    ///    moves the wrong way, the reading of the current position is wrong —
+    ///    which is what it was, and `topVisibleRow` records why.
+    /// 2. **`rect(ofRow:)`** — the four sample rows should step by one row height
+    ///    each. If they are identical or zero-height, AppKit's row geometry isn't
+    ///    working on SwiftUI's table subclass and every notch computes the same
+    ///    `y`. (Checked: it is fine. Don't spend a second round here.)
+    /// 3. **`wanted y` vs `after` vs `settled`** — if `y` is right but `after` or
+    ///    `settled` differ, the scroll is being applied and then reverted by
+    ///    something else and this monitor's arithmetic is innocent.
+    private static func diagnoseScroll(event: NSEvent, table: NSTableView,
+                                       clipView: NSClipView,
+                                       document: NSView, steps: CGFloat,
+                                       currentTop: Int, targetRow: Int,
+                                       y: CGFloat, before: CGFloat) {
+        guard Scrolling.diagnose else { return }
+        let last = max(table.numberOfRows - 1, 0)
+        // Type pinned: a six-element literal of concatenated interpolations is
+        // exactly the shape that trips "unable to type-check in reasonable time".
+        let lines: [String] = [
+            "[wheel] deltaY \(f(event.scrollingDeltaY))"
+                + "  precise \(event.hasPreciseScrollingDeltas)"
+                + "  steps \(f(steps))"
+                + "  inverted \(Scrolling.inverted)",
+            "  rows \(table.numberOfRows)"
+                + "  rowHeight \(f(table.rowHeight))"
+                + "  spacing.h \(f(table.intercellSpacing.height))",
+            "  visibleRect \(f(table.visibleRect))"
+                + "  currentTop \(currentTop)"
+                + "  -> targetRow \(targetRow)",
+            "  rect(ofRow:) 0 \(f(table.rect(ofRow: 0)))"
+                + "  1 \(f(table.rect(ofRow: min(1, last))))"
+                + "  target \(f(table.rect(ofRow: targetRow)))"
+                + "  last[\(last)] \(f(table.rect(ofRow: last)))",
+            "  documentView \(document === table ? "IS the table" : String(describing: type(of: document)))"
+                + "  document.frame \(f(document.frame))"
+                + "  clip.bounds \(f(clipView.bounds))"
+                + "  clip.insets.top \(f(clipView.contentInsets.top))",
+            "  wanted y \(f(y))"
+                + "  before \(f(before))  after \(f(clipView.bounds.origin.y))",
+        ]
+        print(lines.joined(separator: "\n"))
+        // One turn later: if something else reverts the scroll, this is where it
+        // shows up — `after` above would be right and this one wrong.
+        DispatchQueue.main.async { [weak clipView, weak table] in
+            guard let clipView, let table else { return }
+            print("  [wheel] settled clip.origin.y \(f(clipView.bounds.origin.y))"
+                    + "  topVisibleRow \(Scrolling.topVisibleRow(table: table, clipView: clipView))")
         }
     }
 
@@ -1163,13 +1403,15 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         let generation = coordinator.restoreGeneration
         coordinator.isRestoring = true
 
-        // Convert into the document view's space and allow for the clip view's
-        // top inset, or the target row can end up hidden under the header.
+        // Through `Scrolling.originY`, the one place that knows how a row index
+        // becomes a clip origin — so a restore lands exactly where the wheel
+        // would have put it, and neither can be fixed without the other.
         let clipView = scrollView.contentView
         let document = scrollView.documentView ?? table
-        let target = table.convert(table.rect(ofRow: row), to: document)
         clipView.scroll(to: NSPoint(x: clipView.bounds.origin.x,
-                                    y: target.minY - clipView.contentInsets.top))
+                                    y: Scrolling.originY(forTopRow: row, table: table,
+                                                         clipView: clipView,
+                                                         document: document)))
         scrollView.reflectScrolledClipView(clipView)
 
         // Let the resulting bounds notification land before recording again.
