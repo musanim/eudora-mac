@@ -6,6 +6,8 @@ to do
 
 compress lines in message list
 
+Next, we need to untangle an issue between stephen@musanim.com (running Eudora 7 under the Windows emulation on a remote Mac) and stephen.malinowski@gmail.com (running Eudora 8 here).  Emails from 8 -> 7 work fine, but 7 -> 8 do not.
+
 
 
 

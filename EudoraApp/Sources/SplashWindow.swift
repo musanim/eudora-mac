@@ -75,7 +75,7 @@ enum SplashWindow {
     /// Puts the splash on screen immediately. Safe to call more than once.
     static func show() {
         guard enabled, !hasRun else { return }
-        guard window == nil, let art = NSImage(named: "EudoraSplash") else { return }
+        guard window == nil, let art = NSImage(named: "EudoraSplash8") else { return }
 
         let size = art.size
         let panel = NSWindow(contentRect: NSRect(origin: .zero, size: size),
