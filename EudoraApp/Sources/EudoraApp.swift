@@ -118,8 +118,15 @@ struct EudoraApp: App {
             Button("Open Eudora Folder…") { pickFolder(model) }
                 .keyboardShortcut("o", modifiers: .command)
             Divider()
+            // ⌘M, plain, deliberately taking the key macOS gives Minimize.
+            // Stephen minimises with the title-bar button and never the key, so
+            // the shortcut is free to reuse — and Check Mail is the one command
+            // worth a bare ⌘. It wins over Minimize because AppKit matches key
+            // equivalents by walking the menu bar in order and File precedes
+            // Window; see MinimizeKeyStripper, which removes the now-duplicate
+            // ⌘M glyph the Window menu would otherwise still show.
             Button("Check Mail") { Task { await model.receiveMail(accounts: accounts) } }
-                .keyboardShortcut("m", modifiers: [.command, .shift])
+                .keyboardShortcut("m", modifiers: .command)
         }
 
         // Edit. The standard `.pasteboard` and `.undoRedo` groups used to be
@@ -161,5 +168,56 @@ struct EudoraApp: App {
             }
             .disabled(!messageCommandsEnabled)
         }
+    }
+}
+
+/// Clears the ⌘M that macOS attaches to Window ▸ Minimize, now that File ▸ Check
+/// Mail owns that key.
+///
+/// Only the *glyph* is at stake. Check Mail already wins the keystroke — AppKit
+/// matches key equivalents by walking the menu bar in order, and File precedes
+/// Window — but the Window menu would still print ⌘M beside Minimize, which by
+/// this codebase's own standard "reads as a mistake". Minimize itself keeps
+/// working, from the menu and the title-bar button; it only loses a shortcut
+/// Stephen doesn't use.
+///
+/// A `.background` view rather than a launch hook, because the app has no
+/// AppDelegate and this matches how `MainWindowAccessor` already reaches into
+/// AppKit. `updateNSView` re-runs on SwiftUI updates, so if the Window menu is
+/// ever rebuilt with the key restored, the next update strips it again; the
+/// strip is idempotent, costing one menu walk.
+struct MinimizeKeyStripper: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        // The menu bar predates any view, but be defensive: on the very first
+        // pass it is occasionally not installed yet, so retry a few times.
+        DispatchQueue.main.async { Self.strip(attemptsLeft: 10) }
+    }
+
+    private static func strip(attemptsLeft: Int) {
+        guard let item = minimizeItem() else {
+            if attemptsLeft > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    strip(attemptsLeft: attemptsLeft - 1)
+                }
+            }
+            return
+        }
+        item.keyEquivalent = ""
+        item.keyEquivalentModifierMask = []
+    }
+
+    /// The standard Minimize item, found by its *action* rather than its title,
+    /// so a localised menu still matches. `performMiniaturize:` is the selector
+    /// AppKit wires that item to.
+    private static func minimizeItem() -> NSMenuItem? {
+        let selector = #selector(NSWindow.performMiniaturize(_:))
+        for top in NSApp.mainMenu?.items ?? [] {
+            if let found = top.submenu?.items.first(where: { $0.action == selector }) {
+                return found
+            }
+        }
+        return nil
     }
 }

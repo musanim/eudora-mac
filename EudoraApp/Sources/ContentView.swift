@@ -41,6 +41,8 @@ struct ContentView: View {
         // Tells SplashWindow which window is SwiftUI's, so it doesn't have to
         // guess from NSApp.windows (which raced with window placement).
         .background(MainWindowAccessor())
+        // Strips the now-duplicate ⌘M from Window ▸ Minimize; see the type.
+        .background(MinimizeKeyStripper())
     }
 
     private var splitView: some View {

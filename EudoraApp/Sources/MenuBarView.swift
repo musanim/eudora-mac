@@ -50,7 +50,7 @@ struct MenuBarView: View {
                 .keyboardShortcut("o", modifiers: .command)
             Divider()
             Button("Check Mail") { Task { await model.receiveMail(accounts: accounts) } }
-                .keyboardShortcut("m", modifiers: [.command, .shift])
+                .keyboardShortcut("m", modifiers: .command)
                 .disabled(model.isChecking)
             Divider()
             Button("Save") {}.disabled(true)
