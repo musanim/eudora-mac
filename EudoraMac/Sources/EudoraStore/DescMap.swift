@@ -5,7 +5,7 @@ import Foundation
 /// distinguished by name), **M** (regular mailbox), or **F** (folder — a `.fol`
 /// subdirectory with its own `descmap.pce`). The single-letter cases below are
 /// the internal roles we resolve those to (plus legacy fixture chars I/O/T/J).
-public enum MailboxType: String {
+public enum MailboxType: String, Sendable {
     case inbox = "I"
     case outbox = "O"
     case trash = "T"
@@ -32,7 +32,7 @@ public enum MailboxType: String {
 }
 
 /// One line of a `descmap.pce`: `DisplayName,Filename,TypeChar,UnreadStatus`.
-public struct DescMapEntry {
+public struct DescMapEntry: Sendable {
     public let display: String
     public let filename: String
     public let type: MailboxType

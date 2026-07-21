@@ -13,10 +13,6 @@ struct ComposeView: View {
     /// Closes this window.
     @Environment(\.dismiss) private var dismiss
 
-    /// Set once the user has answered the Save prompt, so the close that
-    /// follows isn't intercepted a second time and asked again.
-    @State private var closeApproved = false
-
     /// The window this editor is in, filled in by `WindowCloseGuard`. Closing
     /// goes through it rather than `dismiss()`, so the footer's Close button and
     /// Escape take the same route as the title-bar button and can't bypass the
@@ -94,7 +90,7 @@ struct ComposeView: View {
         // dismissed. Returning false holds it open; the dialog's buttons then
         // close it themselves.
         .background(WindowCloseGuard(shouldClose: {
-            if closeApproved || wasSent { return true }
+            if wasSent { return true }
             if isUntouched { model.discardDraft(currentDraft()); return true }
             if isDirty { showingSavePrompt = true; return false }
             return true
@@ -103,7 +99,7 @@ struct ComposeView: View {
         .confirmationDialog("Save changes to this message?",
                             isPresented: $showingSavePrompt) {
             Button("Save") {
-                if save() { closeAfterPrompt() }
+                if save() { forceClose() }
             }
             // Destructive only when it actually destroys something. On a
             // never-saved message Don't Save removes the record from Out; on one
@@ -111,7 +107,7 @@ struct ComposeView: View {
             // ordinary meaning and not worth a red button.
             Button("Don't Save", role: .destructive) {
                 if !draft.hasBeenSaved { model.discardDraft(currentDraft()) }
-                closeAfterPrompt()
+                forceClose()
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -225,15 +221,6 @@ struct ComposeView: View {
         requestClose()
     }
 
-    /// Close once the Save prompt has been answered.
-    ///
-    /// `closeApproved` first: the close goes back through `WindowCloseGuard`,
-    /// which would otherwise see the same unsaved state and ask again.
-    private func closeAfterPrompt() {
-        closeApproved = true
-        requestClose()
-    }
-
     /// Close via the window itself, so the guard is consulted.
     ///
     /// `performClose(_:)` sends `windowShouldClose`; `dismiss()` and
@@ -244,6 +231,28 @@ struct ComposeView: View {
     private func requestClose() {
         if let window = windowHandle.window {
             window.performClose(nil)
+        } else {
+            dismiss()
+        }
+    }
+
+    /// Close *without* consulting the guard, for when the question has already
+    /// been answered — the Save prompt, or a successful send.
+    ///
+    /// **Not a shortcut; the guard cannot be used here.** Its closure is
+    /// refreshed by SwiftUI on each render pass, and the state these callers set
+    /// (`wasSent`, or the saved `draft`) only takes effect on the *next* pass.
+    /// Closing synchronously on the following line means the guard is still
+    /// holding the closure captured before the change, sees the same unsaved
+    /// draft, and vetoes — which showed up as "Save saved it but the window
+    /// stayed open, and Close had to be pressed a second time".
+    ///
+    /// `NSWindow.close()` doesn't send `windowShouldClose`, which is exactly the
+    /// semantics wanted: the decision is made, don't re-ask. `onDisappear` still
+    /// runs, so the draft is still released from the model.
+    private func forceClose() {
+        if let window = windowHandle.window {
+            window.close()
         } else {
             dismiss()
         }
@@ -385,9 +394,11 @@ struct ComposeView: View {
                                      who: toList.first ?? "", subject: subject)
                 model.showBanner("Message sent.")
                 sending = false
-                // `wasSent` is already true, so the close guard lets this
-                // through without asking about unsaved changes.
-                requestClose()
+                // Not `requestClose()`: `wasSent` was set moments ago and the
+                // guard's closure won't have been refreshed yet, so it would
+                // still see an unsaved draft and ask about a message that has
+                // already gone out.
+                forceClose()
             } catch {
                 sending = false
                 self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

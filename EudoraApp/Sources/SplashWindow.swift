@@ -206,6 +206,28 @@ enum SplashWindow {
 struct MainWindowAccessor: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
 
+    /// Takes ⌘W away from the main window. Only ⌘Q ends the app.
+    ///
+    /// Dropping `.closable` rather than vetoing the close in a delegate. A veto
+    /// leaves a fully live-looking close button that silently does nothing;
+    /// without the trait AppKit draws it dimmed and disables File ▸ Close by
+    /// itself, so both the button and the menu state the situation rather than
+    /// lying about it. (The button is dimmed, not absent — the three traffic
+    /// lights are still drawn.)
+    ///
+    /// Only this window. `MainWindowAccessor` is attached to `ContentView`
+    /// alone, so compose and Find windows keep ⌘W — which is the point: closing
+    /// an editor is routine, closing the mailbox list is not something you ever
+    /// mean to do.
+    ///
+    /// Guarded on the live value because this runs on every `updateNSView`, and
+    /// assigning `styleMask` forces a titlebar rebuild — doing that on every
+    /// published model change would be visible.
+    static func makeUnclosable(_ window: NSWindow) {
+        guard window.styleMask.contains(.closable) else { return }
+        window.styleMask.remove(.closable)
+    }
+
     func updateNSView(_ nsView: NSView, context: Context) {
         // Synchronously if the window is already there: an async hop costs a
         // runloop turn, and in that turn the main window is on screen, empty,
@@ -223,6 +245,7 @@ struct MainWindowAccessor: NSViewRepresentable {
 
     private func attach(_ window: NSWindow, context: Context) {
         SplashWindow.mainWindowDidAppear(window)
+        Self.makeUnclosable(window)
 
         guard context.coordinator.observers.isEmpty else { return }
         for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification] {

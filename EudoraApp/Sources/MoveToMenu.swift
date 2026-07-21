@@ -30,9 +30,17 @@ import SwiftUI
 /// It was rebuilt on every mailbox switch because the items used to depend on
 /// the current selection (to exclude it). They no longer do — `moveSelected`
 /// ignores a move to the mailbox you're already in — so the content depends only
-/// on the tree, and `treeVersion` lets SwiftUI skip it the rest of the time.
+/// on the tree, and a version lets SwiftUI skip it the rest of the time.
+///
+/// **Pass `AppModel.treeStructureVersion`, not `treeVersion`.** This menu draws
+/// names and hierarchy and nothing else, but it was keyed on `treeVersion`,
+/// which changes whenever a *count* does — so every delete rebuilt all 2,657
+/// items inside `NSToolbarItemViewer` layout. Sampling caught 554 ms of it in a
+/// single delete, on the main thread, in the window where the message list was
+/// waiting to be redrawn.
 struct MoveToMenuContent: View, Equatable {
     let tree: [MailboxItem]
+    /// `AppModel.treeStructureVersion`. See the note above.
     let treeVersion: Int
     let action: (MailboxItem.ID) -> Void
 

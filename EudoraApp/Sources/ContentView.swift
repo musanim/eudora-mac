@@ -60,7 +60,7 @@ struct ContentView: View {
 
                 Menu {
                     MoveToMenuContent(tree: model.tree,
-                                      treeVersion: model.treeVersion) {
+                                      treeVersion: model.treeStructureVersion) {
                         model.moveSelected(to: $0)
                     }
                     .equatable()

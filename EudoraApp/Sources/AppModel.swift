@@ -312,6 +312,20 @@ final class AppModel: ObservableObject {
     /// the tree itself — see `MailboxTree` — because a structural comparison of
     /// 2,723 nested items on every render would cost as much as it saves.
     @Published private(set) var treeVersion = 0
+
+    /// Bumped only when the tree's *shape* changes — a mailbox added, removed or
+    /// renamed. Message counts and unread flags don't touch it.
+    ///
+    /// The Move menus need this rather than `treeVersion`. They show names and
+    /// hierarchy and nothing else, but they were keyed on `treeVersion`, so
+    /// every delete — which changes two counts and no structure — rebuilt all
+    /// 2,657 items eagerly inside `NSToolbarItemViewer` layout. Sampling caught
+    /// 554 ms of that in one delete, on the main thread, in the exact window
+    /// where the message list was waiting to be redrawn.
+    @Published private(set) var treeStructureVersion = 0
+
+    /// Hash of the last published shape, to tell the two apart.
+    private var treeShape = 0
     @Published var status: String = "No Eudora folder open."
 
     // Selected mailbox (sidebar) and message (table), by their ids. Reactions
@@ -582,6 +596,11 @@ final class AppModel: ObservableObject {
         // its completion, which persists the wrong selection and takes the splash
         // down over a message list that belongs to a folder we just closed.
         cancelBackgroundWork()
+        // Also abandon any tree walk still running against the *previous*
+        // store. `cancelBackgroundWork` deliberately doesn't do this — it is
+        // called on every sidebar click too, and dropping count refreshes there
+        // would leave the unread badges stale.
+        treeReloadGeneration &+= 1
 
         selectedMailboxID = nil
         selectedMessageID = nil
@@ -740,6 +759,53 @@ final class AppModel: ObservableObject {
             viewState.selectedMessageOffsetByMailbox[mailbox] = offset
         }
         ViewStateStore.save(viewState, forRoot: root)
+    }
+
+    /// The first mailbox of a given type, from the tree already in memory.
+    ///
+    /// **Never call `MailStore.mailboxBase(ofType:)` from here.** It looks like
+    /// an accessor and is a full filesystem walk: `flatten(tree())` rebuilds
+    /// every node from disk — 84 `descmap.pce` reads and a
+    /// `FileManager.attributesOfItem` per mailbox, 6,699 of them on Stephen's
+    /// archive. `outboxBase()` is the same function.
+    ///
+    /// That was being paid twice for every ⌘N (once to find Out, once for the
+    /// `reloadTree` afterwards), twice per draft save, and twice per delete —
+    /// on the main thread, which is why opening a compose window and deleting a
+    /// message both took a surprisingly long time despite touching a mailbox
+    /// with one message in it.
+    ///
+    /// Depth-first pre-order, matching what `flatten` returned, so "first of
+    /// this type" still means the same mailbox.
+    func base(ofType type: MailboxType) -> URL? {
+        func find(_ items: [MailboxItem]) -> MailboxItem? {
+            for item in items {
+                if !item.isFolder, item.type == type { return item }
+                if let kids = item.children, let hit = find(kids) { return hit }
+            }
+            return nil
+        }
+        return find(tree)?.base
+    }
+
+    /// Where sent and unsent mail lives, from the in-memory tree.
+    var outboxBase: URL? { base(ofType: .outbox) }
+
+    /// A hash of everything the Move menus draw: ids, labels, folder-ness and
+    /// nesting. Deliberately excludes `messageCount` and `hasUnread`, which are
+    /// the only things our own mutations change.
+    private static func shapeSignature(_ items: [MailboxItem]) -> Int {
+        var hasher = Hasher()
+        func walk(_ items: [MailboxItem]) {
+            for item in items {
+                hasher.combine(item.id)
+                hasher.combine(item.display)
+                hasher.combine(item.isFolder)
+                if let kids = item.children { walk(kids) }
+            }
+        }
+        walk(items)
+        return hasher.finalize()
     }
 
     private func indexItems(_ items: [MailboxItem]) {
@@ -1181,6 +1247,7 @@ final class AppModel: ObservableObject {
     /// down doesn't queue a render for every message passed through — only the
     /// one landed on is ever read from disk.
     func loadMessage() {
+        PerfLog.mark("loadMessage begins")
         previewTask?.cancel()
 
         guard let store,
@@ -1386,7 +1453,7 @@ final class AppModel: ObservableObject {
 
     /// Append a draft to Out as unsent, returning the record's byte offset.
     private func appendDraftRecord(_ draft: ComposeDraft) throws -> Int {
-        guard let store, let outbox = store.outboxBase() else {
+        guard let outbox = outboxBase else {
             throw MailboxMutator.MutateError.notFound
         }
         let result = try Outbox.append(messageData: draftBytes(draft),
@@ -1522,7 +1589,7 @@ final class AppModel: ObservableObject {
     /// right when a draft had no record of its own — now it would leave the
     /// unsent original sitting in Out beside its own sent copy.
     func recordSent(_ draft: ComposeDraft, raw: Data, who: String, subject: String) throws {
-        guard let store, let outbox = store.outboxBase() else { return }
+        guard let outbox = outboxBase else { return }
         if let index = locateDraft(draft, in: outbox) {
             let result = try MailboxMutator.replace(base: outbox, index: index,
                                                     messageData: raw,
@@ -1544,7 +1611,7 @@ final class AppModel: ObservableObject {
     /// Throw away a draft's record. Used by Don't Save on a message that was
     /// never saved, where the record holds only the empty shell from opening.
     func discardDraft(_ draft: ComposeDraft) {
-        guard let store, let outbox = store.outboxBase(),
+        guard let outbox = outboxBase,
               let index = locateDraft(draft, in: outbox) else { return }
         do {
             let (record, entry) = try MailboxMutator.remove(base: outbox, index: index)
@@ -1563,7 +1630,7 @@ final class AppModel: ObservableObject {
     /// The one place a draft's bytes reach the mailbox, so the resolve-offset →
     /// replace → fall-back-to-append sequence exists once.
     private func writeDraft(_ draft: ComposeDraft, status: Int) throws -> Int {
-        guard let store, let outbox = store.outboxBase() else {
+        guard let outbox = outboxBase else {
             throw MailboxMutator.MutateError.notFound
         }
         let data = draftBytes(draft)
@@ -1603,7 +1670,7 @@ final class AppModel: ObservableObject {
     func reopenDraft(messageIndex: Int) {
         // Only from Out. `isUnsent` is a status test, not a location one, and a
         // status-9 record can sit in any mailbox — dragged out of Out, or left
-        // by real Eudora. Every write path here targets `outboxBase()`, so
+        // by real Eudora. Every write path here targets the Out mailbox, so
         // reopening one from elsewhere would save a *copy* into Out and leave
         // the original behind, quietly forking the message.
         //
@@ -1762,15 +1829,84 @@ final class AppModel: ObservableObject {
 
     // MARK: write-back after a successful send
 
-    /// Append a just-sent message to the Out mailbox and refresh the UI.
-    /// Rebuild the sidebar tree (e.g. after message counts change) without
-    /// disturbing the current selection.
+    /// Bumped per tree rebuild, so a slow one can't install itself over a newer
+    /// — or over a different tree entirely, which is why `open` bumps it too.
+    private var treeReloadGeneration = 0
+
+    /// One walk at a time, with at most one more queued behind it.
+    ///
+    /// Every save, delete and mark-as-read asks for a refresh, so deleting ten
+    /// messages quickly would otherwise start ten independent walks of 6,699
+    /// mailboxes. The generation guard makes the *result* right, but the work
+    /// still runs — each one holding a cooperative-pool thread blocked in
+    /// `getattrlist`, and the pool is only core-count sized, so a burst can
+    /// starve the listing and enrichment tasks of threads for seconds. That is
+    /// the same shape as the stacked-overlapping-reads bug this project has hit
+    /// before.
+    ///
+    /// Collapsing them loses nothing: a walk sees whatever is on disk when it
+    /// runs, so one at the end reports everything the skipped ones would have.
+    private var treeReloadInFlight = false
+    private var treeReloadRequested = false
+
+    /// Refresh the sidebar's mailbox counts, off the main thread.
+    ///
+    /// **Why this can't be synchronous.** Building the tree stats every mailbox
+    /// to read its `.toc` size, and Stephen's archive has 6,699 of them. Sampling
+    /// a single ⌘N measured 434 ms on the main thread, 339 of it here, almost
+    /// all in `getattrlist` — one syscall per mailbox. That is a kernel cost, so
+    /// it doesn't go away in a release build, and it was being paid after every
+    /// new message, every draft save, every delete and every mark-as-read.
+    ///
+    /// Nothing needs the result synchronously. The structure of the tree doesn't
+    /// change under our own mutations — only counts and unread flags do — so
+    /// `itemsByID`, `base(ofType:)` and the listing all stay valid while this is
+    /// in flight, and the sidebar's numbers settle a moment later. Nothing in
+    /// the app creates or deletes a *mailbox*; the one capability given up is
+    /// noticing one made in the Finder while the app is running, which now needs
+    /// a File ▸ Open rather than arriving on the next mutation.
     private func reloadTree() {
+        guard store != nil else { return }
+        guard !treeReloadInFlight else {
+            treeReloadRequested = true
+            return
+        }
+        startTreeReload()
+    }
+
+    private func startTreeReload() {
         guard let store else { return }
-        tree = Self.buildItems(store.tree(), prefix: "")
-        treeVersion &+= 1
-        itemsByID = [:]
-        indexItems(tree)
+        treeReloadInFlight = true
+        treeReloadRequested = false
+        treeReloadGeneration &+= 1
+        let generation = treeReloadGeneration
+        PerfLog.mark("tree walk queued")
+        Task { [weak self] in
+            let nodes = await Task.detached(priority: .userInitiated) {
+                store.tree()
+            }.value
+            PerfLog.mark("tree walk done: \(nodes.count) roots")
+            guard let self else { return }
+            self.treeReloadInFlight = false
+            // A different tree may have been opened while this walked. Installing
+            // it would put the old folder's mailboxes in the sidebar — the same
+            // failure `cancelBackgroundWork` guards against for listings.
+            guard self.treeReloadGeneration == generation else { return }
+            let items = Self.buildItems(nodes, prefix: "")
+            let shape = Self.shapeSignature(items)
+            self.tree = items
+            self.treeVersion &+= 1
+            // Only when the shape actually moved. Hashing 6,699 ids costs
+            // microseconds; rebuilding the Move menus costs half a second.
+            if shape != self.treeShape {
+                self.treeShape = shape
+                self.treeStructureVersion &+= 1
+            }
+            self.itemsByID = [:]
+            self.indexItems(self.tree)
+            PerfLog.mark("tree published (treeVersion \(self.treeVersion))")
+            if self.treeReloadRequested { self.startTreeReload() }
+        }
     }
 
     // MARK: message management (delete / move / mark read)
@@ -1850,12 +1986,12 @@ final class AppModel: ObservableObject {
 
     /// Delete = move to Trash; if already in Trash, remove permanently.
     func deleteSelected() {
-        guard let store, let sel = currentSelection() else { return }
+        guard let sel = currentSelection() else { return }
         do {
             if sel.item.type == .trash {
                 try MailboxMutator.remove(base: sel.item.base, index: sel.index)
                 showBanner("Message deleted.")
-            } else if let trash = store.mailboxBase(ofType: .trash) {
+            } else if let trash = base(ofType: .trash) {
                 try MailboxMutator.move(from: sel.item.base, index: sel.index, to: trash)
                 showBanner("Moved to Trash.")
             } else {
@@ -1885,6 +2021,7 @@ final class AppModel: ObservableObject {
 
     /// The selected message left the current mailbox: clear it and refresh.
     private func afterRemoval() {
+        PerfLog.mark("afterRemoval begins")
         selectedMessageID = nil
         preview = nil
         // Clear the rows rather than leaving them up during the re-list.
@@ -1893,8 +2030,20 @@ final class AppModel: ObservableObject {
         // message than the one shown. A blank list for the duration is honest;
         // a stale one is not.
         setRows([])
-        rebuildRows()
-        reloadTree()
+        // The tree refresh runs *after* the rows are back, not alongside them.
+        //
+        // Publishing a new tree re-renders the sidebar over 6,699 nodes, and
+        // that lands on the main actor — where the listing's continuation is
+        // also queued. Started together, the render wins and the finished
+        // listing waits behind it: measured at 4,017 ms between the read
+        // completing and the rows appearing, for a mailbox holding one 350-byte
+        // message. Sequencing them puts the list back immediately and lets the
+        // sidebar's counts settle a moment later, which is the order that
+        // matters to someone watching.
+        rebuildRows { [weak self] in
+            self?.reloadTree()
+        }
+        PerfLog.mark("afterRemoval returned")
     }
 
     // MARK: receiving (POP3)
@@ -1903,7 +2052,7 @@ final class AppModel: ObservableObject {
     /// opted in — delete them from the server in a second pass, after they're
     /// safely written locally.
     func receiveMail(accounts: AccountStore) async {
-        guard let store, let inbox = store.mailboxBase(ofType: .inbox) else {
+        guard let inbox = base(ofType: .inbox) else {
             showError("No In mailbox in this tree.")
             return
         }

@@ -1,7 +1,7 @@
 import Foundation
 
 /// A node in the mailbox tree reconstructed from `descmap.pce`.
-public struct MailboxNode {
+public struct MailboxNode: Sendable {
     public let entry: DescMapEntry
     public let base: URL        // ".../In" for a mailbox, ".../Projects" for a folder
     public let depth: Int
@@ -94,10 +94,15 @@ public struct MailStore: Sendable {
     }
 
     /// Message count from the `.toc` file size, without reading its contents.
+    ///
+    /// `resourceValues(forKeys:)` rather than `attributesOfItem(atPath:)`: the
+    /// latter builds a dictionary of every attribute the filesystem knows —
+    /// owner, permissions, dates, inode — to answer one question about size.
+    /// This runs once per mailbox on every tree walk, which on Stephen's archive
+    /// is 6,699 of them, so the difference is not academic.
     private func tocEntryCount(base: URL) -> Int? {
-        let path = tocURL(base).path
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-              let size = (attrs[.size] as? NSNumber)?.intValue,
+        guard let size = try? tocURL(base)
+                .resourceValues(forKeys: [.fileSizeKey]).fileSize,
               size >= Toc.folderSize else { return nil }
         return (size - Toc.folderSize) / Toc.entrySize
     }
