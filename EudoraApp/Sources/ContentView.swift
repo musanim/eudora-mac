@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var accounts: AccountStore
+    @Environment(\.openWindow) private var openWindow
 
     private var hasSelection: Bool { model.selectedMessageID != nil }
 
@@ -86,6 +87,15 @@ struct ContentView: View {
             // can be created from places that never see the AccountStore — the
             // message list's right-click Reply, for one. Handed over once here.
             model.accounts = accounts
+            // Compose is a window per message now, not a sheet, and only a view
+            // can reach `openWindow`. Handing the action over once means the
+            // model can present a draft window even with no window on screen —
+            // ⌘N used to write a record into Out and show nothing in that case.
+            //
+            // `openWindow(id:value:)` brings an existing window for the same
+            // value forward rather than opening a second, which is what makes
+            // double-clicking an already-open draft focus it.
+            model.presentDraftWindow = { openWindow(id: ComposeWindow.groupID, value: $0) }
             // Splash first — the main window exists by now, so it can be
             // centered over it, and the run loop is running, so it paints.
             SplashWindow.show()
@@ -108,11 +118,6 @@ struct ContentView: View {
         }
         .onChange(of: model.selectedMessageID) { _ in
             DispatchQueue.main.async { model.loadMessage() }
-        }
-        .sheet(item: $model.composing) { draft in
-            ComposeView(seed: draft)
-                .environmentObject(model)
-                .environmentObject(accounts)
         }
         .overlay(alignment: .top) {
             if let banner = model.banner {

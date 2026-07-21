@@ -416,8 +416,29 @@ final class AppModel: ObservableObject {
     /// Message index → position in `rows`, maintained by `setRows`.
     private var rowPositionByID: [Int: Int] = [:]
 
-    /// Non-nil while a compose sheet is open.
-    @Published var composing: ComposeDraft?
+    /// Every message currently open for editing, keyed by draft id.
+    ///
+    /// The model owns these, not the windows, and that is the whole point.
+    /// Several drafts can be open at once, they all live in the same Out
+    /// mailbox, and saving one *moves the others*: `replace` shifts every record
+    /// after the one it rewrote. A window holding its own offset in `@State`
+    /// would go stale the moment you saved an earlier draft, and its next save
+    /// would append a duplicate rather than update. Keeping them here means
+    /// `shiftDraftOffsets` can fix all of them at once.
+    @Published private(set) var openDrafts: [ComposeDraft.ID: ComposeDraft] = [:]
+
+    /// Opens (or brings forward) the window for a draft.
+    ///
+    /// `openWindow` is an `@Environment` action, so only a view can reach it —
+    /// the model can't open its own windows. `ContentView` hands the action over
+    /// once at launch, and the captured `OpenWindowAction` keeps working
+    /// afterwards, including when no window is on screen.
+    ///
+    /// This replaced a published queue that `ContentView` drained. The queue had
+    /// a hole: with the main window closed nothing was draining it, so ⌘N wrote
+    /// an empty record into Out and no window ever appeared — a silent orphan
+    /// every time.
+    var presentDraftWindow: ((ComposeDraft.ID) -> Void)?
 
     /// The mail account, for assembling a draft's From line.
     ///
@@ -1308,7 +1329,40 @@ final class AppModel: ObservableObject {
                 + describe(error)
                 + " It can still be written and sent; it just isn't saved yet."
         }
-        composing = draft
+        openDrafts[draft.id] = draft
+        presentDraftWindow?(draft.id)
+    }
+
+    /// A compose window has closed. The record in Out stays; only the editing
+    /// session ends.
+    func closeDraft(_ id: ComposeDraft.ID) {
+        openDrafts.removeValue(forKey: id)
+    }
+
+    /// Fold a window's edits back into the model's copy.
+    func updateDraft(_ draft: ComposeDraft) {
+        guard openDrafts[draft.id] != nil else { return }
+        openDrafts[draft.id] = draft
+    }
+
+    /// Move every *other* open draft's offset to follow a write to Out.
+    ///
+    /// A replacement that changes length shifts every record after it, and a
+    /// removal shifts everything after the hole. Drafts sitting after the
+    /// changed record must be told, or their offsets silently start naming the
+    /// wrong bytes — and `locateDraft`'s Message-ID check would then reject
+    /// them, so every subsequent save would append a copy instead of updating.
+    ///
+    /// Strictly greater than: a record at exactly `offset` is the one that
+    /// changed, and `replace` leaves its own offset alone.
+    private func shiftDraftOffsets(after offset: Int, by delta: Int, except id: ComposeDraft.ID?) {
+        guard delta != 0 else { return }
+        for key in openDrafts.keys where key != id {
+            guard var draft = openDrafts[key],
+                  let existing = draft.outOffset, existing > offset else { continue }
+            draft.outOffset = existing + delta
+            openDrafts[key] = draft
+        }
     }
 
     /// A readable message for a store error. `MutateError` and `WriteError`
@@ -1383,19 +1437,42 @@ final class AppModel: ObservableObject {
     /// could overwrite unrelated mail. Returning nil is safe: callers append
     /// instead, which at worst duplicates rather than destroys.
     private func locateDraft(_ draft: ComposeDraft, in outbox: URL) -> Int? {
-        guard let store, let offset = draft.outOffset,
-              let index = store.indexOfRecord(at: outbox, offset: offset) else { return nil }
-        // Fails *closed*: a draft with no ID can't be proven to be this record,
-        // and the caller appending a duplicate is a far smaller harm than
-        // overwriting someone's mail. Nothing today can reach this — every draft
-        // gets an ID in `beginCompose` — but the default is `""`, so a future
-        // one built another way would otherwise silently get the unchecked
-        // behaviour this method exists to prevent.
-        guard !draft.messageID.isEmpty else { return nil }
-        guard MailboxMutator.messageID(base: outbox, index: index) == draft.messageID else {
-            return nil
+        // Fails *closed*: a draft with no ID can't be proven to be any record,
+        // and appending a duplicate is a far smaller harm than overwriting
+        // someone's mail. Nothing today can reach this — every draft gets an ID
+        // in `beginCompose` — but the default is `""`, so a future one built
+        // another way would otherwise silently get the unchecked behaviour this
+        // method exists to prevent.
+        guard let store, !draft.messageID.isEmpty else { return nil }
+
+        if let offset = draft.outOffset,
+           let index = store.indexOfRecord(at: outbox, offset: offset),
+           MailboxMutator.messageID(base: outbox, index: index) == draft.messageID {
+            return index
         }
-        return index
+        return findDraft(draft, in: outbox)
+    }
+
+    /// Find a draft's record by Message-ID when its offset has gone stale.
+    ///
+    /// Offsets go stale for reasons the draft's window never hears about:
+    /// deleting or moving a message in Out from the main window shifts
+    /// everything after it, and unlike a save from another compose window that
+    /// path has no idea any drafts exist. Without this, the next save from the
+    /// affected window appends a duplicate and orphans the original — which is
+    /// the failure this whole design is trying to avoid, arriving by a different
+    /// door.
+    ///
+    /// A linear scan, which is only defensible because it runs on a save that
+    /// has already failed its cheap lookup, and because Out is small. Never let
+    /// this become the primary path.
+    private func findDraft(_ draft: ComposeDraft, in outbox: URL) -> Int? {
+        guard let store, let listing = store.list(at: outbox) else { return nil }
+        for row in listing.rows
+        where MailboxMutator.messageID(base: outbox, index: row.index) == draft.messageID {
+            return row.index
+        }
+        return nil
     }
 
     /// Re-list Out if it's the mailbox on screen, so a draft appearing,
@@ -1419,6 +1496,7 @@ final class AppModel: ObservableObject {
         // a statement about the last *attempt*, and editing invalidates it.
         draft.outOffset = try writeDraft(draft, status: MailboxMutator.statusUnsent)
         draft.hasBeenSaved = true
+        updateDraft(draft)
         return draft
     }
 
@@ -1433,6 +1511,7 @@ final class AppModel: ObservableObject {
         var draft = draft
         draft.outOffset = try writeDraft(draft, status: MailboxMutator.statusSendError)
         draft.hasBeenSaved = true
+        updateDraft(draft)
         return draft
     }
 
@@ -1445,10 +1524,11 @@ final class AppModel: ObservableObject {
     func recordSent(_ draft: ComposeDraft, raw: Data, who: String, subject: String) throws {
         guard let store, let outbox = store.outboxBase() else { return }
         if let index = locateDraft(draft, in: outbox) {
-            try MailboxMutator.replace(base: outbox, index: index,
-                                       messageData: raw,
-                                       status: MailboxMutator.statusSent,
-                                       who: who, subject: subject)
+            let result = try MailboxMutator.replace(base: outbox, index: index,
+                                                    messageData: raw,
+                                                    status: MailboxMutator.statusSent,
+                                                    who: who, subject: subject)
+            shiftDraftOffsets(after: result.offset, by: result.delta, except: draft.id)
         } else {
             // No record to update — the pre-save failed, or something outside
             // the app removed it. Appending is the honest fallback: better a
@@ -1467,7 +1547,13 @@ final class AppModel: ObservableObject {
         guard let store, let outbox = store.outboxBase(),
               let index = locateDraft(draft, in: outbox) else { return }
         do {
-            try MailboxMutator.remove(base: outbox, index: index)
+            let (record, entry) = try MailboxMutator.remove(base: outbox, index: index)
+            // Removing leaves a hole, so everything after it slides left by the
+            // record's length. Same bookkeeping as a replace, opposite sign.
+            //
+            // `entry.offset`, not the draft's: the located record may not be
+            // where the draft thought it was.
+            shiftDraftOffsets(after: entry.offset, by: -record.count, except: draft.id)
             refreshOutIfShowing()
         } catch {
             showError("Couldn't remove the abandoned message from Out: " + describe(error))
@@ -1483,14 +1569,21 @@ final class AppModel: ObservableObject {
         let data = draftBytes(draft)
         defer { refreshOutIfShowing() }
 
-        if let index = locateDraft(draft, in: outbox), let offset = draft.outOffset {
-            try MailboxMutator.replace(base: outbox, index: index,
-                                       messageData: data, status: status,
-                                       who: draft.to, subject: draft.subject)
-            // `replace` leaves this record's own offset alone — only later ones
-            // move — so the draft still knows where it lives.
-            return offset
+        if let index = locateDraft(draft, in: outbox) {
+            let result = try MailboxMutator.replace(base: outbox, index: index,
+                                                    messageData: data, status: status,
+                                                    who: draft.to, subject: draft.subject)
+            // Everything after this record just moved. Tell the other open
+            // drafts before returning, or the next save from one of those
+            // windows writes to the wrong place.
+            shiftDraftOffsets(after: result.offset, by: result.delta, except: draft.id)
+            // `result.offset`, not the draft's own: `locateDraft` may have
+            // recovered from a stale offset by finding the record's Message-ID
+            // elsewhere, in which case the value we came in with is wrong and
+            // returning it would leave the draft stale for good.
+            return result.offset
         }
+        // Appending only grows the file at the end, so no existing offset moves.
         return try Outbox.append(messageData: data, to: outbox, status: status,
                                  who: draft.to, subject: draft.subject).messageOffset
     }
@@ -1514,17 +1607,20 @@ final class AppModel: ObservableObject {
         // reopening one from elsewhere would save a *copy* into Out and leave
         // the original behind, quietly forking the message.
         //
-        // `composing == nil` is belt-and-braces while compose is a sheet: it is
-        // modal over this very window, so the table can't be double-clicked
-        // while one is open. When compose moves to its own window that changes
-        // — a double-click on a second draft would hit this guard and do
-        // nothing at all, with no feedback. Revisit it there.
-        guard composing == nil,
-              let store,
+        guard let store,
               let mid = selectedMailboxID, let item = itemsByID[mid],
               !item.isFolder, item.type == .outbox,
               let msg = store.message(at: item.base, index: messageIndex) else { return }
         let part = msg.part
+
+        // Already open? Bring that window forward instead of starting a second
+        // editing session on the same record — two windows saving over each
+        // other would be a fine way to lose half a message. Matched on the
+        // record's offset, which is what identifies a draft in Out.
+        if let open = openDrafts.values.first(where: { $0.outOffset == msg.record.offset }) {
+            presentDraftWindow?(open.id)
+            return
+        }
 
         var draft = ComposeDraft(
             to: HeaderDecoder.decode(part.header("To") ?? ""),
@@ -1551,10 +1647,15 @@ final class AppModel: ObservableObject {
                 fromName: "", fromAddress: accounts?.account.fromAddress ?? "",
                 to: [], subject: "", body: "").generatedMessageID()
             do {
-                try MailboxMutator.replace(base: item.base, index: messageIndex,
-                                           messageData: draftBytes(draft),
-                                           status: MailboxMutator.statusUnsent,
-                                           who: draft.to, subject: draft.subject)
+                let result = try MailboxMutator.replace(base: item.base, index: messageIndex,
+                                                        messageData: draftBytes(draft),
+                                                        status: MailboxMutator.statusUnsent,
+                                                        who: draft.to, subject: draft.subject)
+                // Stamping the ID rewrites the record and almost certainly
+                // changes its length, so this moves everything after it just as
+                // a save would. `except: nil` — this draft isn't in `openDrafts`
+                // yet, and its own offset doesn't move anyway.
+                shiftDraftOffsets(after: result.offset, by: result.delta, except: nil)
                 refreshOutIfShowing()
             } catch {
                 // The stamp didn't land, so saving can't prove this record is
@@ -1567,7 +1668,8 @@ final class AppModel: ObservableObject {
         } else {
             draft.messageID = existingID
         }
-        composing = draft
+        openDrafts[draft.id] = draft
+        presentDraftWindow?(draft.id)
     }
 
     /// Build a reply (or reply-all) from the selected message.

@@ -24,6 +24,27 @@ struct EudoraApp: App {
         }
         .commands { eudoraCommands }
 
+        // One window per message being composed, as Eudora had — several can be
+        // open at once and each closes on its own.
+        //
+        // Keyed by draft id rather than presenting a draft value directly: the
+        // draft itself lives in `AppModel.openDrafts`, because saving one draft
+        // moves the records of the others in Out and they all have to be
+        // corrected together. A window holding its own copy couldn't be told.
+        //
+        // `openWindow(id:value:)` reuses the window already showing a given
+        // value rather than making a second one, which is exactly the behaviour
+        // wanted when a draft is double-clicked while it's already open.
+        WindowGroup(id: ComposeWindow.groupID, for: ComposeDraft.ID.self) { $draftID in
+            ComposeWindow(draftID: draftID)
+                .environmentObject(model)
+                .environmentObject(accounts)
+        }
+        // No `New Message` in the File menu for this group — the app's own
+        // command creates the draft record first, and a window opened by
+        // SwiftUI with no draft behind it would have nothing to edit.
+        .commandsRemoved()
+
         // The Eudora "Find Messages" window (⌘F / Edit ▸ Find… / Tools ▸ Search…).
         // Shares the single AppModel so results open in the main window.
         Window("Find Messages", id: "find") {
@@ -67,15 +88,19 @@ struct EudoraApp: App {
     /// `MenuBarView`.
     /// Whether the message commands should be live.
     ///
-    /// `composing == nil` is the load-bearing half. These shortcuts are global
+    /// `openDrafts.isEmpty` is the load-bearing half. These shortcuts are global
     /// now, in a way the in-window menu's decorative ones never were, so ⌘⌫
-    /// would reach Message ▸ Delete *while you are typing in the compose sheet*
+    /// would reach Message ▸ Delete *while you are typing in a compose window*
     /// — where it otherwise means delete-to-start-of-line — and silently throw
     /// away whatever message is selected in the list behind it. A menu-bar key
     /// equivalent beats the field editor, so the only defence is not offering
     /// the command while a draft is open.
+    ///
+    /// Disabled while *any* draft is open, not just a frontmost one: a command
+    /// menu has no notion of which window is key, and erring toward unavailable
+    /// costs a menu click where erring the other way costs a message.
     private var messageCommandsEnabled: Bool {
-        model.composing == nil && model.canActOnMessage
+        model.openDrafts.isEmpty && model.canActOnMessage
     }
 
     // `@MainActor` is not strictly required — the `@StateObject` properties

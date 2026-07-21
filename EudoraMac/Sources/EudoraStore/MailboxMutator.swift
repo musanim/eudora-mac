@@ -64,9 +64,25 @@ public enum MailboxMutator {
     /// line; this writes one, the same way `Outbox.append` does, so the caller
     /// deals only in message bytes.
     ///
-    /// - Returns: the replaced record's new 1-based index. Unchanged from the
-    ///   one passed in — the message stays where it was — but returned so
-    ///   callers read the invariant rather than assume it.
+    /// What a replacement did to the mailbox around it.
+    public struct ReplaceResult {
+        /// The replaced record's 1-based index. Unchanged from the one passed
+        /// in — the message stays where it was — but returned so callers read
+        /// the invariant rather than assume it.
+        public let index: Int
+        /// Byte offset of the replaced record. Also unchanged.
+        public let offset: Int
+        /// How far every record *after* this one moved: positive if the new
+        /// version is longer, negative if shorter.
+        ///
+        /// Callers holding offsets into this mailbox — an open draft window, say
+        /// — must add this to any offset greater than `offset`, or they will be
+        /// pointing at the wrong bytes. Nothing detects that for them: a stale
+        /// offset either fails to resolve or, worse, resolves to a different
+        /// real message.
+        public let delta: Int
+    }
+
     @discardableResult
     public static func replace(base: URL,
                                index: Int,
@@ -74,7 +90,7 @@ public enum MailboxMutator {
                                status: Int,
                                who: String,
                                subject: String,
-                               date: Date = Date()) throws -> Int {
+                               date: Date = Date()) throws -> ReplaceResult {
         let mbx = base.appendingPathExtension("mbx")
         let toc = base.appendingPathExtension("toc")
         // Refuse if Eudora itself looks to have the mailbox open, the same test
@@ -124,7 +140,7 @@ public enum MailboxMutator {
         } else if FileManager.default.fileExists(atPath: toc.path) {
             try? FileManager.default.removeItem(at: toc)
         }
-        return index
+        return ReplaceResult(index: index, offset: rec.offset, delta: delta)
     }
 
     /// The `Message-ID` header of one record, without parsing the rest of the

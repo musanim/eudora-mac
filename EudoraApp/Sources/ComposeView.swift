@@ -7,7 +7,21 @@ struct ComposeView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var accounts: AccountStore
 
+    let draftID: ComposeDraft.ID
     let seed: ComposeDraft
+
+    /// Closes this window.
+    @Environment(\.dismiss) private var dismiss
+
+    /// Set once the user has answered the Save prompt, so the close that
+    /// follows isn't intercepted a second time and asked again.
+    @State private var closeApproved = false
+
+    /// The window this editor is in, filled in by `WindowCloseGuard`. Closing
+    /// goes through it rather than `dismiss()`, so the footer's Close button and
+    /// Escape take the same route as the title-bar button and can't bypass the
+    /// Save prompt.
+    @State private var windowHandle = WindowCloseGuard.WindowHandle()
     @State private var to: String
     @State private var cc: String
     @State private var bcc: String
@@ -47,7 +61,8 @@ struct ComposeView: View {
     /// nothing discards, and closing never prompts.
     @State private var wasSent = false
 
-    init(seed: ComposeDraft) {
+    init(draftID: ComposeDraft.ID, seed: ComposeDraft) {
+        self.draftID = draftID
         self.seed = seed
         _draft = State(initialValue: seed)
         _to = State(initialValue: seed.to)
@@ -74,18 +89,29 @@ struct ComposeView: View {
         }
         .frame(minWidth: 580, minHeight: 460)
         .background(BackTabCatcher { focus = Self.field(before: focus) })
+        // Catches the window's own close button and ⌘W, not just the Close
+        // button in the footer — the prompt has to appear however the window is
+        // dismissed. Returning false holds it open; the dialog's buttons then
+        // close it themselves.
+        .background(WindowCloseGuard(shouldClose: {
+            if closeApproved || wasSent { return true }
+            if isUntouched { model.discardDraft(currentDraft()); return true }
+            if isDirty { showingSavePrompt = true; return false }
+            return true
+        }, handle: windowHandle))
+        .onDisappear { model.closeDraft(draftID) }
         .confirmationDialog("Save changes to this message?",
                             isPresented: $showingSavePrompt) {
             Button("Save") {
-                if save() { model.composing = nil }
+                if save() { closeAfterPrompt() }
             }
             // Destructive only when it actually destroys something. On a
             // never-saved message Don't Save removes the record from Out; on one
             // with a saved version it reverts to that version, which is the
             // ordinary meaning and not worth a red button.
             Button("Don't Save", role: .destructive) {
-                if !draft.hasBeenSaved { model.discardDraft(draft) }
-                model.composing = nil
+                if !draft.hasBeenSaved { model.discardDraft(currentDraft()) }
+                closeAfterPrompt()
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -192,22 +218,51 @@ struct ComposeView: View {
     /// whether to save a message you never typed in is noise — but its empty
     /// record still has to come out of Out, since it was written on open.
     private func attemptClose() {
-        if wasSent {
-            // Delivered. There is nothing to save and nothing to discard.
-            model.composing = nil
-        } else if isUntouched {
-            model.discardDraft(draft)
-            model.composing = nil
-        } else if isDirty {
-            showingSavePrompt = true
+        // Deliberately thin: the footer's Close button just asks the window to
+        // close, and `WindowCloseGuard` runs the same checks it would for the
+        // title-bar button or ⌘W. Duplicating the decision here would mean two
+        // places to keep in step, and they would drift.
+        requestClose()
+    }
+
+    /// Close once the Save prompt has been answered.
+    ///
+    /// `closeApproved` first: the close goes back through `WindowCloseGuard`,
+    /// which would otherwise see the same unsaved state and ask again.
+    private func closeAfterPrompt() {
+        closeApproved = true
+        requestClose()
+    }
+
+    /// Close via the window itself, so the guard is consulted.
+    ///
+    /// `performClose(_:)` sends `windowShouldClose`; `dismiss()` and
+    /// `NSWindow.close()` do not. Using `dismiss()` here would mean the footer's
+    /// Close button — and Escape, which shares its shortcut — skipped the Save
+    /// prompt and discarded the edits without a word. `dismiss()` survives only
+    /// as a fallback for the moment before the window has been found.
+    private func requestClose() {
+        if let window = windowHandle.window {
+            window.performClose(nil)
         } else {
-            model.composing = nil
+            dismiss()
         }
     }
 
-    /// The draft with the window's current fields folded in.
+    /// The draft with the window's current fields folded in, and its record
+    /// location taken from the model.
+    ///
+    /// The offset **must** come from `model.openDrafts`, not from this view's
+    /// `@State`. Saving any earlier draft rewrites its record and moves every
+    /// record after it; the model corrects all the open drafts, but a window's
+    /// own copy is never told. Using the stale one means `locateDraft` can't
+    /// find the record, the save falls through to appending, and Out ends up
+    /// with a duplicate and an orphan. That is exactly the bug the model owning
+    /// the drafts was meant to prevent, and this is where the ownership has to
+    /// be honoured.
     private func currentDraft() -> ComposeDraft {
         var current = draft
+        if let live = model.openDrafts[draftID] { current.outOffset = live.outOffset }
         current.to = to
         current.cc = cc
         current.bcc = bcc
@@ -326,11 +381,13 @@ struct ComposeView: View {
                 // Rewrites the draft's own record as sent rather than appending
                 // a second copy — otherwise the unsent original would sit in Out
                 // next to it forever.
-                try model.recordSent(draft, raw: sent.raw,
+                try model.recordSent(currentDraft(), raw: sent.raw,
                                      who: toList.first ?? "", subject: subject)
                 model.showBanner("Message sent.")
                 sending = false
-                model.composing = nil
+                // `wasSent` is already true, so the close guard lets this
+                // through without asking about unsaved changes.
+                requestClose()
             } catch {
                 sending = false
                 self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
