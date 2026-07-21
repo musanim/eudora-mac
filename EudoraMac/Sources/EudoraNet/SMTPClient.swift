@@ -102,13 +102,41 @@ public final class SMTPClient: @unchecked Sendable {
             if let reply = parseReply() {
                 if reply.code == code || reply.code == alt { return reply }
                 throw SMTPError.unexpected(code: reply.code,
-                                           message: reply.lines.last ?? "",
+                                           message: Self.readableMessage(reply.lines),
                                            during: during)
             }
             let chunk = try await receive()
             if chunk.isEmpty { throw SMTPError.closed(during) }
             buffer.append(chunk)
         }
+    }
+
+    /// A multi-line SMTP reply flattened into one readable sentence.
+    ///
+    /// Every line of a reply repeats the status code — `553-` on all but the
+    /// last, `553 ` on the last. Reporting only `lines.last`, which is what this
+    /// used to do, therefore reports only the *tail* of the explanation. Gmail
+    /// rejecting a malformed address answers with three lines, and the last one
+    /// alone reads "553 5.1.3 specifications." — the end of a sentence whose
+    /// subject, the address and what was wrong with it, was on the lines before.
+    ///
+    /// Stripping the repeated code and joining gives the whole thing, and stops
+    /// the code being printed twice ("553 553 …") now that `errorDescription`
+    /// prints it separately.
+    ///
+    /// A line that doesn't start with a code is passed through untouched rather
+    /// than blindly having four characters removed — servers are not obliged to
+    /// be well-formed, and losing real text would be worse than a stray prefix.
+    static func readableMessage(_ lines: [String]) -> String {
+        lines.map { line -> String in
+            let chars = Array(line)
+            guard chars.count >= 4,
+                  chars[0].isNumber, chars[1].isNumber, chars[2].isNumber,
+                  chars[3] == " " || chars[3] == "-" else { return line }
+            return String(chars[4...]).trimmingCharacters(in: .whitespaces)
+        }
+        .filter { !$0.isEmpty }
+        .joined(separator: " ")
     }
 
     /// Parse one complete SMTP reply out of `buffer` (final line has a space at

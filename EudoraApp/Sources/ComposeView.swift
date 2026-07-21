@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import EudoraStore
 import EudoraNet
 
@@ -15,13 +16,49 @@ struct ComposeView: View {
     @State private var sending = false
     @State private var error: String?
 
+    /// The draft as it stands, including where its record lives in Out and
+    /// whether the user's content has ever been written there. Seeded from
+    /// `seed` and updated by each save — `seed` itself is a `let`.
+    @State private var draft: ComposeDraft
+
+    /// Whether there are edits not yet written to Out.
+    ///
+    /// Compared against the last saved values rather than tracked with a flag on
+    /// every keystroke, so undoing a change back to what was saved correctly
+    /// reports clean — and so Close doesn't nag about a message you opened and
+    /// didn't touch.
+    private var isDirty: Bool {
+        to != draft.to || cc != draft.cc || bcc != draft.bcc
+            || subject != draft.subject || bodyText != draft.body
+    }
+
+    /// True for a message that has never been saved and never edited — ⌘N
+    /// followed straight by Close. Nothing to ask about; the empty shell in Out
+    /// just goes.
+    private var isUntouched: Bool { !draft.hasBeenSaved && !isDirty }
+
+    @State private var showingSavePrompt = false
+
+    /// Set the instant SMTP accepts the message, before it is recorded.
+    ///
+    /// Between those two steps the draft is still marked unsent and unsaved, so
+    /// if recording fails, Close would offer "Don't Save" — which would remove
+    /// from Out a message that had genuinely been delivered. Once this is true
+    /// nothing discards, and closing never prompts.
+    @State private var wasSent = false
+
     init(seed: ComposeDraft) {
         self.seed = seed
+        _draft = State(initialValue: seed)
         _to = State(initialValue: seed.to)
         _cc = State(initialValue: seed.cc)
         _bcc = State(initialValue: seed.bcc)
         _subject = State(initialValue: seed.subject)
         _bodyText = State(initialValue: seed.body)
+        // A failure to pre-save shows here rather than as a banner: this window
+        // goes up on top of the main one immediately, so a banner would be
+        // hidden before it could be read.
+        _error = State(initialValue: seed.openError)
     }
 
     var body: some View {
@@ -31,37 +68,94 @@ struct ComposeView: View {
             TextEditor(text: $bodyText)
                 .font(.system(.body, design: .monospaced))
                 .frame(minHeight: 220)
+                .focused($focus, equals: .body)
             Divider()
             footer
         }
         .frame(minWidth: 580, minHeight: 460)
+        .background(BackTabCatcher { focus = Self.field(before: focus) })
+        .confirmationDialog("Save changes to this message?",
+                            isPresented: $showingSavePrompt) {
+            Button("Save") {
+                if save() { model.composing = nil }
+            }
+            // Destructive only when it actually destroys something. On a
+            // never-saved message Don't Save removes the record from Out; on one
+            // with a saved version it reverts to that version, which is the
+            // ordinary meaning and not worth a red button.
+            Button("Don't Save", role: .destructive) {
+                if !draft.hasBeenSaved { model.discardDraft(draft) }
+                model.composing = nil
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(draft.hasBeenSaved
+                 ? "Your changes since the last save will be lost. "
+                    + "The message stays in Out as unsent."
+                 : "This message hasn't been saved. "
+                    + "Discarding removes it from Out.")
+        }
     }
 
     private var headerFields: some View {
         Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 8, verticalSpacing: 6) {
-            field("To", $to)
-            field("Cc", $cc)
-            field("Bcc", $bcc)
+            field("To", $to, .to)
+            field("Cc", $cc, .cc)
+            field("Bcc", $bcc, .bcc)
             GridRow {
                 Text("Subject").foregroundStyle(.secondary).gridColumnAlignment(.trailing)
                 TextField("", text: $subject)
+                    .focused($focus, equals: .subject)
             }
         }
         .padding(12)
     }
 
-    private func field(_ label: String, _ text: Binding<String>) -> some View {
+    private func field(_ label: String, _ text: Binding<String>, _ id: Field) -> some View {
         GridRow {
             Text(label).foregroundStyle(.secondary).gridColumnAlignment(.trailing)
             TextField("", text: text)
                 .textFieldStyle(.roundedBorder)
+                .focused($focus, equals: id)
         }
+    }
+
+    // MARK: focus order
+
+    /// The editable fields, in the order Tab walks them.
+    private enum Field: Hashable, CaseIterable {
+        case to, cc, bcc, subject, body
+    }
+
+    @FocusState private var focus: Field?
+
+    /// The field before `current`, wrapping around.
+    ///
+    /// Only the backward direction is handled here. Tab already walks forward
+    /// through AppKit's key-view loop, and intercepting that as well would mean
+    /// reimplementing behaviour that works — including the parts of it, like
+    /// where focus starts, that nothing here knows about. Shift-Tab is the half
+    /// that doesn't arrive, because `TextEditor` is an `NSTextView` and swallows
+    /// it rather than passing it back up the loop.
+    ///
+    /// A nil focus (nothing in the window focused yet) goes to the last field,
+    /// which is what shift-tabbing into a window should do.
+    private static func field(before current: Field?) -> Field {
+        let order = Field.allCases
+        guard let current, let i = order.firstIndex(of: current) else { return order[order.count - 1] }
+        return order[(i - 1 + order.count) % order.count]
     }
 
     private var footer: some View {
         HStack(spacing: 10) {
-            Button("Cancel") { model.composing = nil }
+            // "Close", not "Cancel". The message already exists in Out as
+            // unsent, so closing isn't an undo — it's a decision about what to
+            // do with edits since the last save.
+            Button("Close") { attemptClose() }
                 .keyboardShortcut(.cancelAction)
+            Button("Save") { save() }
+                .keyboardShortcut("s", modifiers: .command)
+                .disabled(!isDirty)
             if !accounts.isReadyToSend {
                 SettingsButton { Text("Settings…") }
             }
@@ -82,13 +176,127 @@ struct ComposeView: View {
             if sending { ProgressView().controlSize(.small) }
             Button("Send") { send() }
                 .keyboardShortcut("d", modifiers: .command)   // ⌘D, Eudora's Send
-                .disabled(sending)
+                // `wasSent` as well as `sending`: if delivery succeeded but
+                // writing it to Out failed, the window stays open showing that
+                // error — and Send must not still be live, or the obvious
+                // response to the error message is to send the message twice.
+                .disabled(sending || wasSent)
                 .buttonStyle(.borderedProminent)
         }
         .padding(12)
     }
 
+    /// Close, asking about unsaved work first.
+    ///
+    /// An untouched brand-new message doesn't prompt at all — being asked
+    /// whether to save a message you never typed in is noise — but its empty
+    /// record still has to come out of Out, since it was written on open.
+    private func attemptClose() {
+        if wasSent {
+            // Delivered. There is nothing to save and nothing to discard.
+            model.composing = nil
+        } else if isUntouched {
+            model.discardDraft(draft)
+            model.composing = nil
+        } else if isDirty {
+            showingSavePrompt = true
+        } else {
+            model.composing = nil
+        }
+    }
+
+    /// The draft with the window's current fields folded in.
+    private func currentDraft() -> ComposeDraft {
+        var current = draft
+        current.to = to
+        current.cc = cc
+        current.bcc = bcc
+        current.subject = subject
+        current.body = bodyText
+        return current
+    }
+
+    /// Write the current fields into the draft's record in Out, still unsent.
+    /// - Returns: whether it succeeded, so callers can decline to close on
+    ///   failure rather than closing over an error the user never saw.
+    @discardableResult
+    private func save() -> Bool {
+        do {
+            draft = try model.saveDraft(currentDraft())
+            error = nil
+            return true
+        } catch {
+            self.error = "Couldn't save to Out: " + model.describe(error)
+            return false
+        }
+    }
+
+    /// Turns Shift-Tab in the compose window into "focus the previous field".
+    ///
+    /// **Why this is needed at all.** Tab walks forward by itself: AppKit's
+    /// key-view loop handles it and SwiftUI's `@FocusState` follows along. The
+    /// backward half doesn't arrive, because the body is a `TextEditor` — an
+    /// `NSTextView` — and text views consume Shift-Tab rather than passing it up
+    /// the loop, so the cycle only ever runs one way.
+    ///
+    /// **Why an event monitor.** macOS 13 has no `.onKeyPress`; that's macOS 14.
+    /// A local monitor is how this codebase already takes keys and clicks
+    /// AppKit won't otherwise surrender (see `TableScrollStateSyncer`'s wheel
+    /// handling and `MessageDoubleClickController`).
+    ///
+    /// **Scoped to one window.** The monitor is global to the process, so it
+    /// checks the event's window against the one this view is in. Without that,
+    /// Shift-Tab would be hijacked in the main window and the Find window too.
+    private struct BackTabCatcher: NSViewRepresentable {
+        let onShiftTab: () -> Void
+
+        final class Coordinator {
+            var onShiftTab: () -> Void = {}
+            /// The backing view, not its window. `nsView.window` is usually nil
+            /// on the first `updateNSView` — the view isn't in the hierarchy yet
+            /// — so caching the window there would install a monitor that could
+            /// never match, and recovery would depend on SwiftUI happening to
+            /// update again. Resolving it live self-heals, and is what
+            /// `TableScrollStateSyncer` does for the same reason.
+            weak var view: NSView?
+            var monitor: Any?
+            deinit { if let monitor { NSEvent.removeMonitor(monitor) } }
+        }
+
+        func makeCoordinator() -> Coordinator { Coordinator() }
+        func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
+
+        func updateNSView(_ nsView: NSView, context: Context) {
+            let coordinator = context.coordinator
+            // Refreshed every pass: the closure captures the current `focus`,
+            // and a stale one would always move back from wherever focus was
+            // when the monitor was installed.
+            coordinator.onShiftTab = onShiftTab
+            coordinator.view = nsView
+            guard coordinator.monitor == nil else { return }
+            coordinator.monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
+                [weak coordinator] event in
+                guard let coordinator else { return event }
+                // 48 is Tab. Shift-Tab also arrives as keyCode 48 with the shift
+                // flag; matching on the character would mean handling the
+                // back-tab control code (0x19) as well, which is less clear.
+                //
+                // Shift and *only* shift: ⌥⇧Tab and ⌃⇧Tab are different
+                // gestures and shouldn't be swallowed as if they were this one.
+                guard event.keyCode == 48,
+                      event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .shift,
+                      let window = coordinator.view?.window,
+                      event.window === window else { return event }
+                coordinator.onShiftTab()
+                return nil          // consumed, or the text view inserts a tab
+            }
+        }
+    }
+
     private func send() {
+        // Belt as well as the disabled button: ⌘D goes through the same action,
+        // and delivering twice is not recoverable.
+        guard !wasSent, !sending else { return }
         guard accounts.account.isConfigured else {
             error = "Set up your SMTP account first — use the Settings… button."; return
         }
@@ -111,13 +319,39 @@ struct ComposeView: View {
         Task {
             do {
                 let sent = try await SMTPClient.send(message, account: account, password: password)
-                try model.recordSent(raw: sent.raw, who: toList.first ?? "", subject: subject)
+                // Before recording, not after: the message is out of our hands
+                // from here, and if writing it to Out fails we must not go on to
+                // offer to discard it.
+                wasSent = true
+                // Rewrites the draft's own record as sent rather than appending
+                // a second copy — otherwise the unsent original would sit in Out
+                // next to it forever.
+                try model.recordSent(draft, raw: sent.raw,
+                                     who: toList.first ?? "", subject: subject)
                 model.showBanner("Message sent.")
                 sending = false
                 model.composing = nil
             } catch {
                 sending = false
                 self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                // Mark the message in Out as having failed to send, and save
+                // what's in the window while we're at it. Two reasons: the list
+                // should show *why* this message is still sitting there, and a
+                // failure that also silently discarded the last edits would be
+                // the worst possible moment to lose them.
+                //
+                // Only for a genuine send failure. A failure *after* delivery is
+                // handled above — `wasSent` is already true there and the
+                // message did go out.
+                if !wasSent {
+                    do {
+                        draft = try model.markSendFailed(currentDraft())
+                    } catch {
+                        self.error = (self.error ?? "")
+                            + " (It also couldn't be marked as unsent in Out: "
+                            + model.describe(error) + ")"
+                    }
+                }
             }
         }
     }

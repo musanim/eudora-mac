@@ -46,6 +46,8 @@ struct MailboxItem: Identifiable, Hashable {
 struct MessageRow: Identifiable, Hashable, Sendable {
     let id: Int             // 1-based message index within the mailbox
     let statusGlyph: String
+    /// Raw Eudora status byte, -1 when unknown. See `isUnsent`.
+    let status: Int
     let priority: Int       // Eudora: 1=highest … 4=normal … 7=lowest; 0=unknown
     let label: String       // color-label placeholder (not parsed yet)
     let size: Int
@@ -74,6 +76,25 @@ struct MessageRow: Identifiable, Hashable, Sendable {
     /// ("R", "F", "→", "Q", "S", " ") means the message has been opened at
     /// least once. Named so the list doesn't have to know the glyph.
     var isUnread: Bool { statusGlyph == MailStore.unreadGlyph }
+
+    /// A message composed but never sent — a draft sitting in Out.
+    ///
+    /// From the raw status byte, not the glyph: read, unsendable, sendable and
+    /// unsent all render blank, so the glyph can't tell a draft from ordinary
+    /// mail. False on the scan fallback, where there's no `.toc` and therefore
+    /// no status at all — a mailbox with no index simply can't show drafts as
+    /// drafts.
+    var isUnsent: Bool { status == MailboxMutator.statusUnsent }
+
+    /// Sending was attempted and failed. Stays this way until the message is
+    /// edited and saved again, which puts it back to unsent.
+    var isSendError: Bool { status == MailboxMutator.statusSendError }
+
+    /// Anything still editable in the composer — an unsent draft or one whose
+    /// send failed. The distinction matters for the icon and nowhere else, so
+    /// every behaviour (reopen on double-click, refusing to mark read) keys off
+    /// this rather than testing the two states separately and forgetting one.
+    var isDraft: Bool { isUnsent || isSendError }
 }
 
 /// The rendered preview of a single message.
@@ -131,8 +152,13 @@ struct MessageAttachment: Identifiable, Hashable, Sendable {
     }
 }
 
-/// An editable outgoing-message seed handed to the compose sheet. Address
+/// An editable outgoing message, and the record in Out that backs it. Address
 /// fields are free text (comma/semicolon separated) as the user types them.
+///
+/// A draft is not just UI state: as in Eudora 7, the message exists in the Out
+/// mailbox as **unsent** from the moment it is opened, before a word is typed.
+/// That is what makes a half-written message survive a quit, and what lets Out
+/// show what you are working on.
 struct ComposeDraft: Identifiable {
     let id = UUID()
     var to: String = ""
@@ -142,6 +168,45 @@ struct ComposeDraft: Identifiable {
     var body: String = ""
     var inReplyTo: String? = nil
     var references: [String] = []
+
+    /// Byte offset of this draft's record in Out.
+    ///
+    /// An offset rather than an index, for the reason `ViewState` gives about
+    /// the remembered selection: an index is a position and shifts as soon as
+    /// anything earlier is removed, and a draft can stay open for a long time.
+    /// The offset survives `MailboxMutator.replace` of *this* record, which is
+    /// the common case — only resizing an earlier record moves it.
+    ///
+    /// Nil only if the record couldn't be written (no Out mailbox, a lock). The
+    /// window still opens in that case; Save and Send fall back to appending.
+    var outOffset: Int? = nil
+
+    /// This draft's `Message-ID`, fixed for its whole life and written into
+    /// every version of the record.
+    ///
+    /// The offset alone can't be trusted as identity. Removing an earlier
+    /// message shifts everything after it left, and if the removed record
+    /// happened to be exactly as long as this one, the stale offset lands on a
+    /// *different* real message — which `replace` would then overwrite and
+    /// `discard` would delete, silently. So the offset is the fast path and this
+    /// is the proof: resolve by offset, then confirm the record really is this
+    /// message before touching it.
+    var messageID: String = ""
+
+    /// Why the record couldn't be written on open, if it couldn't.
+    ///
+    /// Carried on the draft rather than shown as a banner: the compose window
+    /// goes up immediately on top, so a banner would be covered before it was
+    /// read. `ComposeView` surfaces it in its own error line instead.
+    var openError: String? = nil
+
+    /// True once the user's content has actually been written.
+    ///
+    /// Distinguishes "unsaved changes" from "never saved at all", which is what
+    /// Don't Save has to decide between: with nothing ever saved, the record in
+    /// Out is the empty shell created on open and discarding means removing it;
+    /// once there is a saved version, discarding means reverting to it.
+    var hasBeenSaved = false
 }
 
 /// What parsing a message adds to the row the TOC already gave us.
@@ -353,6 +418,15 @@ final class AppModel: ObservableObject {
 
     /// Non-nil while a compose sheet is open.
     @Published var composing: ComposeDraft?
+
+    /// The mail account, for assembling a draft's From line.
+    ///
+    /// Held rather than passed in because drafts are now created from places
+    /// that have no access to it — `MessageContextMenuController` holds only the
+    /// model, and Reply and Forward are reachable from there. Set once by
+    /// `ContentView.onAppear`; nil only in the moment before that, when a draft
+    /// simply gets an empty From.
+    weak var accounts: AccountStore?
     /// Banner text (e.g. "Message sent", or why Check Mail failed).
     ///
     /// Write through `showBanner`/`showError`/`dismissBanner` rather than
@@ -913,6 +987,7 @@ final class AppModel: ObservableObject {
             if r.statusGlyph == MailStore.unreadGlyph { unread += 1 }
             return MessageRow(id: r.index,
                               statusGlyph: r.statusGlyph,
+                              status: r.status,
                               priority: Int(r.priority) ?? 0,
                               label: "",
                               size: r.size,
@@ -1205,7 +1280,294 @@ final class AppModel: ObservableObject {
     // MARK: compose / reply / forward
 
     func composeNew() {
-        composing = ComposeDraft()
+        beginCompose(ComposeDraft())
+    }
+
+    /// The single funnel every new message goes through — new, reply, forward.
+    ///
+    /// Writes the message into Out as unsent *before* showing it, so it exists
+    /// in the mailbox from the moment it opens, as Eudora 7 did. The record is
+    /// an empty shell at this point; Save and Send rewrite it in place.
+    ///
+    /// A failure here is reported but doesn't block composing: being unable to
+    /// pre-save is a much smaller problem than refusing to let the user write a
+    /// message, and Save and Send both cope with `outOffset == nil` by
+    /// appending instead.
+    private func beginCompose(_ draft: ComposeDraft) {
+        var draft = draft
+        // Fixed now and never regenerated — this is the draft's identity for the
+        // rest of its life. `OutgoingMessage.generatedMessageID` builds one from
+        // the From domain, so it needs the account, but falls back sensibly.
+        draft.messageID = OutgoingMessage(
+            fromName: "", fromAddress: accounts?.account.fromAddress ?? "",
+            to: [], subject: "", body: "").generatedMessageID()
+        do {
+            draft.outOffset = try appendDraftRecord(draft)
+        } catch {
+            draft.openError = "Couldn't put this message in Out: "
+                + describe(error)
+                + " It can still be written and sent; it just isn't saved yet."
+        }
+        composing = draft
+    }
+
+    /// A readable message for a store error. `MutateError` and `WriteError`
+    /// aren't `LocalizedError`, so `localizedDescription` alone yields
+    /// "The operation couldn't be completed. (… error 0.)" — which is exactly
+    /// what the user gets on the most likely failure, a tree with no Out.
+    func describe(_ error: Error) -> String {
+        switch error {
+        case MailboxMutator.MutateError.notFound:
+            return "this Eudora folder has no Out mailbox."
+        case MailboxMutator.MutateError.outOfRange:
+            return "the message is no longer where it was in Out."
+        case Outbox.WriteError.locked:
+            return "the mailbox is locked (a .lck file is next to it)."
+        case let MailboxMutator.MutateError.ioError(m), let Outbox.WriteError.ioError(m):
+            return m
+        default:
+            return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    /// Append a draft to Out as unsent, returning the record's byte offset.
+    private func appendDraftRecord(_ draft: ComposeDraft) throws -> Int {
+        guard let store, let outbox = store.outboxBase() else {
+            throw MailboxMutator.MutateError.notFound
+        }
+        let result = try Outbox.append(messageData: draftBytes(draft),
+                                       to: outbox,
+                                       status: MailboxMutator.statusUnsent,
+                                       who: draft.to,
+                                       subject: draft.subject)
+        refreshOutIfShowing()
+        return result.messageOffset
+    }
+
+    /// A draft's RFC-822 bytes, assembled the same way a sent message is.
+    ///
+    /// Every version carries the draft's own `Message-ID`, fixed at
+    /// `beginCompose` — that is what lets `locateDraft` prove a record really is
+    /// this message before overwriting it, which the byte offset alone cannot.
+    ///
+    /// The From identity comes from the account when there is one. A draft
+    /// written before Settings has been filled in simply has an empty From,
+    /// which is what an unconfigured Eudora showed too.
+    private func draftBytes(_ draft: ComposeDraft) -> Data {
+        let message = OutgoingMessage(
+            fromName: accounts?.account.fromName ?? "",
+            fromAddress: accounts?.account.fromAddress ?? "",
+            to: splitAddresses(draft.to),
+            cc: splitAddresses(draft.cc),
+            bcc: splitAddresses(draft.bcc),
+            subject: draft.subject,
+            body: draft.body,
+            inReplyTo: draft.inReplyTo,
+            references: draft.references)
+        // The draft's own ID, every time — that's what makes the record
+        // identifiable across saves. See `ComposeDraft.messageID`.
+        //
+        // Empty maps to nil, not to an empty header: `rfc822` writes whatever
+        // non-nil value it is handed, and a literal `Message-ID: ` would parse
+        // back as "" and defeat the identity check for good.
+        return message.rfc822(messageID: draft.messageID.isEmpty ? nil
+                                                                 : draft.messageID).data
+    }
+
+    /// Where this draft's record is right now, or nil if it can't be trusted.
+    ///
+    /// Offset first because it's cheap, then a `Message-ID` check because the
+    /// offset can be stale *and still resolve* — remove an earlier record of the
+    /// same length as this one and the offset lands squarely on the next
+    /// message. Without the second test, saving a draft after deleting from Out
+    /// could overwrite unrelated mail. Returning nil is safe: callers append
+    /// instead, which at worst duplicates rather than destroys.
+    private func locateDraft(_ draft: ComposeDraft, in outbox: URL) -> Int? {
+        guard let store, let offset = draft.outOffset,
+              let index = store.indexOfRecord(at: outbox, offset: offset) else { return nil }
+        // Fails *closed*: a draft with no ID can't be proven to be this record,
+        // and the caller appending a duplicate is a far smaller harm than
+        // overwriting someone's mail. Nothing today can reach this — every draft
+        // gets an ID in `beginCompose` — but the default is `""`, so a future
+        // one built another way would otherwise silently get the unchecked
+        // behaviour this method exists to prevent.
+        guard !draft.messageID.isEmpty else { return nil }
+        guard MailboxMutator.messageID(base: outbox, index: index) == draft.messageID else {
+            return nil
+        }
+        return index
+    }
+
+    /// Re-list Out if it's the mailbox on screen, so a draft appearing,
+    /// changing or going away is visible immediately.
+    private func refreshOutIfShowing() {
+        reloadTree()
+        if let id = selectedMailboxID, itemsByID[id]?.type == .outbox {
+            loadListing(force: true)
+        }
+    }
+
+    /// Write the draft's current content into its record in Out, still unsent.
+    ///
+    /// - Returns: the draft with `outOffset` and `hasBeenSaved` brought up to
+    ///   date, for the caller to hold on to.
+    @discardableResult
+    func saveDraft(_ draft: ComposeDraft) throws -> ComposeDraft {
+        var draft = draft
+        // Always unsent, never send-error. This is what puts a failed message
+        // back to a plain draft once it has been edited: the send-error mark is
+        // a statement about the last *attempt*, and editing invalidates it.
+        draft.outOffset = try writeDraft(draft, status: MailboxMutator.statusUnsent)
+        draft.hasBeenSaved = true
+        return draft
+    }
+
+    /// Record that this message could not be sent.
+    ///
+    /// Writes the current content as well as the status, so the attempt isn't
+    /// lost along with the delivery — and so closing the window straight after a
+    /// failure has nothing left to prompt about, which is what lets a
+    /// send-error message simply be closed with its mark intact.
+    @discardableResult
+    func markSendFailed(_ draft: ComposeDraft) throws -> ComposeDraft {
+        var draft = draft
+        draft.outOffset = try writeDraft(draft, status: MailboxMutator.statusSendError)
+        draft.hasBeenSaved = true
+        return draft
+    }
+
+    /// Record a draft that has just been delivered: same record, sent bytes,
+    /// status 8.
+    ///
+    /// Replaces rather than appends. `recordSent` used to append, which was
+    /// right when a draft had no record of its own — now it would leave the
+    /// unsent original sitting in Out beside its own sent copy.
+    func recordSent(_ draft: ComposeDraft, raw: Data, who: String, subject: String) throws {
+        guard let store, let outbox = store.outboxBase() else { return }
+        if let index = locateDraft(draft, in: outbox) {
+            try MailboxMutator.replace(base: outbox, index: index,
+                                       messageData: raw,
+                                       status: MailboxMutator.statusSent,
+                                       who: who, subject: subject)
+        } else {
+            // No record to update — the pre-save failed, or something outside
+            // the app removed it. Appending is the honest fallback: better a
+            // sent message recorded in the wrong position than one delivered
+            // and never recorded at all.
+            _ = try Outbox.append(messageData: raw, to: outbox,
+                                  status: MailboxMutator.statusSent,
+                                  who: who, subject: subject)
+        }
+        refreshOutIfShowing()
+    }
+
+    /// Throw away a draft's record. Used by Don't Save on a message that was
+    /// never saved, where the record holds only the empty shell from opening.
+    func discardDraft(_ draft: ComposeDraft) {
+        guard let store, let outbox = store.outboxBase(),
+              let index = locateDraft(draft, in: outbox) else { return }
+        do {
+            try MailboxMutator.remove(base: outbox, index: index)
+            refreshOutIfShowing()
+        } catch {
+            showError("Couldn't remove the abandoned message from Out: " + describe(error))
+        }
+    }
+
+    /// The one place a draft's bytes reach the mailbox, so the resolve-offset →
+    /// replace → fall-back-to-append sequence exists once.
+    private func writeDraft(_ draft: ComposeDraft, status: Int) throws -> Int {
+        guard let store, let outbox = store.outboxBase() else {
+            throw MailboxMutator.MutateError.notFound
+        }
+        let data = draftBytes(draft)
+        defer { refreshOutIfShowing() }
+
+        if let index = locateDraft(draft, in: outbox), let offset = draft.outOffset {
+            try MailboxMutator.replace(base: outbox, index: index,
+                                       messageData: data, status: status,
+                                       who: draft.to, subject: draft.subject)
+            // `replace` leaves this record's own offset alone — only later ones
+            // move — so the draft still knows where it lives.
+            return offset
+        }
+        return try Outbox.append(messageData: data, to: outbox, status: status,
+                                 who: draft.to, subject: draft.subject).messageOffset
+    }
+
+    /// Reopen an unsent message in Out for further editing.
+    ///
+    /// Unlike `beginCompose`, this must *not* write a new record — the message
+    /// already has one, and that is precisely what it is being reattached to. It
+    /// takes over the existing record's offset and Message-ID, and comes back
+    /// already saved, so closing without edits asks nothing and discards nothing.
+    ///
+    /// **Bcc is lost.** `OutgoingMessage.rfc822` deliberately omits Bcc from the
+    /// headers, as it must — so once a draft has been written to Out there is
+    /// nowhere for those addresses to have survived. Reopening therefore silently
+    /// drops them. Keeping them would mean storing them outside the message, and
+    /// a blind-copy list sitting in a side file is a worse idea than losing it.
+    func reopenDraft(messageIndex: Int) {
+        // Only from Out. `isUnsent` is a status test, not a location one, and a
+        // status-9 record can sit in any mailbox — dragged out of Out, or left
+        // by real Eudora. Every write path here targets `outboxBase()`, so
+        // reopening one from elsewhere would save a *copy* into Out and leave
+        // the original behind, quietly forking the message.
+        //
+        // `composing == nil` is belt-and-braces while compose is a sheet: it is
+        // modal over this very window, so the table can't be double-clicked
+        // while one is open. When compose moves to its own window that changes
+        // — a double-click on a second draft would hit this guard and do
+        // nothing at all, with no feedback. Revisit it there.
+        guard composing == nil,
+              let store,
+              let mid = selectedMailboxID, let item = itemsByID[mid],
+              !item.isFolder, item.type == .outbox,
+              let msg = store.message(at: item.base, index: messageIndex) else { return }
+        let part = msg.part
+
+        var draft = ComposeDraft(
+            to: HeaderDecoder.decode(part.header("To") ?? ""),
+            cc: HeaderDecoder.decode(part.header("Cc") ?? ""),
+            subject: HeaderDecoder.decode(part.header("Subject") ?? ""),
+            body: Self.plainText(of: part),
+            inReplyTo: part.header("In-Reply-To")?.trimmingCharacters(in: .whitespaces),
+            references: (part.header("References") ?? "")
+                .split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init))
+        draft.outOffset = msg.record.offset
+        draft.hasBeenSaved = true
+
+        let existingID = part.header("Message-ID")?.trimmingCharacters(in: .whitespaces) ?? ""
+        if existingID.isEmpty {
+            // Real Eudora stamps Message-ID at *send* time, so a draft it wrote
+            // has none — and this app's identity check needs one. Without it
+            // `locateDraft` fails closed, every save appends another copy, and
+            // the count grows without bound.
+            //
+            // So mint one and stamp it on the record now, while `messageIndex`
+            // is known good because we have just read it. `replace` leaves this
+            // record's own offset alone, so `outOffset` stays valid.
+            draft.messageID = OutgoingMessage(
+                fromName: "", fromAddress: accounts?.account.fromAddress ?? "",
+                to: [], subject: "", body: "").generatedMessageID()
+            do {
+                try MailboxMutator.replace(base: item.base, index: messageIndex,
+                                           messageData: draftBytes(draft),
+                                           status: MailboxMutator.statusUnsent,
+                                           who: draft.to, subject: draft.subject)
+                refreshOutIfShowing()
+            } catch {
+                // The stamp didn't land, so saving can't prove this record is
+                // the draft and will append instead of replacing. Say so rather
+                // than letting copies pile up unexplained.
+                draft.openError = "This message couldn't be tagged for editing ("
+                    + describe(error)
+                    + ") Saving will add a copy to Out rather than update it."
+            }
+        } else {
+            draft.messageID = existingID
+        }
+        composing = draft
     }
 
     /// Build a reply (or reply-all) from the selected message.
@@ -1224,13 +1586,13 @@ final class AppModel: ObservableObject {
         var cc: [String] = []
         if all { cc = (splitAddresses(origTo) + splitAddresses(origCc)) }
 
-        composing = ComposeDraft(
+        beginCompose(ComposeDraft(
             to: origFrom,
             cc: cc.joined(separator: ", "),
             subject: subject.lowercased().hasPrefix("re:") ? subject : "Re: \(subject)",
             body: quotedReply(part, from: origFrom),
             inReplyTo: msgID,
-            references: refs)
+            references: refs))
     }
 
     /// Build a forward from the selected message.
@@ -1247,9 +1609,9 @@ final class AppModel: ObservableObject {
         To: \(part.header("To") ?? "")
 
         """
-        composing = ComposeDraft(
+        beginCompose(ComposeDraft(
             subject: subject.lowercased().hasPrefix("fwd:") ? subject : "Fwd: \(subject)",
-            body: intro + Self.plainText(of: part))
+            body: intro + Self.plainText(of: part)))
     }
 
     private func selectedPart() -> MIMEPart? {
@@ -1299,13 +1661,6 @@ final class AppModel: ObservableObject {
     // MARK: write-back after a successful send
 
     /// Append a just-sent message to the Out mailbox and refresh the UI.
-    func recordSent(raw: Data, who: String, subject: String) throws {
-        guard let store, let outbox = store.outboxBase() else { return }
-        _ = try Outbox.append(messageData: raw, to: outbox, who: who, subject: subject)
-        reloadTree()
-        if let id = selectedMailboxID, itemsByID[id]?.type == .outbox { loadListing(force: true) }
-    }
-
     /// Rebuild the sidebar tree (e.g. after message counts change) without
     /// disturbing the current selection.
     private func reloadTree() {
@@ -1341,6 +1696,15 @@ final class AppModel: ObservableObject {
 
     func markSelected(read: Bool) {
         guard let sel = currentSelection() else { return }
+        // Never on a draft. Status is a single byte, so writing read/unread over
+        // an unsent message doesn't annotate it — it *replaces* the unsent
+        // state. `isUnsent` would go false, the row would stop being a draft,
+        // and double-click would never reopen it again. One keystroke, silently
+        // unrecoverable.
+        if let pos = rowPositionByID[sel.index], pos < rows.count, rows[pos].isDraft {
+            showBanner("That message hasn't been sent yet — it has no read state.")
+            return
+        }
         do {
             try MailboxMutator.setStatus(base: sel.item.base, index: sel.index,
                                          status: read ? MailboxMutator.statusRead
@@ -1359,6 +1723,8 @@ final class AppModel: ObservableObject {
                 let r = rows[pos]
                 rows[pos] = MessageRow(id: r.id,
                                        statusGlyph: read ? " " : MailStore.unreadGlyph,
+                                       status: read ? MailboxMutator.statusRead
+                                                    : MailboxMutator.statusUnread,
                                        priority: r.priority,
                                        label: r.label,
                                        size: r.size,

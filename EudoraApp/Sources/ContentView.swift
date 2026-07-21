@@ -38,7 +38,14 @@ struct ContentView: View {
         .toolbar {
             ToolbarItemGroup {
                 Button { Task { await model.receiveMail(accounts: accounts) } } label: {
-                    Label("Check Mail", systemImage: "arrow.down.circle")
+                    // The button greys out while a fetch runs, but greyed-out
+                    // reads as "unavailable", not as "working" — a POP3 round
+                    // trip is long enough to want the difference stated.
+                    if model.isChecking {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Check Mail", systemImage: "arrow.down.circle")
+                    }
                 }.disabled(model.isChecking)
                 Button { model.composeNew() } label: {
                     Label("New Message", systemImage: "square.and.pencil")
@@ -75,6 +82,10 @@ struct ContentView: View {
         // the thread for seconds in the very iteration that would have put the
         // splash on screen. A short delay guarantees an idle pass first.
         .onAppear {
+            // Drafts are assembled from the account's From identity, and they
+            // can be created from places that never see the AccountStore — the
+            // message list's right-click Reply, for one. Handed over once here.
+            model.accounts = accounts
             // Splash first — the main window exists by now, so it can be
             // centered over it, and the run loop is running, so it paints.
             SplashWindow.show()
@@ -434,6 +445,10 @@ struct HeaderIcon {
 enum RowIcon {
     static let unread = "RowUnread"
     static let attachment = "RowAttachment"
+    /// A message composed but not sent — a draft in Out.
+    static let unsent = "RowUnsent"
+    /// A message whose send was attempted and failed.
+    static let sendError = "RowSendError"
 
     /// Height of the glyph slot.
     ///
@@ -1496,6 +1511,15 @@ struct MessageListView: View {
                 HStack {
                     Text(model.mailboxSummary)
                         .font(.caption).foregroundStyle(.secondary)
+                    // The rows are usable while this runs — Who, Date and the
+                    // attachment mark are still settling — so this is a quiet
+                    // note rather than a blocking indicator. It also explains
+                    // why those columns change under you a few seconds in.
+                    if model.isEnriching {
+                        ProgressView().controlSize(.small).scaleEffect(0.6)
+                        Text("reading messages…")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }
                     Spacer()
                     if !model.listingSource.isEmpty {
                         Text(model.listingSource)
@@ -1513,6 +1537,12 @@ struct MessageListView: View {
     @ViewBuilder private var content: some View {
         if model.selectedMailboxID == nil {
             placeholder("Select a mailbox")
+        } else if model.isListing && model.rows.isEmpty {
+            // Before this, a mailbox mid-listing was indistinguishable from an
+            // empty one — it said "No messages" for however long the read took,
+            // which on Trash is several seconds of the app confidently
+            // asserting something false.
+            busy("Listing messages…")
         } else if model.rows.isEmpty {
             placeholder("No messages")
         } else {
@@ -1538,7 +1568,20 @@ struct MessageListView: View {
                         // unread case and dropping the letters would lose real
                         // information from the list.
                         Group {
-                            if r.isUnread {
+                            // Draft states before unread: neither is ever
+                            // unread, but testing them first keeps the
+                            // precedence explicit rather than incidental. All
+                            // three are Eudora's own art; the states that only
+                            // have a letter fall through.
+                            if r.isSendError {
+                                RowIcon.view(RowIcon.sendError,
+                                             show: true,
+                                             width: HeaderIcon.status.width)
+                            } else if r.isUnsent {
+                                RowIcon.view(RowIcon.unsent,
+                                             show: true,
+                                             width: HeaderIcon.status.width)
+                            } else if r.isUnread {
                                 RowIcon.view(RowIcon.unread,
                                              show: true,
                                              width: HeaderIcon.status.width)
@@ -1592,14 +1635,83 @@ struct MessageListView: View {
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
+
+    /// A placeholder that says work is happening, rather than one that states a
+    /// fact which isn't true yet.
+    private func busy(_ text: String) -> some View {
+        VStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text(text).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 }
 
 // MARK: - Detail: message preview
 
+/// The rule marking the split between the message list and the message view.
+///
+/// Drawn by us, along the top edge of the preview pane, rather than by styling
+/// the `VSplitView`'s own divider — SwiftUI exposes no control over that, and
+/// the AppKit `NSSplitView` underneath offers only `dividerStyle` (a choice
+/// between one hairline and a dimpled 9 pt splitter) with a `dividerColor` that
+/// is read-only. Drawing our own is both simpler and fully adjustable, and it
+/// sits directly under the system hairline so the two read as one line.
+///
+/// Note this changes the *look* of the split, not the grab area: the draggable
+/// region is still the `VSplitView`'s own divider, which is a little taller than
+/// its hairline but not as tall as this rule. If the mismatch ever grates, the
+/// fix is to replace `VSplitView` with an explicit divider and a stored pane
+/// height — which would also let the position persist across launches.
+///
+/// Both values are taste, not measurement. Retune freely.
+enum PaneDivider {
+    static let thickness: CGFloat = 5
+
+    /// `.primary` rather than `.separatorColor` — the system separator is
+    /// deliberately faint, which is the thing being corrected here. Going
+    /// through the semantic colour keeps it legible in both appearances instead
+    /// of being a dark grey that disappears in dark mode.
+    static let color = Color.primary.opacity(0.35)
+}
+
 struct PreviewView: View {
     @EnvironmentObject var model: AppModel
 
+    /// Wrapped in a `GeometryReader` so the pane's height is decided by the
+    /// split view and the user, never by the message being shown.
+    ///
+    /// `VSplitView` sizes its panes from their content's minimum height, and
+    /// this pane's minimum used to change with every selection: the detached
+    /// attachment bar is `fixedSize`d and so demands up to 120 pt on a message
+    /// that has attachments and nothing on one that doesn't, and the header block
+    /// grows and shrinks with the To line, the attachment chips and a subject
+    /// long enough to wrap. Switching messages therefore moved the divider —
+    /// which looks like the app resizing the pane behind your back, because it is.
+    ///
+    /// A `GeometryReader` has no intrinsic size of its own: it reports no
+    /// minimum, takes whatever height it is offered, and hands it down. That
+    /// leaves exactly one thing deciding this pane's size — the `.frame(minHeight:
+    /// 140)` it is given in the split view, and wherever the user has dragged the
+    /// divider. The content is then pinned to that height rather than asking for
+    /// one, and clipped, since a very short pane can't fit a tall header block.
     var body: some View {
+        GeometryReader { geo in
+            content
+                .frame(width: geo.size.width, height: geo.size.height,
+                       alignment: .topLeading)
+                .clipped()
+                // After `.clipped()`, so the rule isn't clipped away with the
+                // content it sits on top of.
+                .overlay(alignment: .top) {
+                    Rectangle()
+                        .fill(PaneDivider.color)
+                        .frame(height: PaneDivider.thickness)
+                }
+        }
+    }
+
+    @ViewBuilder private var content: some View {
         if let p = model.preview {
             VStack(alignment: .leading, spacing: 0) {
                 headers(p)
@@ -1638,6 +1750,16 @@ struct PreviewView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 }
             }
+        } else if model.isLoadingPreview {
+            // `loadMessage` clears `preview` and then reads and renders off the
+            // main actor, which on a large mailbox is a noticeable wait. Without
+            // this the pane sat on "Select a message" throughout — telling the
+            // user to do the thing they had just done.
+            VStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Opening message…").foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             Text("Select a message")
                 .foregroundStyle(.secondary)

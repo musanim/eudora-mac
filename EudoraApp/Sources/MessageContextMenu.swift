@@ -27,6 +27,7 @@ struct MessageContextMenuInstaller: NSViewRepresentable {
     final class Coordinator {
         weak var table: NSTableView?
         var controller: MessageContextMenuController?
+        var doubleClick: MessageDoubleClickController?
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -58,6 +59,7 @@ struct MessageContextMenuInstaller: NSViewRepresentable {
         if let known = coordinator.table, known.window != nil,
            let controller = coordinator.controller {
             controller.model = model
+            coordinator.doubleClick?.model = model
             return
         }
 
@@ -77,8 +79,68 @@ struct MessageContextMenuInstaller: NSViewRepresentable {
         if coordinator.table !== table || coordinator.controller == nil {
             coordinator.table = table
             coordinator.controller = MessageContextMenuController(model: model, table: table)
+            coordinator.doubleClick = MessageDoubleClickController(model: model, table: table)
         }
         coordinator.controller?.model = model
+        coordinator.doubleClick?.model = model
+    }
+}
+
+/// Double-clicking an unsent message reopens it in the editor.
+///
+/// AppKit again, and for a plainer reason than usual: SwiftUI's `Table` on
+/// macOS 13 has no double-click action at all. `.onTapGesture(count: 2)` on a
+/// cell fights the table's own selection handling and swallows the first click.
+///
+/// Deliberately a separate object from `MessageContextMenuController` even
+/// though both watch the mouse over the same table: that one owns an `NSMenu`
+/// and its lazy submenu builders, and folding an unrelated left-click handler
+/// into it would tangle two lifetimes that have no reason to be shared.
+///
+/// Only unsent messages respond. A double-click anywhere else falls through
+/// untouched, so the table keeps whatever default behaviour it has.
+@MainActor
+final class MessageDoubleClickController: NSObject {
+    var model: AppModel
+    private weak var table: NSTableView?
+    private var monitor: Any?
+
+    init(model: AppModel, table: NSTableView) {
+        self.model = model
+        self.table = table
+        super.init()
+        installEventMonitor()
+    }
+
+    deinit {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+    }
+
+    private func installEventMonitor() {
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            guard event.clickCount == 2,
+                  let self, let table = self.table, let window = table.window,
+                  event.window === window else { return event }
+
+            // Row coordinates. A click on the column header converts to a
+            // negative y and one in the empty strip right of the last column to
+            // an x outside the table, so both fail this and pass through —
+            // notably leaving the header-sort monitor's own handling alone.
+            let point = table.convert(event.locationInWindow, from: nil)
+            guard table.bounds.contains(point) else { return event }
+            let row = table.row(at: point)
+            guard row >= 0, row < self.model.rows.count else { return event }
+
+            // `rows` is in display order, so the row number indexes it directly
+            // — the same property the right-click menu relies on.
+            // `isDraft`, not `isUnsent`: a message whose send failed is just as
+            // editable, and is the one you are most likely to want to reopen.
+            let message = self.model.rows[row]
+            guard message.isDraft else { return event }
+
+            self.model.reopenDraft(messageIndex: message.id)
+            return nil          // consumed; the table must not also act on it
+        }
     }
 }
 

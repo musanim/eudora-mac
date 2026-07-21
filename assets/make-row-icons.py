@@ -67,5 +67,7 @@ def process(src, dst):
           f"{w*h - cleared - partial} px opaque")
 
 for src, dst in [('assets/Unread.png', 'assets/RowUnread.png'),
-                 ('assets/attachment.png', 'assets/RowAttachment.png')]:
+                 ('assets/attachment.png', 'assets/RowAttachment.png'),
+                 ('assets/unsent.png', 'assets/RowUnsent.png'),
+                 ('assets/senderror.png', 'assets/RowSendError.png')]:
     process(src, dst)

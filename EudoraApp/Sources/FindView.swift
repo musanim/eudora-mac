@@ -23,6 +23,10 @@ struct FindCriterion: Identifiable {
 struct FindView: View {
     @EnvironmentObject var model: AppModel
 
+    /// Closes this window. `Window` scenes opened with `openWindow` respond to
+    /// `dismiss` on macOS 13, the same as a sheet would.
+    @Environment(\.dismiss) private var dismiss
+
     @State private var rows: [FindCriterion] = [FindCriterion()]
     @State private var matchAll = true
     @State private var scope: Set<MailboxItem.ID> = []
@@ -42,6 +46,15 @@ struct FindView: View {
         }
         .padding(12)
         .frame(minWidth: 720, minHeight: 460)
+        // Escape closes the window, as it did in Eudora.
+        //
+        // `.onExitCommand` rather than a zero-sized Button carrying
+        // `.keyboardShortcut(.cancelAction)`: this is the sanctioned way to take
+        // the Escape ("exit") command, and it doesn't put an invisible control in
+        // the layout or in the tab order. It fires for the focused view's
+        // ancestors, so attaching it to the root covers the whole window
+        // wherever focus happens to be.
+        .onExitCommand { dismiss() }
         .onAppear(perform: initScopeIfNeeded)
         // A newly opened tree resets the scope to "all selected".
         .onChange(of: model.tree.count) { _ in

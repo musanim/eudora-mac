@@ -8,9 +8,21 @@ public enum MailboxMutator {
 
     public enum MutateError: Error { case notFound, outOfRange, ioError(String) }
 
-    // Eudora status bytes (from summary.h): 0 = unread, 1 = read.
+    // Eudora status bytes (from summary.h).
     public static let statusUnread = 0
     public static let statusRead = 1
+    /// A message composed but not yet sent — a draft sitting in Out.
+    public static let statusUnsent = 9
+    /// Delivered. What an unsent message becomes once SMTP accepts it.
+    public static let statusSent = 8
+    /// Tried to send and couldn't.
+    ///
+    /// Eudora's own `MS_UNSENDABLE`, reused rather than invented: the status is
+    /// a single byte written into a format real Eudora also reads, and picking
+    /// an unused value would make these messages display as `?` there. The
+    /// meaning is close enough — Eudora used it for a message it would not send,
+    /// this uses it for one it could not.
+    public static let statusSendError = 5
 
     /// Set the cached status byte for one message (e.g. read/unread). TOC-only;
     /// the `.mbx` is untouched, so no backup is needed.
@@ -32,6 +44,103 @@ public enum MailboxMutator {
                               priority: e.priority, date: e.date, to: e.to, subject: e.subject)
         do { try TocWriter.data(entries: entries).write(to: tocURL) }
         catch { throw MutateError.ioError(error.localizedDescription) }
+    }
+
+    /// Replace one message's bytes in place, keeping its position in the mailbox.
+    ///
+    /// This is what editing a draft needs. `setStatus` can only touch the TOC's
+    /// cached columns, and append-then-remove would move the message to the end
+    /// of Out every time it was saved — so a draft you edited three times would
+    /// have wandered past everything queued after it.
+    ///
+    /// The new record is almost never the same length as the old one, so every
+    /// later message's offset shifts. That is the whole difficulty, and it is
+    /// handled exactly as `remove` handles it: rewrite the `.mbx` around the
+    /// replaced span, then walk the `.toc` adjusting each later entry by the
+    /// difference. A `.toc` that doesn't match the mailbox is deleted rather than
+    /// patched, so the reader rescans instead of trusting a bad index.
+    ///
+    /// `messageData` is the assembled RFC-822 body *without* a `From ` envelope
+    /// line; this writes one, the same way `Outbox.append` does, so the caller
+    /// deals only in message bytes.
+    ///
+    /// - Returns: the replaced record's new 1-based index. Unchanged from the
+    ///   one passed in — the message stays where it was — but returned so
+    ///   callers read the invariant rather than assume it.
+    @discardableResult
+    public static func replace(base: URL,
+                               index: Int,
+                               messageData: Data,
+                               status: Int,
+                               who: String,
+                               subject: String,
+                               date: Date = Date()) throws -> Int {
+        let mbx = base.appendingPathExtension("mbx")
+        let toc = base.appendingPathExtension("toc")
+        // Refuse if Eudora itself looks to have the mailbox open, the same test
+        // `Outbox.append` makes. Rewriting a record underneath a running Eudora
+        // would corrupt whatever it later flushed.
+        if FileManager.default.fileExists(atPath: base.appendingPathExtension("lck").path) {
+            throw MutateError.ioError("the mailbox is locked (a .lck file is next to it)")
+        }
+        guard let data = try? Data(contentsOf: mbx) else { throw MutateError.notFound }
+        let bytes = [UInt8](data)
+        let recs = Mbox.findRecords(bytes)
+        guard index >= 1, index <= recs.count else { throw MutateError.outOfRange }
+
+        let rec = recs[index - 1]
+        let end = min(rec.offset + rec.length, bytes.count)
+
+        let record = Mbox.record(messageData: messageData, date: date)
+        let delta = record.count - (end - rec.offset)
+
+        do {
+            try MailboxIO.backupOnce(mbx)
+            var newData = Data()
+            newData.append(contentsOf: bytes[0..<rec.offset])
+            newData.append(record)
+            if end < bytes.count { newData.append(contentsOf: bytes[end...]) }
+            try MailboxIO.atomicWrite(newData, to: mbx)
+        } catch { throw MutateError.ioError(error.localizedDescription) }
+
+        if let entries0 = Toc.read(toc), tocConsistent(entries0, recs: recs) {
+            let rewritten = entries0.map { e -> TocEntry in
+                if e.offset == rec.offset {
+                    // The replaced message: new length and new cached columns,
+                    // same offset.
+                    return TocEntry(offset: e.offset, length: record.count,
+                                    status: status, priority: e.priority,
+                                    date: Mbox.tocDateString(date),
+                                    to: who, subject: subject)
+                }
+                // Everything after it slides by the size difference. Everything
+                // before is untouched — `delta` must not be applied to it.
+                let off = e.offset > rec.offset ? e.offset + delta : e.offset
+                return TocEntry(offset: off, length: e.length, status: e.status,
+                                priority: e.priority, date: e.date,
+                                to: e.to, subject: e.subject)
+            }
+            try? TocWriter.data(entries: rewritten).write(to: toc)
+        } else if FileManager.default.fileExists(atPath: toc.path) {
+            try? FileManager.default.removeItem(at: toc)
+        }
+        return index
+    }
+
+    /// The `Message-ID` header of one record, without parsing the rest of the
+    /// mailbox.
+    ///
+    /// Exists so a caller holding a byte offset can check that it still names
+    /// the message it thinks it does. An offset alone is not enough: removing an
+    /// earlier record shifts everything after it left, and if the removed
+    /// record happened to be the same length as the one being tracked, the stale
+    /// offset lands exactly on a *different* real message. Nothing detects that
+    /// — `replace` would overwrite someone's mail and `remove` would delete it.
+    public static func messageID(base: URL, index: Int) -> String? {
+        guard let (record, _) = try? readRecord(base: base, index: index) else { return nil }
+        let rec = MboxRecord(offset: 0, length: record.count)
+        let part = MIMEParser.parse(Mbox.messageBytes(record, rec))
+        return part.header("Message-ID")?.trimmingCharacters(in: .whitespaces)
     }
 
     /// Permanently remove one message from a mailbox (used for a message already

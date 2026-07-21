@@ -21,6 +21,13 @@ public enum IndexSource: String {
 public struct ListingRow {
     public let index: Int
     public let statusGlyph: String
+    /// The raw Eudora status byte, or -1 when it isn't known.
+    ///
+    /// Carried alongside the glyph because several states share a glyph — 1
+    /// (read), 5 (unsendable), 6 (sendable) and 9 (unsent) all render as a
+    /// blank — so the glyph cannot answer "is this a draft?". -1 is the
+    /// scan fallback, where there is no `.toc` to read a status from.
+    public let status: Int
     public let priority: String
     public let date: String
     public let size: Int
@@ -175,6 +182,7 @@ public struct MailStore: Sendable {
                 let idx = indexByOffset[e.offset]!
                 return ListingRow(index: idx,
                                   statusGlyph: Self.statusGlyphs[e.status] ?? "?",
+                                  status: e.status,
                                   priority: String(e.priority),
                                   date: e.date, size: recs[idx - 1].length,
                                   who: e.to, subject: e.subject)
@@ -188,7 +196,7 @@ public struct MailStore: Sendable {
         let rows = recs.enumerated().map { (i, rec) -> ListingRow in
             let msg = MIMEParser.parse(Mbox.messageBytes(bytes, rec))
             return ListingRow(index: i + 1,
-                              statusGlyph: "?", priority: "-",
+                              statusGlyph: "?", status: -1, priority: "-",
                               date: msg.header("Date") ?? "",
                               size: rec.length,
                               who: msg.header("From") ?? msg.header("To") ?? "",
