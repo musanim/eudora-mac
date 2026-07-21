@@ -1,0 +1,5 @@
+bash
+mv ~/Desktop/fromDesktop /Users/Shared/
+sudo sharing -r fromDesktop
+sudo sharing -a /Users/Shared/fromDesktop -S fromDesktop -s 001 -g 000
+
