@@ -316,12 +316,17 @@ final class AppModel: ObservableObject {
     /// Bumped only when the tree's *shape* changes — a mailbox added, removed or
     /// renamed. Message counts and unread flags don't touch it.
     ///
-    /// The Move menus need this rather than `treeVersion`. They show names and
-    /// hierarchy and nothing else, but they were keyed on `treeVersion`, so
-    /// every delete — which changes two counts and no structure — rebuilt all
-    /// 2,657 items eagerly inside `NSToolbarItemViewer` layout. Sampling caught
-    /// 554 ms of that in one delete, on the main thread, in the exact window
-    /// where the message list was waiting to be redrawn.
+    /// **Currently unread by anything.** It existed for the Move menus, which
+    /// show names and hierarchy and nothing else but were keyed on
+    /// `treeVersion`, so every delete — which changes two counts and no
+    /// structure — rebuilt all 2,657 items eagerly inside `NSToolbarItemViewer`
+    /// layout. Sampling caught 554 ms of that in one delete, on the main thread,
+    /// in the exact window where the message list was waiting to be redrawn.
+    ///
+    /// Those menus are now AppKit and lazy (see MoveToMenu.swift), so they hold
+    /// no items to invalidate and don't need the distinction. Kept because it is
+    /// cheap and any future view that draws the tree's shape will want it; drop
+    /// it, with `treeShape` and `shapeSignature`, if none appears.
     @Published private(set) var treeStructureVersion = 0
 
     /// Hash of the last published shape, to tell the two apart.
@@ -1921,7 +1926,7 @@ final class AppModel: ObservableObject {
     /// Whether anywhere exists to move a message to.
     ///
     /// Only the yes/no is needed — the menus themselves walk `tree` so they can
-    /// mirror the sidebar's hierarchy (see `MoveToMenuItems`). This used to build
+    /// mirror the sidebar's hierarchy (see `MailboxMenuBuilder`). This used to build
     /// and alphabetically sort every mailbox in the tree just to ask whether the
     /// result was empty, which on a real folder is 2,657 items re-sorted every
     /// time a toolbar button re-evaluated `disabled`.
@@ -2006,7 +2011,7 @@ final class AppModel: ObservableObject {
 
     func moveSelected(to destID: MailboxItem.ID) {
         guard let sel = currentSelection(), let dest = itemsByID[destID] else { return }
-        // The menu lists every mailbox, including this one — see MoveToMenuItems
+        // The menu lists every mailbox, including this one — see MoveToMenu.swift
         // for why it can't depend on the selection. Moving a message to where it
         // already is should do nothing rather than rewrite two mailboxes.
         guard destID != selectedMailboxID else { return }

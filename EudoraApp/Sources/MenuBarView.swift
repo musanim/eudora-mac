@@ -144,19 +144,28 @@ struct MenuBarView: View {
         }.menuBarItem()
     }
 
+    /// The one menu here that is *not* a SwiftUI `Menu`. It lists the whole
+    /// mailbox tree, and SwiftUI would build all 2,657 items — every nested
+    /// submenu included — every time this view's body ran, which is every time
+    /// anything on `AppModel` publishes. `MoveToMenuButton` drops an `NSMenu`
+    /// that fills one level at a time instead; see MoveToMenu.swift.
+    ///
+    /// `.plain` and `.menuBarItem()` are what make it sit level with the real
+    /// menus either side of it: `menuBarItem`'s own `menuStyle`/`menuIndicator`
+    /// do nothing to a Button, but its `fixedSize` and padding are the geometry.
+    ///
+    /// Deliberate change of behaviour: with nothing selected, or nowhere to move
+    /// to, the *title* greys out. It used to open onto disabled items and a
+    /// "No other mailboxes" placeholder. Greying it matches the toolbar's Move
+    /// button, and there is nothing behind it worth opening to read.
     private var transferMenu: some View {
-        Menu("Transfer") {
-            if !model.hasMoveTargets {
-                Button("No other mailboxes") {}.disabled(true)
-            } else {
-                MoveToMenuContent(tree: model.tree,
-                                  treeVersion: model.treeStructureVersion) {
-                    model.moveSelected(to: $0)
-                }
-                .equatable()
-                .disabled(!model.canActOnMessage)
-            }
-        }.menuBarItem()
+        MoveToMenuButton(tree: { model.tree },
+                         onPick: { model.moveSelected(to: $0) }) {
+            Text("Transfer")
+        }
+        .buttonStyle(.plain)
+        .disabled(!model.canActOnMessage || !model.hasMoveTargets)
+        .menuBarItem()
     }
 
     private var specialMenu: some View {

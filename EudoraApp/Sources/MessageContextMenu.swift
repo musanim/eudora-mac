@@ -302,64 +302,7 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
     @objc private func deleteMessage() { actOnClickedRow { model.deleteSelected() } }
 }
 
-/// Fills one level of the mailbox tree into a submenu, when that submenu opens.
-///
-/// One instance per level. Children are created only as their parent is opened,
-/// so walking three folders deep builds three levels, not the whole tree.
-@MainActor
-final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
-    private let items: [MailboxItem]
-    private let onPick: (MailboxItem.ID) -> Void
-
-    /// Child builders, retained for the same reason `moveBuilders` is: menu
-    /// delegates are weak.
-    private var children: [MailboxMenuBuilder] = []
-
-    init(items: [MailboxItem], onPick: @escaping (MailboxItem.ID) -> Void) {
-        self.items = items
-        self.onPick = onPick
-        super.init()
-    }
-
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        // Rebuilt each time it opens rather than cached: it is one level, the
-        // tree can change under us (Rebuild, a new folder opened), and a stale
-        // menu naming mailboxes that no longer exist would be worse than the
-        // negligible cost of redoing it.
-        menu.removeAllItems()
-        children.removeAll()
-
-        for item in items {
-            if item.isFolder {
-                guard let kids = item.children,
-                      MoveToMenuItems.containsDestination(kids) else { continue }
-                let submenu = NSMenu(title: item.display)
-                submenu.autoenablesItems = false
-                let child = MailboxMenuBuilder(items: kids, onPick: onPick)
-                submenu.delegate = child
-                children.append(child)
-
-                let entry = NSMenuItem(title: item.display, action: nil, keyEquivalent: "")
-                entry.submenu = submenu
-                menu.addItem(entry)
-            } else {
-                let entry = NSMenuItem(title: item.display,
-                                       action: #selector(pick(_:)),
-                                       keyEquivalent: "")
-                entry.target = self
-                entry.representedObject = item.id
-                menu.addItem(entry)
-            }
-        }
-    }
-
-    @objc private func pick(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? MailboxItem.ID else { return }
-        onPick(id)
-    }
-
-    // The "does this folder hold anything?" test is `MoveToMenuItems
-    // .containsDestination` — shared so the two Move menus can't drift. It is
-    // recursive over the subtree, unlike the menu building itself, but it only
-    // inspects `isFolder`/`children` and creates nothing.
-}
+// `MailboxMenuBuilder`, which fills the Move submenu one level at a time, was
+// written here and now lives in MoveToMenu.swift: the toolbar's Move button and
+// the menu bar's Transfer menu use it too, so all three Move menus share one
+// implementation and can't drift apart.

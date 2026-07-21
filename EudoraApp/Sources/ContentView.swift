@@ -10,6 +10,28 @@ struct ContentView: View {
 
     private var hasSelection: Bool { model.selectedMessageID != nil }
 
+    /// Height of the preview pane, remembered across launches.
+    ///
+    /// `@AppStorage`, not `ViewState`. `ViewState` is deliberately per-Eudora-
+    /// folder — it remembers selections and sort orders, which are properties of
+    /// a particular tree — whereas where you like the divider is a property of
+    /// the window and shouldn't change because a different folder was opened.
+    ///
+    /// The *preview* is the pane that's stored, so the message list absorbs a
+    /// window resize and the reading pane stays the size you set it to. Every
+    /// read of it is clamped by `PaneLayout` rather than trusted: a value
+    /// written on a large display is nonsense on a small one, and the defaults
+    /// database outlives any particular screen.
+    @AppStorage("previewPaneHeight") private var storedPreviewHeight: Double =
+        PaneLayout.defaultPreviewHeight
+
+    /// The preview height when the current drag began; nil when not dragging.
+    @State private var dragStartHeight: Double?
+
+    /// The height being dragged to, before it is committed. Nil when not
+    /// dragging, and the displayed height falls back to the stored one.
+    @State private var liveHeight: Double?
+
     var body: some View {
         VStack(spacing: 0) {
             MenuBarView()
@@ -27,12 +49,59 @@ struct ContentView: View {
                 .frame(minWidth: 180)
         } detail: {
             // Classic Eudora: message list on top, preview below.
-            VSplitView {
-                MessageListView()
-                    .frame(minWidth: 460, minHeight: 150)
-                PreviewView()
-                    .frame(minHeight: 140)
+            //
+            // Hand-built rather than a `VSplitView`. That gave a draggable region
+            // barely wider than a hairline, and there is no way to widen it: the
+            // AppKit answer is a delegate method, and SwiftUI's split view is
+            // managed by an `NSSplitViewController`, which refuses to give up its
+            // delegate (see PaneDivider). Owning the split outright also means
+            // the position can be remembered, which VSplitView never offered.
+            GeometryReader { geo in
+                let previewHeight = PaneLayout.previewHeight(liveHeight ?? storedPreviewHeight,
+                                                             total: geo.size.height)
+                VStack(spacing: 0) {
+                    MessageListView()
+                        .frame(maxHeight: .infinity)
+                    PaneDividerHandle { translation in
+                        // A fresh gesture always reports zero first (the handle
+                        // uses `minimumDistance: 0`). Clearing on that rather
+                        // than trusting `onEnded` is what makes a *cancelled*
+                        // drag harmless — SwiftUI doesn't promise to end a
+                        // gesture the window resigned or another gesture won,
+                        // and a stale base would teleport the divider on the
+                        // next mouse-down.
+                        if translation == 0 { dragStartHeight = nil }
+                        // `translation` is measured from where the drag began,
+                        // not since the last event, so the height it applies to
+                        // must also be the one from where the drag began —
+                        // otherwise each event compounds the last and the divider
+                        // runs away from the pointer.
+                        //
+                        // The base is the *clamped* height, not the stored one.
+                        // They differ whenever the window is shorter than it was
+                        // when the value was written, and starting from the
+                        // stored value then means the first part of the drag is
+                        // spent re-clamping to the same number — the divider
+                        // looks stuck until the pointer has covered the gap.
+                        let base = dragStartHeight ?? Double(previewHeight)
+                        if dragStartHeight == nil { dragStartHeight = base }
+                        // Dragging down makes the preview *smaller*.
+                        liveHeight = Double(
+                            PaneLayout.previewHeight(base - Double(translation),
+                                                     total: geo.size.height))
+                    } onEnded: {
+                        // Committed once, here, rather than on every frame:
+                        // `@AppStorage` writes to UserDefaults, and a drag
+                        // produces these at the refresh rate.
+                        if let liveHeight { storedPreviewHeight = liveHeight }
+                        liveHeight = nil
+                        dragStartHeight = nil
+                    }
+                    PreviewView()
+                        .frame(height: previewHeight)
+                }
             }
+            .frame(minWidth: 460, minHeight: PaneLayout.minimumTotal)
         }
         .navigationTitle("Eudora")
         .navigationSubtitle(model.status)
@@ -58,13 +127,12 @@ struct ContentView: View {
                     Label("Forward", systemImage: "arrowshape.turn.up.right")
                 }.disabled(!hasSelection)
 
-                Menu {
-                    MoveToMenuContent(tree: model.tree,
-                                      treeVersion: model.treeStructureVersion) {
-                        model.moveSelected(to: $0)
-                    }
-                    .equatable()
-                } label: {
+                // Not a SwiftUI `Menu`: its content would be built eagerly, all
+                // 2,657 mailboxes of it, every time this toolbar item was
+                // invalidated — which `disabled` guarantees on every selection
+                // change. See MoveToMenu.swift.
+                MoveToMenuButton(tree: { model.tree },
+                                 onPick: { model.moveSelected(to: $0) }) {
                     Label("Move", systemImage: "tray.and.arrow.up")
                 }.disabled(!hasSelection || !model.hasMoveTargets)
 
@@ -1656,28 +1724,124 @@ struct MessageListView: View {
 
 /// The rule marking the split between the message list and the message view.
 ///
-/// Drawn by us, along the top edge of the preview pane, rather than by styling
-/// the `VSplitView`'s own divider — SwiftUI exposes no control over that, and
-/// the AppKit `NSSplitView` underneath offers only `dividerStyle` (a choice
-/// between one hairline and a dimpled 9 pt splitter) with a `dividerColor` that
-/// is read-only. Drawing our own is both simpler and fully adjustable, and it
-/// sits directly under the system hairline so the two read as one line.
+/// Drawn by `PaneDividerHandle`, which also carries the drag.
 ///
-/// Note this changes the *look* of the split, not the grab area: the draggable
-/// region is still the `VSplitView`'s own divider, which is a little taller than
-/// its hairline but not as tall as this rule. If the mismatch ever grates, the
-/// fix is to replace `VSplitView` with an explicit divider and a stored pane
-/// height — which would also let the position persist across launches.
+/// **Historical note, so nobody re-treads it.** This used to be a cosmetic
+/// overlay on top of a `VSplitView`, whose own divider stayed a hairline and was
+/// fiddly to grab. The obvious AppKit repair is
+/// `splitView(_:additionalEffectiveRectOfDividerAt:)`, which adds to both the
+/// drag region and the cursor region — but it is a *delegate* method, and
+/// SwiftUI's `VSplitView` is managed by an `NSSplitViewController`, which throws
+/// the moment you assign to its split view's delegate: *"A SplitView managed by
+/// a SplitViewController cannot have its delegate modified."* The slot is not
+/// available, interposed or otherwise. Hence the hand-built split.
 ///
-/// Both values are taste, not measurement. Retune freely.
+/// All values here are taste, not measurement. Retune freely.
+/// The drawn rule and the draggable strip are the same thing: the whole
+/// thickness takes the drag, so what you can see is exactly what you can grab.
+///
+/// It was briefly a 5 pt rule inside an 11 pt invisible grab band, which worked
+/// but meant the target didn't match the target you could see, and the surplus
+/// showed as a strip of bare window background above the preview.
 enum PaneDivider {
-    static let thickness: CGFloat = 5
+    /// 9 rather than the 5 this was for a long time — two points more above and
+    /// below, which is the difference between fiddly and easy to hit.
+    static let thickness: CGFloat = 9
 
     /// `.primary` rather than `.separatorColor` — the system separator is
     /// deliberately faint, which is the thing being corrected here. Going
     /// through the semantic colour keeps it legible in both appearances instead
     /// of being a dark grey that disappears in dark mode.
     static let color = Color.primary.opacity(0.35)
+}
+
+/// Where the divider is allowed to be.
+///
+/// Every read of the stored height goes through `previewHeight`, so a stored
+/// value can never put either pane below its minimum however it was arrived at
+/// — dragged on a taller window, restored from an older build, or hand-edited in
+/// the defaults database.
+enum PaneLayout {
+    /// Enough to see a useful number of rows.
+    static let listMinimum: CGFloat = 150
+    /// Enough for the header block and a line or two of body.
+    static let previewMinimum: CGFloat = 140
+    static let defaultPreviewHeight: Double = 300
+
+    /// The smallest the detail area may be, which becomes the window's own
+    /// minimum. `VSplitView` used to impose this implicitly, from the two panes'
+    /// `minHeight`s; stating it keeps the window from being resized into the
+    /// degenerate case below.
+    static var minimumTotal: CGFloat { listMinimum + previewMinimum + PaneDivider.thickness }
+
+    /// The preview's height, clamped to what `total` can actually accommodate.
+    static func previewHeight(_ stored: Double, total: CGFloat) -> CGFloat {
+        let available = max(0, total - PaneDivider.thickness)
+        let mostThePreviewMayTake = available - listMinimum
+        // `>=`, not `>`: at exactly `minimumTotal` the two minimums fit precisely,
+        // and `>` would send the one window height this layout is designed
+        // around down the degenerate path below — giving the list 145 pt when
+        // its stated minimum is 150.
+        guard mostThePreviewMayTake >= previewMinimum else {
+            // Not enough room for both minimums — the window is smaller than the
+            // layout supports, which `minimumTotal` should prevent but a display
+            // change or a restored frame can still produce. Halve it rather than
+            // let either pane go negative, which lays out as a hard crash in
+            // some SwiftUI versions and as nothing at all in others.
+            return available / 2
+        }
+        return min(max(CGFloat(stored), previewMinimum), mostThePreviewMayTake)
+    }
+}
+
+/// The divider: draws the rule, takes the drag, and shows the resize cursor.
+struct PaneDividerHandle: View {
+    /// Distance dragged since the gesture began, positive downward.
+    let onChanged: (CGFloat) -> Void
+    let onEnded: () -> Void
+
+    /// Whether *we* put a cursor on the stack. See the hover handler.
+    @State private var pushedCursor = false
+
+    var body: some View {
+        Rectangle()
+            .fill(PaneDivider.color)
+            .frame(height: PaneDivider.thickness)
+            .contentShape(Rectangle())
+            // Push/pop rather than `set()`: `set` is undone by the next view that
+            // has an opinion, which over a scrolling list is immediately.
+            //
+            // The flag is what keeps the pair balanced. `onHover(true)` can arrive
+            // without a matching `false` — the window hidden with ⌘H, a menu opening
+            // over the pointer, the app deactivating — and the two leaks are not
+            // symmetric: a spare `pop` is documented as a no-op, but a spare `push`
+            // means someone else's cursor gets popped later.
+            .onHover { inside in
+                if inside, !pushedCursor {
+                    NSCursor.resizeUpDown.push()
+                    pushedCursor = true
+                } else if !inside, pushedCursor {
+                    NSCursor.pop()
+                    pushedCursor = false
+                }
+            }
+            // `minimumDistance: 0` so the drag starts on mouse-down rather than
+            // after a few points of slop, which on a divider reads as stickiness.
+            //
+            // **`coordinateSpace: .global` is load-bearing — do not drop it.**
+            // `DragGesture` defaults to `.local`, meaning local to this view, and
+            // this view is the thing being dragged. Every frame the divider moves,
+            // its local origin moves with it, so the same pointer position reports a
+            // different translation, which moves the divider again. It is a feedback
+            // loop, and it looks like the divider fighting the mouse: frantic
+            // jittering that never settles under the cursor. A space that doesn't
+            // move with the handle breaks the loop.
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .onChanged { onChanged($0.translation.height) }
+                    .onEnded { _ in onEnded() }
+            )
+    }
 }
 
 struct PreviewView: View {
@@ -1696,23 +1860,26 @@ struct PreviewView: View {
     ///
     /// A `GeometryReader` has no intrinsic size of its own: it reports no
     /// minimum, takes whatever height it is offered, and hands it down. That
-    /// leaves exactly one thing deciding this pane's size — the `.frame(minHeight:
-    /// 140)` it is given in the split view, and wherever the user has dragged the
-    /// divider. The content is then pinned to that height rather than asking for
-    /// one, and clipped, since a very short pane can't fit a tall header block.
+    /// leaves exactly one thing deciding this pane's size — the explicit
+    /// `.frame(height:)` it is given in `splitView`, which is `PaneLayout`'s
+    /// clamp of wherever the user last dragged the divider. The content is then
+    /// pinned to that height rather than asking for one, and clipped, since a
+    /// very short pane can't fit a tall header block.
+    ///
+    /// (The `GeometryReader` was originally here to defend against `VSplitView`
+    /// sizing panes from their content's minimum, which made the divider jump
+    /// whenever a selection changed the header block's height. The split is
+    /// hand-built now and no longer asks, but the reasoning still holds: this
+    /// pane must take the height it is given and not ask for one.)
     var body: some View {
         GeometryReader { geo in
             content
                 .frame(width: geo.size.width, height: geo.size.height,
                        alignment: .topLeading)
                 .clipped()
-                // After `.clipped()`, so the rule isn't clipped away with the
-                // content it sits on top of.
-                .overlay(alignment: .top) {
-                    Rectangle()
-                        .fill(PaneDivider.color)
-                        .frame(height: PaneDivider.thickness)
-                }
+                // The rule that used to be overlaid here is now drawn by
+                // `PaneDividerHandle`, which sits above this pane in the stack
+                // and carries the drag as well as the line.
         }
     }
 
