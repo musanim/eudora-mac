@@ -2228,25 +2228,22 @@ final class AppModel: ObservableObject {
     /// each removal shifted the ones after it.
     func deleteSelected() {
         guard let sel = currentSelectionSet() else { return }
-        let n = sel.indices.count
         do {
-            // Success text goes through the veil's notice — the same capsule
-            // that says "Deleting…", updated when the veil lifts — never the
-            // window banner, so the eye tracks one spot. Failures still use
-            // the banner: they're actionable and shouldn't auto-retire.
+            // No completion notice on a delete: the rows sliding up to close
+            // the gap is feedback enough that it worked, and a delete's
+            // destination is never in question (Trash, or gone). A *move* still
+            // gets one — see `moveSelected` — because that names a mailbox the
+            // eye can't otherwise see it landed in. Failures still use the
+            // banner: they're actionable and shouldn't auto-retire.
             if sel.item.type == .trash {
                 try MailboxMutator.removeMany(base: sel.item.base, indices: sel.indices)
-                afterRemoval(veil: "Deleting…",
-                             notice: n == 1 ? "Message deleted." : "\(n) messages deleted.")
+                afterRemoval(veil: "Deleting…")
             } else if let trash = base(ofType: .trash) {
                 try MailboxMutator.moveMany(from: sel.item.base, indices: sel.indices, to: trash)
-                afterRemoval(veil: "Deleting…",
-                             notice: n == 1 ? "Moved to Trash." : "\(n) messages moved to Trash.")
+                afterRemoval(veil: "Deleting…")
             } else {
                 try MailboxMutator.removeMany(base: sel.item.base, indices: sel.indices)
-                afterRemoval(veil: "Deleting…",
-                             notice: n == 1 ? "Message deleted (no Trash mailbox)."
-                                            : "\(n) messages deleted (no Trash mailbox).")
+                afterRemoval(veil: "Deleting…")
             }
         } catch {
             showError("Delete failed: \(error.localizedDescription)")
@@ -2272,9 +2269,11 @@ final class AppModel: ObservableObject {
 
     /// The selected message(s) left the current mailbox: clear the selection
     /// and refresh, behind the veil. `notice` is what the veil's label spot
-    /// says once the veil lifts ("Moved to Trash." and friends) — held here,
-    /// not shown, until then.
-    private func afterRemoval(veil: String, notice: String) {
+    /// says once the veil lifts (a move's "Moved to Family." and friends) —
+    /// held here, not shown, until then. Nil for operations that need no
+    /// word — a delete, where the closing gap is feedback enough — and the
+    /// label spot simply clears when the veil lifts.
+    private func afterRemoval(veil: String, notice: String? = nil) {
         PerfLog.mark("afterRemoval begins")
         pendingRemovalNotice = notice
         if removalNotice != nil { removalNotice = nil }   // a new veil replaces any old notice
