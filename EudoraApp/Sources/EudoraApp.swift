@@ -103,6 +103,13 @@ struct EudoraApp: App {
         model.openDrafts.isEmpty && model.canActOnMessage
     }
 
+    /// Same draft-open guard, but for Delete, which acts on the whole
+    /// multi-selection — `canActOnMessage` requires exactly one message and
+    /// would grey Delete out the moment a second row was ⌘-clicked.
+    private var deleteCommandEnabled: Bool {
+        model.openDrafts.isEmpty && model.canActOnSelection
+    }
+
     // `@MainActor` is not strictly required — the `@StateObject` properties
     // already infer it for the whole type under SE-0316 — but it is stated
     // rather than inferred, because everything in here calls into a
@@ -147,8 +154,9 @@ struct EudoraApp: App {
         CommandMenu("Message") {
             // `.disabled` on a `Group` inside the menu, not on the `CommandMenu`
             // itself — `Commands` has no such modifier; these are Views. One
-            // guard for the lot, since every item acts on the selected message.
-            // See `messageCommandsEnabled`.
+            // guard for the single-message commands; Delete sits outside the
+            // Group because it acts on the whole multi-selection and has its
+            // own gate. See `messageCommandsEnabled` / `deleteCommandEnabled`.
             Group {
                 Button("Reply") { model.reply(all: false) }
                     .keyboardShortcut("r", modifiers: .command)
@@ -162,11 +170,12 @@ struct EudoraApp: App {
                     .keyboardShortcut("u", modifiers: [.command, .shift])
                 Button("Mark as Unread") { model.markSelected(read: false) }
                     .keyboardShortcut("u", modifiers: .command)
-                Divider()
-                Button("Delete") { model.deleteSelected() }
-                    .keyboardShortcut(.delete, modifiers: .command)
             }
             .disabled(!messageCommandsEnabled)
+            Divider()
+            Button("Delete") { model.deleteSelected() }
+                .keyboardShortcut(.delete, modifiers: .command)
+                .disabled(!deleteCommandEnabled)
         }
     }
 }

@@ -161,47 +161,118 @@ public enum MailboxMutator {
 
     /// Permanently remove one message from a mailbox (used for a message already
     /// in Trash). Returns the removed record bytes + its TOC entry.
+    ///
+    /// The single-message case of `removeMany`, kept as the API every existing
+    /// caller uses. One implementation on purpose: the offset-shift arithmetic
+    /// is the part of this file that breaks silently when duplicated, so the
+    /// batch path is the *only* path.
     @discardableResult
     public static func remove(base: URL, index: Int) throws -> (record: [UInt8], entry: TocEntry) {
+        guard let one = try removeMany(base: base, indices: [index]).first else {
+            throw MutateError.outOfRange     // unreachable: removeMany validates
+        }
+        return one
+    }
+
+    /// Permanently remove several messages in **one rewrite** of the `.mbx` and
+    /// one rewrite of the `.toc`.
+    ///
+    /// This exists because a loop over `remove` is the offset-shift bug class
+    /// this codebase keeps fighting: removing one message shifts every later
+    /// record's offset, so the caller's remaining indices silently name
+    /// different messages. Taking every index against the *same* snapshot of the
+    /// mailbox makes the order the caller passes them in irrelevant — they are
+    /// deduplicated, validated together, and cut out in a single ascending pass.
+    ///
+    /// Returns the removed records + TOC entries **in ascending index order**,
+    /// whatever order the indices arrived in.
+    @discardableResult
+    public static func removeMany(base: URL, indices: [Int]) throws -> [(record: [UInt8], entry: TocEntry)] {
+        let unique = Set(indices).sorted()
+        guard !unique.isEmpty else { return [] }
         let mbx = base.appendingPathExtension("mbx")
         let toc = base.appendingPathExtension("toc")
         guard let data = try? Data(contentsOf: mbx) else { throw MutateError.notFound }
         let bytes = [UInt8](data)
         let recs = Mbox.findRecords(bytes)
-        guard index >= 1, index <= recs.count else { throw MutateError.outOfRange }
+        // Validate the whole batch before touching anything: one bad index must
+        // not leave the mailbox half-mutated.
+        guard let first = unique.first, first >= 1,
+              let last = unique.last, last <= recs.count else { throw MutateError.outOfRange }
 
-        let rec = recs[index - 1]
-        let end = min(rec.offset + rec.length, bytes.count)
-        let recordBytes = Array(bytes[rec.offset..<end])
-        let removedEntry = oneEntry(bytes: bytes, rec: rec, tocURL: toc)
+        // The .toc read once and keyed by offset, not re-read per message as
+        // `oneEntry` would. `uniquingKeysWith` is defensive only — a .toc with
+        // duplicate offsets is already inconsistent and gets dropped below.
+        let tocByOffset: [Int: TocEntry]? = Toc.read(toc).map { entries in
+            Dictionary(entries.map { ($0.offset, $0) }, uniquingKeysWith: { a, _ in a })
+        }
 
-        // Physically remove the message's bytes from the .mbx (atomic, backed up).
+        // The byte spans to cut, ascending (unique is sorted and record offsets
+        // increase with index), and what they contained.
+        var removed: [(record: [UInt8], entry: TocEntry)] = []
+        var spans: [(start: Int, end: Int)] = []
+        removed.reserveCapacity(unique.count)
+        spans.reserveCapacity(unique.count)
+        for index in unique {
+            let rec = recs[index - 1]
+            let end = min(rec.offset + rec.length, bytes.count)
+            spans.append((start: rec.offset, end: end))
+            let entry = tocByOffset?[rec.offset] ?? synthesizedEntry(bytes: bytes, rec: rec)
+            removed.append((record: Array(bytes[rec.offset..<end]), entry: entry))
+        }
+
+        // One pass, one atomic write: keep the bytes between the cut spans.
         do {
             try MailboxIO.backupOnce(mbx)
             var newData = Data()
-            newData.append(contentsOf: bytes[0..<rec.offset])
-            if end < bytes.count { newData.append(contentsOf: bytes[end...]) }
+            newData.reserveCapacity(bytes.count)
+            var cursor = 0
+            for span in spans {
+                // `max` defends against overlapping records (a corrupt length
+                // running into the next record); it must never crash the slice.
+                let start = max(span.start, cursor)
+                if start > cursor { newData.append(contentsOf: bytes[cursor..<start]) }
+                cursor = max(cursor, span.end)
+            }
+            if cursor < bytes.count { newData.append(contentsOf: bytes[cursor...]) }
             try MailboxIO.atomicWrite(newData, to: mbx)
         } catch { throw MutateError.ioError(error.localizedDescription) }
 
         // Keep the .toc consistent when its offsets are a valid (sub)set of the
-        // mailbox — drop the removed entry (by offset) and shift every later
-        // offset left by the removed span. This preserves status even for a
-        // mailbox with deleted ghosts. Only a genuinely inconsistent .toc is
-        // dropped (reader rescans). Never parses the whole mailbox.
+        // mailbox — drop the removed entries (by offset) and shift every kept
+        // offset left by the total length of the removed spans before it. This
+        // preserves status even for a mailbox with deleted ghosts. Only a
+        // genuinely inconsistent .toc is dropped (reader rescans). Never parses
+        // the whole mailbox.
         if let entries0 = Toc.read(toc), tocConsistent(entries0, recs: recs) {
+            let removedOffsets = Set(spans.map { $0.start })
+            // Prefix sums of the cut lengths, so each kept entry's shift is a
+            // binary search rather than a rescan of every span — a mailbox can
+            // hold tens of thousands of entries.
+            let starts = spans.map { $0.start }
+            var prefix: [Int] = [0]
+            prefix.reserveCapacity(spans.count + 1)
+            for s in spans { prefix.append(prefix[prefix.count - 1] + (s.end - s.start)) }
+
             var kept: [TocEntry] = []
-            kept.reserveCapacity(entries0.count)
-            for e in entries0 where e.offset != rec.offset {
-                let off = e.offset > rec.offset ? e.offset - rec.length : e.offset
-                kept.append(TocEntry(offset: off, length: e.length, status: e.status,
-                                     priority: e.priority, date: e.date, to: e.to, subject: e.subject))
+            kept.reserveCapacity(max(0, entries0.count - removedOffsets.count))
+            for e in entries0 where !removedOffsets.contains(e.offset) {
+                // How many cut spans start before this offset (they are disjoint
+                // from it — the offset survived the removedOffsets test).
+                var lo = 0, hi = starts.count
+                while lo < hi {
+                    let mid = (lo + hi) / 2
+                    if starts[mid] < e.offset { lo = mid + 1 } else { hi = mid }
+                }
+                kept.append(TocEntry(offset: e.offset - prefix[lo], length: e.length,
+                                     status: e.status, priority: e.priority,
+                                     date: e.date, to: e.to, subject: e.subject))
             }
             try? TocWriter.data(entries: kept).write(to: toc)
         } else if FileManager.default.fileExists(atPath: toc.path) {
             try? FileManager.default.removeItem(at: toc)
         }
-        return (recordBytes, removedEntry)
+        return removed
     }
 
     /// Move one message from `source` to `dest` (Eudora "delete" = move to
@@ -209,9 +280,39 @@ public enum MailboxMutator {
     /// source — so an interrupted/failed move can never lose the message (worst
     /// case it lands in both). Carries its status/priority/date/subject.
     public static func move(from source: URL, index: Int, to dest: URL) throws {
-        let (recordBytes, entry) = try readRecord(base: source, index: index)
-        try appendRecord(recordBytes, entry: entry, to: dest)
-        try remove(base: source, index: index)
+        try moveMany(from: source, indices: [index], to: dest)
+    }
+
+    /// Move several messages in one operation: every record is read against the
+    /// same snapshot of the source, appended to the destination **in mailbox
+    /// order** (so they arrive in the order they sat in the source, not the
+    /// order they were clicked), and then removed from the source in a single
+    /// `removeMany` rewrite. Same crash-safety as `move`: append first, remove
+    /// after, worst case a message lands in both.
+    public static func moveMany(from source: URL, indices: [Int], to dest: URL) throws {
+        let unique = Set(indices).sorted()
+        guard !unique.isEmpty else { return }
+        let mbx = source.appendingPathExtension("mbx")
+        let toc = source.appendingPathExtension("toc")
+        guard let data = try? Data(contentsOf: mbx) else { throw MutateError.notFound }
+        let bytes = [UInt8](data)
+        let recs = Mbox.findRecords(bytes)
+        // Validate before the first append: failing between appends would land
+        // *some* of the batch in the destination with all of it still in the
+        // source, which reads as duplication rather than safety.
+        guard let first = unique.first, first >= 1,
+              let last = unique.last, last <= recs.count else { throw MutateError.outOfRange }
+
+        let tocByOffset: [Int: TocEntry]? = Toc.read(toc).map { entries in
+            Dictionary(entries.map { ($0.offset, $0) }, uniquingKeysWith: { a, _ in a })
+        }
+        for index in unique {
+            let rec = recs[index - 1]
+            let end = min(rec.offset + rec.length, bytes.count)
+            let entry = tocByOffset?[rec.offset] ?? synthesizedEntry(bytes: bytes, rec: rec)
+            try appendRecord(Array(bytes[rec.offset..<end]), entry: entry, to: dest)
+        }
+        try removeMany(base: source, indices: unique)
     }
 
     /// Read one message's raw record bytes + its TOC entry, without modifying
@@ -236,6 +337,14 @@ public enum MailboxMutator {
         if let toc = Toc.read(tocURL), let e = toc.first(where: { $0.offset == rec.offset }) {
             return e
         }
+        return synthesizedEntry(bytes: bytes, rec: rec)
+    }
+
+    /// The fallback half of `oneEntry`: a TOC entry made by parsing just this
+    /// one message, for a mailbox with no usable `.toc`. Split out so the batch
+    /// operations, which read the `.toc` once up front, can synthesize misses
+    /// without re-reading it per message.
+    private static func synthesizedEntry(bytes: [UInt8], rec: MboxRecord) -> TocEntry {
         let part = MIMEParser.parse(Mbox.messageBytes(bytes, rec))
         return TocEntry(offset: rec.offset, length: rec.length, status: 1, priority: 4,  // read/normal
                         date: part.header("Date") ?? "",

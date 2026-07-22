@@ -207,13 +207,21 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         }
     }
 
-    /// The message the click landed on, resolved once when the menu is built.
+    /// The messages the menu acts on, resolved once when the menu is built.
     ///
     /// Held rather than recomputed per action: `rows` can be replaced while the
     /// menu is open — the enrichment pass rewrites them, and a delete clears
-    /// them — and the action must act on the message actually right-clicked, not
-    /// on whatever has since moved into that position.
-    private var clickedID: MessageRow.ID?
+    /// them — and the action must act on the messages actually right-clicked,
+    /// not on whatever has since moved into those positions.
+    ///
+    /// macOS convention decides the membership (see `menuNeedsUpdate`):
+    /// right-clicking a row *inside* the current multi-selection targets the
+    /// whole selection; right-clicking outside it targets just that row, and
+    /// the action will re-select accordingly. `clickedPrimary` is the row under
+    /// the pointer either way — it becomes the primary when the action installs
+    /// the selection.
+    private var clickedIDs: Set<MessageRow.ID> = []
+    private var clickedPrimary: MessageRow.ID?
 
     /// `clickedRow` is a *position*, and `MessageRow.id` is a mailbox index —
     /// they differ whenever a mailbox has ghosts (deleted but not compacted), so
@@ -240,13 +248,26 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         menu.removeAllItems()
         moveBuilders.removeAll()
 
-        clickedID = resolveClickedID()
-        // An NSMenu with no items simply doesn't appear, which is
-        // indistinguishable from never being asked — so never leave it empty.
-        // If the click can't be tied to a row, fall back to whatever is
-        // selected; the model's operations all work on the selection anyway.
-        if clickedID == nil { clickedID = model.selectedMessageID }
-        guard clickedID != nil else {
+        if let clicked = resolveClickedID() {
+            // Inside the current multi-selection → the menu acts on all of it;
+            // outside (or a single selection elsewhere) → on the clicked row
+            // alone, which the action will select first. The macOS convention.
+            if model.selectedMessageIDs.count > 1, model.selectedMessageIDs.contains(clicked) {
+                clickedIDs = model.selectedMessageIDs
+            } else {
+                clickedIDs = [clicked]
+            }
+            clickedPrimary = clicked
+        } else {
+            // An NSMenu with no items simply doesn't appear, which is
+            // indistinguishable from never being asked — so never leave it
+            // empty. If the click can't be tied to a row, fall back to whatever
+            // is selected; the model's operations all work on the selection
+            // anyway.
+            clickedIDs = model.selectedMessageIDs
+            clickedPrimary = model.primaryMessageID
+        }
+        guard !clickedIDs.isEmpty else {
             let none = NSMenuItem(title: "No message selected", action: nil, keyEquivalent: "")
             none.isEnabled = false
             menu.addItem(none)
@@ -259,13 +280,13 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         // they're still on the Message menu.
         //
         // The whole point: a title now, contents only if opened.
+        let n = clickedIDs.count
         let move = NSMenuItem(title: "Move to", action: nil, keyEquivalent: "")
         let submenu = NSMenu(title: "Move to")
         submenu.autoenablesItems = false
         let builder = MailboxMenuBuilder(items: model.tree) { [weak self] destination in
-            guard let self, let id = self.clickedID else { return }
-            self.model.selectedMessageID = id
-            self.model.moveSelected(to: destination)
+            guard let self else { return }
+            self.actOnClickedRows { self.model.moveSelected(to: destination) }
         }
         submenu.delegate = builder
         moveBuilders.append(builder)
@@ -274,32 +295,40 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         menu.addItem(move)
 
         menu.addItem(.separator())
-        add("Reply", #selector(reply))
-        add("Forward", #selector(forward))
+        // Reply and Forward only make sense on one message (the design
+        // decision), so they grey out over a multi-selection rather than
+        // silently acting on just one of it. `autoenablesItems` is false, so
+        // what is set here is what shows.
+        add("Reply", #selector(reply), enabled: n == 1)
+        add("Forward", #selector(forward), enabled: n == 1)
 
         menu.addItem(.separator())
         add("Delete", #selector(deleteMessage))
     }
 
-    private func add(_ title: String, _ action: Selector) {
+    private func add(_ title: String, _ action: Selector, enabled: Bool = true) {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self
+        item.isEnabled = enabled
         menu.addItem(item)
     }
 
     // MARK: actions
 
-    /// Each action selects the clicked row first, matching what the SwiftUI menu
-    /// did — the model's operations all work on the current selection.
-    private func actOnClickedRow(_ body: () -> Void) {
-        guard let id = clickedID else { return }
-        model.selectedMessageID = id
+    /// Each action installs the resolved target as the selection first,
+    /// matching what the SwiftUI menu did — the model's operations all work on
+    /// the current selection. For a right-click inside a multi-selection the
+    /// set is that selection (a no-op install); for one outside it, this is
+    /// what moves the selection to the clicked row.
+    private func actOnClickedRows(_ body: () -> Void) {
+        guard !clickedIDs.isEmpty else { return }
+        model.applyMessageSelection(clickedIDs, primary: clickedPrimary)
         body()
     }
 
-    @objc private func reply() { actOnClickedRow { model.reply(all: false) } }
-    @objc private func forward() { actOnClickedRow { model.forward() } }
-    @objc private func deleteMessage() { actOnClickedRow { model.deleteSelected() } }
+    @objc private func reply() { actOnClickedRows { model.reply(all: false) } }
+    @objc private func forward() { actOnClickedRows { model.forward() } }
+    @objc private func deleteMessage() { actOnClickedRows { model.deleteSelected() } }
 }
 
 // `MailboxMenuBuilder`, which fills the Move submenu one level at a time, was

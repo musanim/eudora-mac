@@ -8,7 +8,8 @@ struct ContentView: View {
     @EnvironmentObject var accounts: AccountStore
     @Environment(\.openWindow) private var openWindow
 
-    private var hasSelection: Bool { model.selectedMessageID != nil }
+    /// Any selection at all — Delete acts on the whole set.
+    private var hasSelection: Bool { !model.selectedMessageIDs.isEmpty }
 
     /// Height of the preview pane, remembered across launches.
     ///
@@ -194,7 +195,7 @@ struct ContentView: View {
         .onChange(of: model.selectedMailboxID) { _ in
             DispatchQueue.main.async { model.loadListing() }
         }
-        .onChange(of: model.selectedMessageID) { _ in
+        .onChange(of: model.selectedMessageIDs) { _ in
             DispatchQueue.main.async { model.loadMessage() }
         }
         .overlay(alignment: .top) {
@@ -1894,7 +1895,14 @@ struct PreviewView: View {
     }
 
     @ViewBuilder private var content: some View {
-        if let p = model.preview {
+        if model.selectedMessageIDs.count > 1 {
+            // A multi-selection previews nothing (the design decision — Mail's
+            // convention). Checked before `preview`: a stale render must not
+            // linger under a selection it no longer describes.
+            Text("\(model.selectedMessageIDs.count) messages selected")
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let p = model.preview {
             VStack(alignment: .leading, spacing: 0) {
                 headers(p)
                 Divider()

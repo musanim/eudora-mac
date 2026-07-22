@@ -338,7 +338,26 @@ final class AppModel: ObservableObject {
     // `didSet`, so the follow-on @Published mutations happen *after* SwiftUI's
     // view-update pass — not during it (which SwiftUI warns about).
     @Published var selectedMailboxID: MailboxItem.ID?
-    @Published var selectedMessageID: MessageRow.ID?
+
+    /// The selected messages. Usually one; ⌘-click and ⇧-click grow it.
+    @Published var selectedMessageIDs: Set<MessageRow.ID> = []
+
+    /// The **primary** selected message — the last row the user actually
+    /// clicked, as against the rest of a multi-selection. This is the one the
+    /// preview would show if only one were selected, the one whose position
+    /// `keepSelectionVisible` protects, and the one that persists across
+    /// relaunch. Maintained by `applyMessageSelection`; always a member of
+    /// `selectedMessageIDs`, or nil when that is empty.
+    @Published private(set) var primaryMessageID: MessageRow.ID?
+
+    /// The single selected message, or nil when none — **or several** — are
+    /// selected. The accessor for every operation that only makes sense on one
+    /// message (preview, reply, forward, mark read): with a multi-selection
+    /// those don't apply, per the design decision, and this returning nil is
+    /// what disables them.
+    var selectedMessageID: MessageRow.ID? {
+        selectedMessageIDs.count == 1 ? selectedMessageIDs.first : nil
+    }
 
     // Bind List/Table selection through these, never to `$selectedMailboxID`
     // directly. A selection binding is written *during* SwiftUI's update pass —
@@ -384,11 +403,58 @@ final class AppModel: ObservableObject {
         PerfLog.mark("cleared for switch")
     }
 
-    var messageSelection: Binding<MessageRow.ID?> {
-        Binding(get: { [weak self] in self?.selectedMessageID },
+    var messageSelection: Binding<Set<MessageRow.ID>> {
+        Binding(get: { [weak self] in self?.selectedMessageIDs ?? [] },
                 set: { [weak self] new in
-                    DispatchQueue.main.async { self?.selectedMessageID = new }
+                    DispatchQueue.main.async { self?.applyMessageSelection(new) }
                 })
+    }
+
+    /// Install a new selection set and keep `primaryMessageID` truthful.
+    ///
+    /// The Table's `Set` binding reports only the new membership — not which
+    /// row was clicked — so the primary is inferred from the difference:
+    /// exactly one row appearing is a click (plain or ⌘), and that row is the
+    /// new primary. A ⇧-click extends the range by several rows at once and
+    /// keeps its anchor, so an unchanged primary that is still selected stays.
+    /// A primary that *left* the selection (⌘-click deselected it) falls back
+    /// to an arbitrary member: which one is primary then matters less than
+    /// there being one at all.
+    ///
+    /// Every programmatic selection change goes through here too, so the
+    /// invariant — primary is a member, or nil — has one owner. A caller that
+    /// *knows* which row was clicked (the AppKit context menu does; the Table
+    /// binding doesn't) passes it as `primary` and overrides the inference.
+    func applyMessageSelection(_ new: Set<MessageRow.ID>,
+                               primary preferred: MessageRow.ID? = nil) {
+        if new != selectedMessageIDs {
+            let added = new.subtracting(selectedMessageIDs)
+            selectedMessageIDs = new
+            if new.isEmpty {
+                primaryMessageID = nil
+            } else if let p = preferred, new.contains(p) {
+                primaryMessageID = p
+            } else if added.count == 1 {
+                primaryMessageID = added.first
+            } else if let p = primaryMessageID, new.contains(p) {
+                // ⇧-click range extension: the anchor stays primary.
+            } else {
+                primaryMessageID = new.first
+            }
+        } else if let p = preferred, new.contains(p), p != primaryMessageID {
+            // Same membership, different pointer — a right-click inside the
+            // selection moves the primary without moving the selection.
+            primaryMessageID = p
+        }
+    }
+
+    /// Select exactly one message (the programmatic equivalent of a click).
+    private func selectMessage(_ id: MessageRow.ID?) {
+        if let id {
+            applyMessageSelection([id])
+        } else {
+            applyMessageSelection([])
+        }
     }
 
     /// The message list, **in display order** — `rows[n]` is the nth row on
@@ -630,7 +696,7 @@ final class AppModel: ObservableObject {
         treeReloadGeneration &+= 1
 
         selectedMailboxID = nil
-        selectedMessageID = nil
+        selectMessage(nil)
         listedMailboxID = nil
         // Before `setRows`, so the (empty) rows aren't run through a sort
         // belonging to a mailbox in the tree being closed.
@@ -879,7 +945,7 @@ final class AppModel: ObservableObject {
 
         let pending = pendingMessageID
         pendingMessageID = nil
-        selectedMessageID = nil
+        selectMessage(nil)
         // Clear immediately: the old mailbox's rows must not linger under the
         // new mailbox's name while the listing is built.
         setRows([])
@@ -893,18 +959,18 @@ final class AppModel: ObservableObject {
                 // outlive the messages it pointed at (deleted, or a mailbox that
                 // shrank).
                 if self.rows.contains(where: { $0.id == pending }) {
-                    self.selectedMessageID = pending
+                    self.selectMessage(pending)
                     // Ask for keyboard focus now the rows are real. Asking in
                     // restoreSelection would start the retry clock before the
                     // listing existed, and it expires after about a second.
                     self.pendingListFocus = true
-                    // Render directly: onChange(selectedMessageID) won't fire if
-                    // `pending` equals the previously selected index (e.g. row 2
-                    // → row 2 in another mailbox), which would leave the preview
-                    // blank.
+                    // Render directly: onChange(selectedMessageIDs) won't fire
+                    // if `pending` equals the previously selected index (e.g.
+                    // row 2 → row 2 in another mailbox), which would leave the
+                    // preview blank.
                     self.loadMessage()
                 } else {
-                    self.selectedMessageID = nil
+                    self.selectMessage(nil)
                 }
             }
             self.rememberSelection()
@@ -1087,7 +1153,7 @@ final class AppModel: ObservableObject {
     /// mailbox's remembered scroll position. Revealing scrolls the minimum
     /// distance and does nothing at all when the row is already visible.
     private func keepSelectionVisible() {
-        guard let id = selectedMessageID, let pos = rowPositionByID[id] else { return }
+        guard let id = primaryMessageID, let pos = rowPositionByID[id] else { return }
         pendingRevealRow = pos
     }
 
@@ -1938,11 +2004,22 @@ final class AppModel: ObservableObject {
 
     // MARK: message management (delete / move / mark read)
 
-    /// The currently selected (mailbox item, message index), if any.
+    /// The currently selected (mailbox item, message index) — **only when
+    /// exactly one message is selected**. `selectedMessageID` is nil for a
+    /// multi-selection, so this is the gate for the single-message operations:
+    /// reply, forward, mark read. Delete and move take `currentSelectionSet`.
     private func currentSelection() -> (item: MailboxItem, index: Int)? {
         guard let id = selectedMailboxID, let item = itemsByID[id], !item.isFolder,
               let idx = selectedMessageID else { return nil }
         return (item, idx)
+    }
+
+    /// The selected (mailbox item, message indices) for any non-empty
+    /// selection — what delete and move act on.
+    private func currentSelectionSet() -> (item: MailboxItem, indices: [Int])? {
+        guard let id = selectedMailboxID, let item = itemsByID[id], !item.isFolder,
+              !selectedMessageIDs.isEmpty else { return nil }
+        return (item, Array(selectedMessageIDs))
     }
 
     /// Whether anywhere exists to move a message to.
@@ -1957,7 +2034,13 @@ final class AppModel: ObservableObject {
         return itemsByID.values.contains { !$0.isFolder && $0.id != current }
     }
 
+    /// Exactly one message selected — enables the single-message commands
+    /// (Reply, Forward, Mark as Read/Unread).
     var canActOnMessage: Bool { currentSelection() != nil }
+
+    /// At least one message selected — enables Delete and Transfer, which act
+    /// on the whole selection.
+    var canActOnSelection: Bool { currentSelectionSet() != nil }
 
     func markSelected(read: Bool) {
         guard let sel = currentSelection() else { return }
@@ -2012,18 +2095,24 @@ final class AppModel: ObservableObject {
     }
 
     /// Delete = move to Trash; if already in Trash, remove permanently.
+    /// Acts on the whole selection: the batch goes to `MailboxMutator` as one
+    /// set of indices against one snapshot of the mailbox — never a loop over
+    /// single removes, which would corrupt the not-yet-processed indices as
+    /// each removal shifted the ones after it.
     func deleteSelected() {
-        guard let sel = currentSelection() else { return }
+        guard let sel = currentSelectionSet() else { return }
+        let n = sel.indices.count
         do {
             if sel.item.type == .trash {
-                try MailboxMutator.remove(base: sel.item.base, index: sel.index)
-                showBanner("Message deleted.")
+                try MailboxMutator.removeMany(base: sel.item.base, indices: sel.indices)
+                showBanner(n == 1 ? "Message deleted." : "\(n) messages deleted.")
             } else if let trash = base(ofType: .trash) {
-                try MailboxMutator.move(from: sel.item.base, index: sel.index, to: trash)
-                showBanner("Moved to Trash.")
+                try MailboxMutator.moveMany(from: sel.item.base, indices: sel.indices, to: trash)
+                showBanner(n == 1 ? "Moved to Trash." : "\(n) messages moved to Trash.")
             } else {
-                try MailboxMutator.remove(base: sel.item.base, index: sel.index)
-                showBanner("Message deleted (no Trash mailbox).")
+                try MailboxMutator.removeMany(base: sel.item.base, indices: sel.indices)
+                showBanner(n == 1 ? "Message deleted (no Trash mailbox)."
+                                  : "\(n) messages deleted (no Trash mailbox).")
             }
             afterRemoval()
         } catch {
@@ -2032,34 +2121,39 @@ final class AppModel: ObservableObject {
     }
 
     func moveSelected(to destID: MailboxItem.ID) {
-        guard let sel = currentSelection(), let dest = itemsByID[destID] else { return }
+        guard let sel = currentSelectionSet(), let dest = itemsByID[destID] else { return }
         // The menu lists every mailbox, including this one — see MoveToMenu.swift
         // for why it can't depend on the selection. Moving a message to where it
         // already is should do nothing rather than rewrite two mailboxes.
         guard destID != selectedMailboxID else { return }
+        let n = sel.indices.count
         do {
-            try MailboxMutator.move(from: sel.item.base, index: sel.index, to: dest.base)
-            showBanner("Moved to \(dest.display).")
+            try MailboxMutator.moveMany(from: sel.item.base, indices: sel.indices, to: dest.base)
+            showBanner(n == 1 ? "Moved to \(dest.display)."
+                              : "\(n) messages moved to \(dest.display).")
             afterRemoval()
         } catch {
             showError("Move failed: \(error.localizedDescription)")
         }
     }
 
-    /// The selected message left the current mailbox: clear it and refresh.
+    /// The selected message(s) left the current mailbox: clear the selection
+    /// and refresh.
     private func afterRemoval() {
         PerfLog.mark("afterRemoval begins")
 
-        // Where the list is looking, and where in it the departing message sits —
+        // Where the list is looking, and where in it the departing messages sat —
         // both captured now, before `setRows([])` wipes them, so the viewport can
         // be put back after the rebuild. Without this the list was left wherever
         // the empty→repopulate cycle happened to park it, a position unrelated to
-        // the message just removed. `rows` here is still the pre-removal list, so
-        // the index is a display position in it.
+        // the messages just removed. `rows` here is still the pre-removal list, so
+        // these are display positions in it.
         let priorTop = selectedMailboxID.flatMap { viewState.scrollTopRowByMailbox[$0] }
-        let removedPos = selectedMessageID.flatMap { id in rows.firstIndex { $0.id == id } }
+        let removedPositions = selectedMessageIDs.compactMap { id in
+            rowPositionByID[id]
+        }
 
-        selectedMessageID = nil
+        selectMessage(nil)
         preview = nil
         // Clear the rows rather than leaving them up during the re-list.
         // Removing a message shifts every later index, so the rows on screen no
@@ -2079,16 +2173,17 @@ final class AppModel: ObservableObject {
         // matters to someone watching.
         rebuildRows { [weak self] in
             guard let self else { return }
-            // Put the viewport back where it was. One row is gone, so the top
-            // moves only if the removed message sat *above* it (everything below
-            // shifted up by one); a message removed at or below the top leaves
-            // the rows above it — and the top — untouched. In the common case
-            // where you delete the row you were looking at, that keeps the row
-            // just after it sitting where the deleted one was. Clamped to what
-            // the mailbox now holds. Handed to the same AppKit bridge, and via
-            // the same `pendingScrollTopRow`, that `loadListing` restores through.
+            // Put the viewport back where it was. The top moves only by the
+            // number of removed rows that sat *above* it (everything below them
+            // shifted up); rows removed at or below the top leave the rows
+            // above it — and the top — untouched. In the common case where you
+            // delete the rows you were looking at, that keeps the row just
+            // after them sitting where the first deleted one was. Clamped to
+            // what the mailbox now holds. Handed to the same AppKit bridge, and
+            // via the same `pendingScrollTopRow`, that `loadListing` restores
+            // through.
             if let top = priorTop, !self.rows.isEmpty {
-                let shifted = (removedPos.map { $0 < top } ?? false) ? top - 1 : top
+                let shifted = top - removedPositions.filter { $0 < top }.count
                 self.pendingScrollTopRow = max(0, min(shifted, self.rows.count - 1))
             } else {
                 self.pendingScrollTopRow = nil
@@ -2296,7 +2391,7 @@ final class AppModel: ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
         if selectedMailboxID == hit.mailbox {
             // Mailbox already listed; just move the selection (onChange renders it).
-            selectedMessageID = index
+            selectMessage(index)
         } else {
             pendingMessageID = index
             selectedMailboxID = hit.mailbox   // onChange → loadListing() applies pending

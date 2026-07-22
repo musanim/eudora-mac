@@ -138,9 +138,12 @@ struct MenuBarView: View {
                 .keyboardShortcut("u", modifiers: .command)
                 .disabled(!model.canActOnMessage)
             Divider()
+            // `canActOnSelection`, not `canActOnMessage`: Delete (like
+            // Transfer) acts on the whole multi-selection, where Reply/Forward
+            // and Mark as Read above require exactly one message.
             Button("Delete") { model.deleteSelected() }
                 .keyboardShortcut(.delete, modifiers: .command)
-                .disabled(!model.canActOnMessage)
+                .disabled(!model.canActOnSelection)
         }.menuBarItem()
     }
 
@@ -164,7 +167,7 @@ struct MenuBarView: View {
             Text("Transfer")
         }
         .buttonStyle(.plain)
-        .disabled(!model.canActOnMessage || !model.hasMoveTargets)
+        .disabled(!model.canActOnSelection || !model.hasMoveTargets)
         .menuBarItem()
     }
 
