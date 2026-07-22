@@ -510,8 +510,30 @@ final class AppModel: ObservableObject {
         bannerIsError = false
     }
 
-    /// True while a Check Mail fetch is in flight.
+    /// True while a Check Mail fetch is in flight. Drives the spinner phase of
+    /// the toolbar indicator.
     @Published var isChecking = false
+
+    /// The Check Mail indicator's completion line — "No new mail", "Received 3
+    /// messages", "Check mail failed". Set when a fetch finishes and cleared a
+    /// few seconds later, so the toolbar shows the outcome and then gets out of
+    /// the way. `isChecking` is the phase before this.
+    @Published private(set) var checkMailNotice: String?
+    private var checkMailNoticeGeneration = 0
+
+    /// Show a Check Mail outcome, then retire it after a beat. Generation-keyed
+    /// like `rememberScroll`'s coalescer: a later notice cancels an earlier
+    /// one's timer, and the `asyncAfter` closure inherits this method's main
+    /// actor so it may touch the published state.
+    private func showCheckMailNotice(_ text: String) {
+        checkMailNotice = text
+        checkMailNoticeGeneration &+= 1
+        let generation = checkMailNoticeGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self, self.checkMailNoticeGeneration == generation else { return }
+            self.checkMailNotice = nil
+        }
+    }
 
     // MARK: search (Find window)
     /// Hits from the last Find run, newest first.
@@ -2098,6 +2120,7 @@ final class AppModel: ObservableObject {
         }
         guard !isChecking else { return }
         isChecking = true
+        checkMailNotice = nil        // spinner only, until this fetch resolves
         defer { isChecking = false }
 
         do {
@@ -2125,10 +2148,13 @@ final class AppModel: ObservableObject {
 
             reloadTree()
             if let id = selectedMailboxID, itemsByID[id]?.type == .inbox { loadListing(force: true) }
-            showBanner(fetched.isEmpty
-                        ? "No new mail."
-                        : "Received \(fetched.count) message\(fetched.count == 1 ? "" : "s").")
+            showCheckMailNotice(fetched.isEmpty
+                        ? "No new mail"
+                        : "Received \(fetched.count) message\(fetched.count == 1 ? "" : "s")")
         } catch {
+            // Short line in the toolbar indicator; the full reason stays up in
+            // the banner until dismissed, since it's usually actionable.
+            showCheckMailNotice("Check mail failed")
             showError("Check mail failed: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)")
         }
     }

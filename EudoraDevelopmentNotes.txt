@@ -6,10 +6,7 @@ to do
 
 compress lines in message list
 
-Next, we need to untangle an issue between stephen@musanim.com (running Eudora 7 under the Windows emulation on a remote Mac) and stephen.malinowski@gmail.com (running Eudora 8 here).  Emails from 8 -> 7 work fine, but 7 -> 8 do not.
-
-
-
+add a settings icon
 
 ==============================================================
 ==============================================================
@@ -17,3 +14,29 @@ Next, we need to untangle an issue between stephen@musanim.com (running Eudora 7
 ==============================================================
 ==============================================================
 ==============================================================
+
+POP3 diag: user=recent:stephen.malinowski@gmail.com host=pop.gmail.com:995
+POP3 diag: server listed 1 message(s); knownUIDs holds 1
+POP3 diag:   #1  uid=GmailId19f1201abb33d22a
+2 GmailId19f1430ecbd24f61
+3 GmailId19f288c9a0591567
+4 GmailId19f3b38d00bf0518
+5 GmailId19f3d4451cc25df6
+6 GmailId19f45dfb8ac175a1
+7 GmailId19f4aa5c30b93d66
+8 GmailId19f54c8315039131
+9 GmailId19f54cf44565711d
+10 GmailId19f552556da9cb91
+11 GmailId19f6912bdd28c401
+12 GmailId19f69837d76c43df
+13 GmailId19f7942c8e9f6b60
+14 GmailId19f7e92dff5f9cdc
+15 GmailId19f7e9fb1cc6fd00
+16 GmailId19f81074066fa7e8
+17 GmailId19f81d5b9751e7f6
+18 GmailId19f81d707d283374
+19 GmailId19f86975a09be37b
+20 GmailId19f8764a500f1169  FETCH (new)
+POP3 diag: 1 new message(s) will be fetched
+tcp_input [C1.1.1:2] flags=[R] seq=3285554474, ack=0, win=0 state=LAST_ACK rcv_nxt=3285554474, snd_una=3114011506
+tcp_input [C1.1.1:2] flags=[R] seq=3285554474, ack=0, win=0 state=CLOSED rcv_nxt=3285554474, snd_una=3114011506

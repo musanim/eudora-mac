@@ -108,36 +108,44 @@ struct ContentView: View {
         .navigationTitle("Eudora")
         .navigationSubtitle(model.status)
         .toolbar {
-            ToolbarItemGroup {
-                Button { Task { await model.receiveMail(accounts: accounts) } } label: {
-                    // The button greys out while a fetch runs, but greyed-out
-                    // reads as "unavailable", not as "working" — a POP3 round
-                    // trip is long enough to want the difference stated.
-                    if model.isChecking {
+            // Centered between the window title and the action buttons — the
+            // same spot Xcode puts its activity view. Spinner + "Checking mail"
+            // during a fetch (⌘M / File ▸ Check Mail — there's no toolbar button
+            // for it), then the outcome, which `showCheckMailNotice` retires
+            // after a few seconds.
+            ToolbarItem(placement: .principal) {
+                if model.isChecking {
+                    HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
-                    } else {
-                        Label("Check Mail", systemImage: "arrow.down.circle")
+                        Text("Checking mail").foregroundStyle(.secondary)
                     }
-                }.disabled(model.isChecking)
+                } else if let notice = model.checkMailNotice {
+                    Text(notice).foregroundStyle(.secondary)
+                }
+            }
+            ToolbarItemGroup {
                 Button { model.composeNew() } label: {
                     Label("New Message", systemImage: "square.and.pencil")
                 }
-                Button { model.reply(all: false) } label: {
-                    Label("Reply", systemImage: "arrowshape.turn.up.left")
-                }.disabled(!hasSelection)
-                Button { model.forward() } label: {
-                    Label("Forward", systemImage: "arrowshape.turn.up.right")
-                }.disabled(!hasSelection)
-
-                // Not a SwiftUI `Menu`: its content would be built eagerly, all
-                // 2,657 mailboxes of it, every time this toolbar item was
-                // invalidated — which `disabled` guarantees on every selection
-                // change. See MoveToMenu.swift.
-                MoveToMenuButton(tree: { model.tree },
-                                 onPick: { model.moveSelected(to: $0) }) {
-                    Label("Move", systemImage: "tray.and.arrow.up")
-                }.disabled(!hasSelection || !model.hasMoveTargets)
-
+                // `SettingsButton` opens the Settings scene the version-correct
+                // way (SettingsLink on 14+, the menu action on 13). The gear is
+                // `assets/settings.png`, template-rendered so it tints like the SF
+                // Symbol icons beside it; sized to sit with them rather than at
+                // the artwork's own resolution.
+                SettingsButton {
+                    Image("settings")
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 15, height: 15)
+                }
+                .help("Settings")
+                // Reply, Forward and Move-to are deliberately *not* here: each is
+                // reachable from the Message/Transfer menus, the message-list
+                // right-click, and (Reply) ⌘R, so a toolbar button for them is
+                // redundant. `MoveToMenuButton` still exists — the Transfer menu
+                // uses it — and `model.reply/forward/moveSelected` are still the
+                // handlers those routes call.
                 Button { model.deleteSelected() } label: {
                     Label("Delete", systemImage: "trash")
                 }.disabled(!hasSelection)
