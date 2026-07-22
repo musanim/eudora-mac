@@ -10,12 +10,28 @@ public struct OutgoingMessage: Sendable {
     public var bcc: [String]
     public var subject: String
     public var body: String           // plain-text, UTF-8
+
+    /// The HTML alternative, when the user actually formatted something.
+    ///
+    /// **Nil is a guarantee, not a default.** A message with no styling must
+    /// assemble to byte-for-byte what this type produced before rich text
+    /// existed: a single `text/plain` entity, no boundary, no parts. Anything
+    /// else would change every plain message this app has ever sent for the sake
+    /// of a feature the sender didn't use — and would rewrite the records
+    /// already sitting in Out the next time they were saved.
+    ///
+    /// So the caller must set this **only** when `RichText.isStyled` is true,
+    /// and `rfc822` branches on it rather than on "is there rich text in the
+    /// composer", which is always yes. `body` stays the plain-text alternative
+    /// and stays authoritative; the HTML is the extra.
+    public var htmlBody: String?
+
     public var inReplyTo: String?     // Message-ID being replied to (with <>)
     public var references: [String]   // References chain (each with <>)
 
     public init(fromName: String, fromAddress: String,
                 to: [String], cc: [String] = [], bcc: [String] = [],
-                subject: String, body: String,
+                subject: String, body: String, htmlBody: String? = nil,
                 inReplyTo: String? = nil, references: [String] = []) {
         self.fromName = fromName
         self.fromAddress = fromAddress
@@ -24,6 +40,7 @@ public struct OutgoingMessage: Sendable {
         self.bcc = bcc
         self.subject = subject
         self.body = body
+        self.htmlBody = htmlBody
         self.inReplyTo = inReplyTo
         self.references = references
     }
@@ -53,7 +70,12 @@ public struct OutgoingMessage: Sendable {
     /// Assemble the full RFC-822 message (CRLF line endings, UTF-8). Bcc is
     /// intentionally omitted from the headers. Returns the bytes plus the
     /// Message-ID and Date used (handy for write-back / threading).
-    public func rfc822(date: Date = Date(), messageID: String? = nil)
+    ///
+    /// - Parameter boundary: the MIME boundary, for tests that need the bytes to
+    ///   be deterministic. Ignored unless `htmlBody` is set; nil means generate
+    ///   one, which is what every caller outside the tests does.
+    public func rfc822(date: Date = Date(), messageID: String? = nil,
+                       boundary: String? = nil)
         -> (data: Data, messageID: String, dateHeader: String) {
 
         let mid = messageID ?? generatedMessageID(date: date)
@@ -70,21 +92,69 @@ public struct OutgoingMessage: Sendable {
         if !references.isEmpty { headers.append("References: \(references.joined(separator: " "))") }
         headers.append("MIME-Version: 1.0")
 
-        let bodyIsASCII = body.unicodeScalars.allSatisfy { $0.value < 128 }
-        headers.append("Content-Type: text/plain; charset=\(bodyIsASCII ? "us-ascii" : "utf-8")")
-
+        let CRLF = "\r\n"
         let bodyText: String
-        if bodyIsASCII {
-            headers.append("Content-Transfer-Encoding: 7bit")
-            bodyText = Self.normalizeCRLF(body)
+
+        if let html = htmlBody, !html.isEmpty {
+            // Styled: plain text first, HTML second. Order is not cosmetic —
+            // RFC 2046 §5.1.4 has the *last* alternative be the richest, and
+            // that is how readers choose which one to show.
+            let mark = boundary ?? Self.generatedBoundary()
+            headers.append("Content-Type: multipart/alternative; boundary=\"\(mark)\"")
+            // No top-level Content-Transfer-Encoding: multipart defaults to 7bit
+            // and each part declares its own.
+            bodyText = "--\(mark)" + CRLF
+                + Self.textEntity(body, subtype: "plain") + CRLF
+                + "--\(mark)" + CRLF
+                + Self.textEntity(html, subtype: "html") + CRLF
+                + "--\(mark)--" + CRLF
         } else {
-            headers.append("Content-Transfer-Encoding: quoted-printable")
-            bodyText = QuotedPrintable.encodeBody(body)
+            // Unstyled: exactly the bytes this produced before rich text
+            // existed. See the note on `htmlBody` — this branch is a
+            // compatibility guarantee and should not be "tidied" into the one
+            // above.
+            let bodyIsASCII = body.unicodeScalars.allSatisfy { $0.value < 128 }
+            headers.append("Content-Type: text/plain; charset=\(bodyIsASCII ? "us-ascii" : "utf-8")")
+            if bodyIsASCII {
+                headers.append("Content-Transfer-Encoding: 7bit")
+                bodyText = Self.normalizeCRLF(body)
+            } else {
+                headers.append("Content-Transfer-Encoding: quoted-printable")
+                bodyText = QuotedPrintable.encodeBody(body)
+            }
         }
 
-        let CRLF = "\r\n"
         let full = headers.joined(separator: CRLF) + CRLF + CRLF + bodyText
         return (Data(full.utf8), mid, dateHeader)
+    }
+
+    /// One `text/*` body part: its two headers, the blank line, and the encoded
+    /// content — with **no** trailing line ending.
+    ///
+    /// The caller adds the CRLF before the next delimiter, because per RFC 2046
+    /// that line ending belongs to the boundary and not to the part. Folding it
+    /// in here would append a phantom blank line to every part's content.
+    static func textEntity(_ text: String, subtype: String) -> String {
+        let CRLF = "\r\n"
+        let isASCII = text.unicodeScalars.allSatisfy { $0.value < 128 }
+        var out = "Content-Type: text/\(subtype); charset=\(isASCII ? "us-ascii" : "utf-8")" + CRLF
+        if isASCII {
+            out += "Content-Transfer-Encoding: 7bit" + CRLF + CRLF
+            out += normalizeCRLF(text)
+        } else {
+            out += "Content-Transfer-Encoding: quoted-printable" + CRLF + CRLF
+            out += QuotedPrintable.encodeBody(text)
+        }
+        return out
+    }
+
+    /// A boundary that cannot occur in either part.
+    ///
+    /// A UUID rather than a scan of the content for a clashing string: the
+    /// probability of collision is nil, and a scan is one more thing that could
+    /// be subtly wrong on the message where it mattered.
+    static func generatedBoundary() -> String {
+        "=_Eudora_\(UUID().uuidString)"
     }
 
     // MARK: helpers
