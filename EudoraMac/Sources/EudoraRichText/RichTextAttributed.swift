@@ -141,7 +141,7 @@ public enum RichTextAttributed {
 
     // MARK: - colour
 
-    static func nsColor(_ c: RichTextColor) -> NSColor {
+    public static func nsColor(_ c: RichTextColor) -> NSColor {
         NSColor(srgbRed: CGFloat(c.red), green: CGFloat(c.green), blue: CGFloat(c.blue), alpha: 1)
     }
 

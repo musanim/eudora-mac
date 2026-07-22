@@ -334,10 +334,13 @@ struct RichTextEditor: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
-        textView.maxSize = NSSize(width: .greatestFiniteMagnitude, height: .greatestFiniteMagnitude)
+        // `CGFloat.greatestFiniteMagnitude` spelled out: bare `.greatest…` is
+        // ambiguous between the Int/Double/CGFloat `NSSize` initialisers.
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                  height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.containerSize =
-            NSSize(width: 0, height: .greatestFiniteMagnitude)
+            NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
 
         controller.attach(textView, seed: seed, defaults: defaults)
 
