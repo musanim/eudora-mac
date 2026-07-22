@@ -32,5 +32,6 @@ let package = Package(
         // Tests (each builds its own temp fixture).
         .testTarget(name: "EudoraStoreTests", dependencies: ["EudoraStore"]),
         .testTarget(name: "EudoraSearchTests", dependencies: ["EudoraStore", "EudoraSearch"]),
+        .testTarget(name: "EudoraNetTests", dependencies: ["EudoraNet"]),
     ]
 )

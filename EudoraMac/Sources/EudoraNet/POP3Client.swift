@@ -40,6 +40,19 @@ public final class POP3Client: @unchecked Sendable {
         connection = NWConnection(host: NWEndpoint.Host(account.host), port: port, using: params)
     }
 
+    /// Diagnostic for the "message is on the server but nothing downloads" case.
+    /// When on, `fetchNew` prints the full UIDL list the server returns and, for
+    /// each entry, whether it is being fetched or skipped as already-known — which
+    /// separates "the server isn't offering it" from "our known-set is eating it"
+    /// without any more guessing.
+    ///
+    /// Off, but intact — the way this codebase keeps its diagnostics. It earned
+    /// its keep once: the `UIDL body … (hex)` dump is what revealed the listing
+    /// was CRLF-delimited, overturning a wrong line-ending theory and pointing at
+    /// the grapheme-split bug in `parseUIDL`. Flip to `true` to see the UIDL
+    /// exchange again.
+    public static var diagnose = false
+
     // MARK: high-level operations
 
     /// Download messages whose UIDL is not in `knownUIDs`. Does NOT delete.
@@ -53,6 +66,19 @@ public final class POP3Client: @unchecked Sendable {
         try await c.login(account.username, password)
 
         let uidls = try await c.uidl()          // [(num, uid)]
+
+        if Self.diagnose {
+            print("POP3 diag [BUILD MARKER: line-ending-fix-v2]")
+            print("POP3 diag: user=\(account.username) host=\(account.host):\(account.port)")
+            print("POP3 diag: server listed \(uidls.count) message(s); knownUIDs holds \(knownUIDs.count)")
+            for entry in uidls {
+                let state = knownUIDs.contains(entry.uid) ? "SKIP (already known)" : "FETCH (new)"
+                print("POP3 diag:   #\(entry.num)  uid=\(entry.uid)  \(state)")
+            }
+            let newCount = uidls.filter { !knownUIDs.contains($0.uid) }.count
+            print("POP3 diag: \(newCount) new message(s) will be fetched")
+        }
+
         var out: [FetchedMessage] = []
         for entry in uidls where !knownUIDs.contains(entry.uid) {
             try await c.sendLine("RETR \(entry.num)")
@@ -99,10 +125,35 @@ public final class POP3Client: @unchecked Sendable {
         try await sendLine("UIDL")
         _ = try await readStatus(during: "UIDL")
         let body = try await readMultiline()
-        var pairs: [(Int, String)] = []
-        for line in String(decoding: body, as: UTF8.self).split(whereSeparator: { $0 == "\n" }) {
-            let parts = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                .split(separator: " ", maxSplits: 1)
+        if Self.diagnose {
+            // Show the actual bytes separating entries. If extractLine failed to
+            // split the list, the original separator survives in `body`; the hex
+            // reveals what it really is (we've assumed CR/LF and been wrong).
+            let head = Array(body.prefix(96))
+            let hex = head.map { String(format: "%02x", $0) }.joined(separator: " ")
+            print("POP3 diag: UIDL body, first \(head.count) bytes (hex):")
+            print("POP3 diag: \(hex)")
+        }
+        return Self.parseUIDL(body)
+    }
+
+    /// Parse a UIDL body — `num uid` per line — into pairs.
+    ///
+    /// **Splits on the LF *byte*, not on a `Character`.** The whole "message
+    /// list collapses into one entry" bug lived here: the body is CRLF-delimited,
+    /// and `String(decoding:).split { $0 == "\n" }` never matched, because a
+    /// Swift `String` is a sequence of grapheme clusters and `"\r\n"` is a
+    /// *single* `Character` equal to neither `"\n"` nor `"\r"`. So every line ran
+    /// together and the 21-message listing parsed as one message with a nonsense
+    /// concatenated UID — nothing ever downloaded. Working in bytes sidesteps
+    /// grapheme clustering entirely. Static and `internal` so it can be tested
+    /// directly on a `Data` — a test that would have caught this.
+    static func parseUIDL(_ body: Data) -> [(num: Int, uid: String)] {
+        var pairs: [(num: Int, uid: String)] = []
+        for var lineBytes in body.split(separator: 0x0A) {   // LF
+            if lineBytes.last == 0x0D { lineBytes = lineBytes.dropLast() }   // strip CR of CRLF
+            let line = String(decoding: lineBytes, as: UTF8.self)
+            let parts = line.split(separator: " ", maxSplits: 1)
             if parts.count == 2, let n = Int(parts[0]) {
                 pairs.append((n, String(parts[1])))
             }
@@ -140,7 +191,7 @@ public final class POP3Client: @unchecked Sendable {
         return out
     }
 
-    /// One CRLF-terminated line (CRLF stripped), buffering across reads.
+    /// One line, its terminator stripped, buffering across reads.
     private func readLine() async throws -> Data {
         while true {
             if let line = extractLine() { return line }
@@ -151,9 +202,38 @@ public final class POP3Client: @unchecked Sendable {
     }
 
     private func extractLine() -> Data? {
-        guard let r = buffer.range(of: Data([0x0D, 0x0A])) else { return nil }
-        let line = buffer.subdata(in: buffer.startIndex..<r.lowerBound)
-        buffer.removeSubrange(buffer.startIndex..<r.upperBound)
+        Self.extractLine(from: &buffer)
+    }
+
+    /// Split off the next line at the first CR or LF, tolerating CRLF, bare LF,
+    /// and bare CR. Consumes the terminator; a CRLF counts as one break.
+    /// Returns `nil` when no complete line is buffered yet.
+    ///
+    /// It was CRLF-only — `range(of: "\r\n")` — which is correct per RFC but
+    /// brittle: a server that separated lines with a bare CR handed back one
+    /// unbroken blob, and the UIDL parser then read a 21-message listing as a
+    /// single message with a nonsense concatenated UID, so nothing ever
+    /// downloaded. (Observed against Gmail POP reached via the wrong host.)
+    /// Since `readMultiline` re-emits every line as CRLF, normalising here also
+    /// repairs message bodies that arrive with odd endings.
+    ///
+    /// Static and `internal` (not `private`) so `EudoraNetTests` can drive it on
+    /// a plain `Data` without a live connection — the regression it fixes is
+    /// exactly the kind that hid for weeks, so it's worth a test that pins it.
+    /// A trailing bare CR with nothing after it is held back deliberately: it may
+    /// be the first half of a CRLF split across two reads. That can't be
+    /// disambiguated until the next byte arrives, so a response whose final byte
+    /// is a lone CR would stall — no RFC-compliant server ends that way.
+    static func extractLine(from buffer: inout Data) -> Data? {
+        guard let idx = buffer.firstIndex(where: { $0 == 0x0D || $0 == 0x0A }) else { return nil }
+        let after = buffer.index(after: idx)
+        if buffer[idx] == 0x0D, after == buffer.endIndex { return nil }
+        let line = buffer.subdata(in: buffer.startIndex..<idx)
+        var consumeEnd = after
+        if buffer[idx] == 0x0D, buffer[after] == 0x0A {
+            consumeEnd = buffer.index(after: after)   // CRLF counts as one break
+        }
+        buffer.removeSubrange(buffer.startIndex..<consumeEnd)
         return line
     }
 
