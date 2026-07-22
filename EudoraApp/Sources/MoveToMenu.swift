@@ -63,7 +63,13 @@ import AppKit
 @MainActor
 final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
     private let items: [MailboxItem]
+    /// The folder whose contents this level shows, nil at the root — what
+    /// "New…" at this level creates *inside*.
+    private let folderID: MailboxItem.ID?
     private let onPick: (MailboxItem.ID) -> Void
+    /// Eudora 7's "New…" at the top of every level. Nil means the item isn't
+    /// offered (a caller that only moves, never creates).
+    private let onNew: ((MailboxItem.ID?) -> Void)?
 
     /// Child builders, retained because `NSMenu.delegate` is a **weak**
     /// reference: a builder that nothing else held would be gone by the time its
@@ -72,9 +78,14 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
     /// `MoveToMenuController.rootBuilder`.
     private var children: [MailboxMenuBuilder] = []
 
-    init(items: [MailboxItem], onPick: @escaping (MailboxItem.ID) -> Void) {
+    init(items: [MailboxItem],
+         folderID: MailboxItem.ID? = nil,
+         onPick: @escaping (MailboxItem.ID) -> Void,
+         onNew: ((MailboxItem.ID?) -> Void)? = nil) {
         self.items = items
+        self.folderID = folderID
         self.onPick = onPick
+        self.onNew = onNew
         super.init()
     }
 
@@ -86,6 +97,15 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
         menu.removeAllItems()
         children.removeAll()
 
+        // "New…" first, above a separator — where Eudora 7 put it, at every
+        // level of the hierarchy.
+        if onNew != nil {
+            let entry = NSMenuItem(title: "New…", action: #selector(newHere), keyEquivalent: "")
+            entry.target = self
+            menu.addItem(entry)
+            menu.addItem(.separator())
+        }
+
         for item in items {
             if item.isFolder {
                 // Folders hold mailboxes, not messages, so a folder is only ever
@@ -93,8 +113,12 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
                 // Without that test, a tree full of empty folders (common: Eudora
                 // leaves `.fol` directories behind) would fill the menu with
                 // submenus that open onto nothing.
+                //
+                // Unless the menu creates as well as moves: then an empty folder
+                // opens onto its own "New…", which is exactly how something gets
+                // *into* it for the first time.
                 guard let kids = item.children,
-                      Self.containsDestination(kids) else { continue }
+                      onNew != nil || Self.containsDestination(kids) else { continue }
                 let submenu = NSMenu(title: item.display)
                 // Automatic validation runs *after* `menuNeedsUpdate`, so it
                 // overwrites hand-set enablement; and it decides an item carrying
@@ -102,7 +126,8 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
                 // deliberately left empty until it opens, greys out the very item
                 // this file exists for.
                 submenu.autoenablesItems = false
-                let child = MailboxMenuBuilder(items: kids, onPick: onPick)
+                let child = MailboxMenuBuilder(items: kids, folderID: item.id,
+                                               onPick: onPick, onNew: onNew)
                 submenu.delegate = child
                 children.append(child)
 
@@ -123,6 +148,10 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
     @objc private func pick(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? MailboxItem.ID else { return }
         onPick(id)
+    }
+
+    @objc private func newHere() {
+        onNew?(folderID)
     }
 
     /// Whether this subtree holds any mailbox at all — an empty folder would
@@ -165,8 +194,10 @@ final class MoveToMenuController: ObservableObject {
 
     /// `tree` is passed in at the moment of the click, not held, so the menu can
     /// never show a tree older than the button press.
-    func popUp(tree: [MailboxItem], onPick: @escaping (MailboxItem.ID) -> Void) {
-        let builder = MailboxMenuBuilder(items: tree, onPick: onPick)
+    func popUp(tree: [MailboxItem],
+               onPick: @escaping (MailboxItem.ID) -> Void,
+               onNew: ((MailboxItem.ID?) -> Void)? = nil) {
+        let builder = MailboxMenuBuilder(items: tree, onPick: onPick, onNew: onNew)
         rootBuilder = builder
         menu.delegate = builder      // popUp asks the delegate to fill it
 
@@ -203,6 +234,44 @@ final class MoveToMenuController: ObservableObject {
                 NSMenu.popUpContextMenu(self.menu, with: event, for: view)
             }
         }
+    }
+}
+
+// MARK: - The "New…" prompt
+
+/// The name-and-kind dialog behind Move to ▸ New…, Eudora 7's main way of
+/// creating mailboxes. Plain AppKit (`NSAlert.runModal`), which is fine here:
+/// it runs from a menu action, after menu tracking has ended and outside any
+/// SwiftUI update pass.
+@MainActor
+enum NewMailboxDialog {
+    struct Response {
+        let name: String
+        let isFolder: Bool
+    }
+
+    /// Returns nil on Cancel. The name comes back untrimmed and unvalidated —
+    /// `MailboxTreeMutator` owns the rules, and its errors carry the reason.
+    static func run(locationDisplay: String) -> Response? {
+        let alert = NSAlert()
+        alert.messageText = "New Mailbox"
+        alert.informativeText = "Create a mailbox in \u{201C}\(locationDisplay)\u{201D}:"
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 30, width: 230, height: 24))
+        field.placeholderString = "Mailbox name"
+        let checkbox = NSButton(checkboxWithTitle: "Make it a folder",
+                                target: nil, action: nil)
+        checkbox.frame = NSRect(x: 0, y: 2, width: 230, height: 20)
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 230, height: 56))
+        accessory.addSubview(field)
+        accessory.addSubview(checkbox)
+        alert.accessoryView = accessory
+        alert.window.initialFirstResponder = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return Response(name: field.stringValue, isFolder: checkbox.state == .on)
     }
 }
 
@@ -248,13 +317,15 @@ private struct MenuAnchor: NSViewRepresentable {
 struct MoveToMenuButton<Label: View>: View {
     let tree: () -> [MailboxItem]
     let onPick: (MailboxItem.ID) -> Void
+    /// Optional "New…" handler, per level; nil leaves the item out.
+    var onNew: ((MailboxItem.ID?) -> Void)? = nil
     @ViewBuilder let label: () -> Label
 
     @StateObject private var controller = MoveToMenuController()
 
     var body: some View {
         Button {
-            controller.popUp(tree: tree(), onPick: onPick)
+            controller.popUp(tree: tree(), onPick: onPick, onNew: onNew)
         } label: {
             label().background(
                 // Made to fill deliberately. The menu is positioned from this

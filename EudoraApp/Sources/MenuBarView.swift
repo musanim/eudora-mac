@@ -163,7 +163,8 @@ struct MenuBarView: View {
     /// button, and there is nothing behind it worth opening to read.
     private var transferMenu: some View {
         MoveToMenuButton(tree: { model.tree },
-                         onPick: { model.moveSelected(to: $0) }) {
+                         onPick: { model.moveSelected(to: $0) },
+                         onNew: { model.createMailboxAndMoveSelection(under: $0) }) {
             Text("Transfer")
         }
         .buttonStyle(.plain)

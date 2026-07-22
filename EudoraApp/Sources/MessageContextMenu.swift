@@ -122,6 +122,13 @@ final class MessageDoubleClickController: NSObject {
                   let self, let table = self.table, let window = table.window,
                   event.window === window else { return event }
 
+            // While the removal veil is up the rows are a stale picture of a
+            // mailbox that no longer exists — a double-click must not reopen
+            // a draft by an index that now names a different message. The
+            // SwiftUI overlay can't intercept for us: this monitor sees the
+            // event before any view does.
+            guard self.model.removalVeil == nil else { return event }
+
             // Row coordinates. A click on the column header converts to a
             // negative y and one in the empty strip right of the last column to
             // an x outside the table, so both fail this and pass through —
@@ -193,6 +200,12 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         monitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { [weak self] event in
             guard let self, let table = self.table, let window = table.window,
                   event.window === window else { return event }
+
+            // Stand down while the removal veil is up: the rows are a stale
+            // picture, and a menu popped over them would act on indices that
+            // now name different messages. (This monitor sees the event before
+            // the SwiftUI overlay could block anything.)
+            guard self.model.removalVeil == nil else { return event }
 
             // Only clicks inside the message list, and only on a real row —
             // anything else is passed through untouched.
@@ -284,10 +297,18 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         let move = NSMenuItem(title: "Move to", action: nil, keyEquivalent: "")
         let submenu = NSMenu(title: "Move to")
         submenu.autoenablesItems = false
-        let builder = MailboxMenuBuilder(items: model.tree) { [weak self] destination in
-            guard let self else { return }
-            self.actOnClickedRows { self.model.moveSelected(to: destination) }
-        }
+        let builder = MailboxMenuBuilder(
+            items: model.tree,
+            onPick: { [weak self] destination in
+                guard let self else { return }
+                self.actOnClickedRows { self.model.moveSelected(to: destination) }
+            },
+            // Move to ▸ New…: create a mailbox at that level, then move the
+            // clicked rows into it — one gesture, as in Eudora 7.
+            onNew: { [weak self] parent in
+                guard let self else { return }
+                self.actOnClickedRows { self.model.createMailboxAndMoveSelection(under: parent) }
+            })
         submenu.delegate = builder
         moveBuilders.append(builder)
         move.submenu = submenu

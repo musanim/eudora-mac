@@ -427,6 +427,12 @@ final class AppModel: ObservableObject {
     /// binding doesn't) passes it as `primary` and overrides the inference.
     func applyMessageSelection(_ new: Set<MessageRow.ID>,
                                primary preferred: MessageRow.ID? = nil) {
+        // While the removal veil is up the rows are a stale picture, so a
+        // non-empty selection arriving through the Table binding (arrow keys —
+        // the veil's overlay already swallows clicks) would select by an index
+        // that names a different message after the re-list. Ignore it; clears
+        // still pass, and the binding's `get` keeps the Table showing none.
+        if removalVeil != nil, !new.isEmpty { return }
         if new != selectedMessageIDs {
             let added = new.subtracting(selectedMessageIDs)
             selectedMessageIDs = new
@@ -675,6 +681,23 @@ final class AppModel: ObservableObject {
         splashHeldForRestore = false
         defer { hideSplashUnlessRestoring() }
         UserDefaults.standard.set(url.path, forKey: Self.lastFolderKey)
+
+        // In/Out/Junk/Trash are load-bearing — receiving needs In, sending
+        // needs Out, delete needs Trash — so any that are missing are created
+        // before the tree is read, and a genuinely fresh directory becomes a
+        // minimal Eudora tree (its first descmap.pce plus the four boxes). On
+        // a complete tree this is a pure read and touches nothing. Failure is
+        // non-fatal: a read-only archive still opens for browsing, and the
+        // operations that need a missing box complain when actually used.
+        do {
+            let created = try MailboxTreeMutator.ensureSystemMailboxes(root: url)
+            if !created.isEmpty {
+                showBanner("Created \(created.joined(separator: ", ")).")
+            }
+        } catch {
+            showError("Couldn't create the standard mailboxes: \(error.localizedDescription)")
+        }
+
         let s = MailStore(root: url)
         store = s
         rootURL = url
@@ -813,7 +836,76 @@ final class AppModel: ObservableObject {
     }
 
     /// Called by the bridge once the scroll position has been applied.
-    func clearPendingScroll() { pendingScrollTopRow = nil }
+    func clearPendingScroll() {
+        // Only a restore that was actually pending may take the veil down —
+        // a straggler from before the veil went up (a launch restore's
+        // one-turn-deferred clear, say) finds `pendingScrollTopRow` already
+        // nil, because `afterRemoval` nils it when raising the veil, and must
+        // not un-hide the very swap the veil exists to cover.
+        let hadPending = pendingScrollTopRow != nil
+        pendingScrollTopRow = nil
+        if hadPending { dropRemovalVeil(showNotice: true) }
+    }
+
+    /// Non-nil from a delete/move until the re-listed rows are back *and*
+    /// their restored scroll position has been applied. While set, the
+    /// message list keeps showing the pre-removal list as a picture —
+    /// washed halfway to white, this text over them, all interaction blocked —
+    /// instead of the old blank → wrong offset → jump sequence. The value is
+    /// the label ("Deleting…" / "Moving…"). See `afterRemoval`.
+    @Published private(set) var removalVeil: String? {
+        didSet {
+            // The frozen picture lives exactly as long as the veil.
+            if removalVeil == nil, removalVeilImage != nil { removalVeilImage = nil }
+        }
+    }
+    private var removalVeilGeneration = 0
+
+    /// The pre-removal list, photographed. Shown *opaque* under the veil's
+    /// wash, so nothing the live table does while re-listing — the row diff,
+    /// the scroll restore, SwiftUI's own geometry settling — can show through.
+    /// A translucent wash over the live table was tried first, and every one
+    /// of those movements read as a jerk through it. Nil (capture failed, or
+    /// the bridge isn't attached) falls back to washing the live table.
+    @Published private(set) var removalVeilImage: NSImage?
+
+    /// The completion message ("Moved to Trash." and friends), shown in the
+    /// exact spot the veil's label occupied, the moment the veil lifts —
+    /// never alongside it, and never in the window banner, so the one capsule
+    /// reads Deleting… → Moved to Trash. with no second location to track.
+    /// Retires itself after a couple of seconds.
+    @Published private(set) var removalNotice: String?
+    private var pendingRemovalNotice: String?
+    private var removalNoticeGeneration = 0
+
+    /// The veil's one exit. Publishes the held completion notice into the
+    /// label's spot (unless the veil is being superseded — a mailbox switch
+    /// doesn't earn a notice about a list no longer showing) and stands the
+    /// backstop timer down.
+    private func dropRemovalVeil(showNotice: Bool) {
+        guard removalVeil != nil else { return }
+        removalVeil = nil                 // didSet drops the frozen picture
+        removalVeilGeneration += 1        // disarm the backstop
+        if showNotice, let notice = pendingRemovalNotice {
+            removalNotice = notice
+            removalNoticeGeneration += 1
+            let generation = removalNoticeGeneration
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                guard let self, self.removalNoticeGeneration == generation,
+                      self.removalNotice != nil else { return }
+                self.removalNotice = nil
+            }
+        }
+        pendingRemovalNotice = nil
+    }
+
+    /// Installed by the message table's AppKit bridge (`TableScrollStateSyncer.
+    /// attach`): photographs the list's scroll view exactly as it looks now.
+    /// A closure because the model decides *when* to photograph
+    /// (`afterRemoval`, before anything visual changes) while only the bridge
+    /// holds the NSViews. Weakly captured on the bridge side, so a torn-down
+    /// table returns nil rather than a stale view's pixels.
+    var captureListSnapshot: (() -> NSImage?)?
 
     /// A row to bring into view, scrolling the least amount that does it — as
     /// opposed to `pendingScrollTopRow`, which puts a row *at the top*. Set after
@@ -938,6 +1030,14 @@ final class AppModel: ObservableObject {
             return
         }
         PerfLog.mark("loadListing begins")
+        // A fresh listing supersedes any removal still veiled: the veil's own
+        // completion was cancelled with the old mailbox's listing task, so
+        // left up it would sit over the *next* mailbox, dead to clicks, until
+        // the backstop timer. No notice — it would describe a list that is no
+        // longer showing — and any notice already up comes down for the same
+        // reason.
+        dropRemovalVeil(showNotice: false)
+        if removalNotice != nil { removalNotice = nil }
         listedMailboxID = selectedMailboxID
         preview = nil
         previewTask?.cancel()
@@ -1003,7 +1103,16 @@ final class AppModel: ObservableObject {
     /// Both phases run off the main actor. Reading and record-scanning a mailbox
     /// is O(file), and Trash here is 613 MB — this used to block the main thread
     /// for seconds, *and* parse all 22,515 messages before drawing a single row.
-    private func rebuildRows(completion: (() -> Void)? = nil) {
+    /// - Parameter carryingEnrichment: enrichment already in hand for rows that
+    ///   survive a removal, keyed by their NEW 1-based index. The fresh listing
+    ///   is TOC-only — recipient cached as Who, the TOC's own date format — and
+    ///   without this the surviving rows visibly regressed to those values the
+    ///   moment the removal veil lifted, then "settled" back as the background
+    ///   parse re-derived what the old rows already knew (and reshuffled the
+    ///   sort with them). Carried values are exactly what the parse will
+    ///   produce, so enrichment lands as a visual no-op on these rows.
+    private func rebuildRows(carryingEnrichment carryOver: [Int: MessageRow]? = nil,
+                             completion: (() -> Void)? = nil) {
         listingTask?.cancel()
         enrichTask?.cancel()
 
@@ -1033,10 +1142,12 @@ final class AppModel: ObservableObject {
         // straight back to where it came from.
         //
         // PRECONDITION: `rows` is either empty or already belongs to `id`. Every
-        // caller satisfies that today — `loadListing` and `afterRemoval` clear
-        // the rows first, and `markSelected`'s fallback re-lists the mailbox it
-        // is already showing. A new caller that left another mailbox's rows in
-        // place would leave them in one order with `sort` claiming another, and
+        // caller satisfies that today — `loadListing` clears the rows first,
+        // `markSelected`'s fallback re-lists the mailbox it is already showing,
+        // and `afterRemoval` deliberately leaves the *same mailbox's* stale rows
+        // up under the removal veil (they were built for `id`, in `id`'s own
+        // sort). A new caller that left another mailbox's rows in place would
+        // leave them in one order with `sort` claiming another, and
         // `rowPositionByID` would still be right, so nothing would look wrong
         // until a click landed on the wrong message. Clear the rows, or follow
         // this with `setRows(rows)`.
@@ -1062,7 +1173,19 @@ final class AppModel: ObservableObject {
             PerfLog.mark("read+scan done: \(built?.rows.count ?? 0) rows")
 
             guard !Task.isCancelled, let self, self.listingGeneration == generation else { return }
-            self.setRows(built?.rows ?? [])
+            var newRows = built?.rows ?? []
+            if let carryOver {
+                newRows = newRows.map { r in
+                    guard let old = carryOver[r.id] else { return r }
+                    var carried = r        // status/subject/size stay the TOC's
+                    carried.who = old.who
+                    carried.date = old.date
+                    carried.hasAttachment = old.hasAttachment
+                    carried.sortDate = old.sortDate
+                    return carried
+                }
+            }
+            self.setRows(newRows)
             PerfLog.mark("rows published")
             self.listingSource = built?.source ?? ""
             self.mailboxSummary = built?.summary ?? ""
@@ -2107,18 +2230,24 @@ final class AppModel: ObservableObject {
         guard let sel = currentSelectionSet() else { return }
         let n = sel.indices.count
         do {
+            // Success text goes through the veil's notice — the same capsule
+            // that says "Deleting…", updated when the veil lifts — never the
+            // window banner, so the eye tracks one spot. Failures still use
+            // the banner: they're actionable and shouldn't auto-retire.
             if sel.item.type == .trash {
                 try MailboxMutator.removeMany(base: sel.item.base, indices: sel.indices)
-                showBanner(n == 1 ? "Message deleted." : "\(n) messages deleted.")
+                afterRemoval(veil: "Deleting…",
+                             notice: n == 1 ? "Message deleted." : "\(n) messages deleted.")
             } else if let trash = base(ofType: .trash) {
                 try MailboxMutator.moveMany(from: sel.item.base, indices: sel.indices, to: trash)
-                showBanner(n == 1 ? "Moved to Trash." : "\(n) messages moved to Trash.")
+                afterRemoval(veil: "Deleting…",
+                             notice: n == 1 ? "Moved to Trash." : "\(n) messages moved to Trash.")
             } else {
                 try MailboxMutator.removeMany(base: sel.item.base, indices: sel.indices)
-                showBanner(n == 1 ? "Message deleted (no Trash mailbox)."
-                                  : "\(n) messages deleted (no Trash mailbox).")
+                afterRemoval(veil: "Deleting…",
+                             notice: n == 1 ? "Message deleted (no Trash mailbox)."
+                                            : "\(n) messages deleted (no Trash mailbox).")
             }
-            afterRemoval()
         } catch {
             showError("Delete failed: \(error.localizedDescription)")
         }
@@ -2133,38 +2262,95 @@ final class AppModel: ObservableObject {
         let n = sel.indices.count
         do {
             try MailboxMutator.moveMany(from: sel.item.base, indices: sel.indices, to: dest.base)
-            showBanner(n == 1 ? "Moved to \(dest.display)."
-                              : "\(n) messages moved to \(dest.display).")
-            afterRemoval()
+            afterRemoval(veil: "Moving…",
+                         notice: n == 1 ? "Moved to \(dest.display)."
+                                        : "\(n) messages moved to \(dest.display).")
         } catch {
             showError("Move failed: \(error.localizedDescription)")
         }
     }
 
     /// The selected message(s) left the current mailbox: clear the selection
-    /// and refresh.
-    private func afterRemoval() {
+    /// and refresh, behind the veil. `notice` is what the veil's label spot
+    /// says once the veil lifts ("Moved to Trash." and friends) — held here,
+    /// not shown, until then.
+    private func afterRemoval(veil: String, notice: String) {
         PerfLog.mark("afterRemoval begins")
+        pendingRemovalNotice = notice
+        if removalNotice != nil { removalNotice = nil }   // a new veil replaces any old notice
 
         // Where the list is looking, and where in it the departing messages sat —
-        // both captured now, before `setRows([])` wipes them, so the viewport can
-        // be put back after the rebuild. Without this the list was left wherever
-        // the empty→repopulate cycle happened to park it, a position unrelated to
-        // the messages just removed. `rows` here is still the pre-removal list, so
-        // these are display positions in it.
+        // both captured now, so the viewport can be put back after the rebuild.
+        // Without this the list was left wherever the rebuild happened to park
+        // it, a position unrelated to the messages just removed. `rows` here is
+        // still the pre-removal list, so these are display positions in it.
         let priorTop = selectedMailboxID.flatMap { viewState.scrollTopRowByMailbox[$0] }
         let removedPositions = selectedMessageIDs.compactMap { id in
             rowPositionByID[id]
         }
 
+        // The survivors' enrichment, re-keyed to the indices they are about
+        // to have. A removal shifts every later record's index down by the
+        // number of removed records before it — the same arithmetic
+        // `MailboxMutator` just performed on disk — so the old rows' parsed
+        // Who/Date/attachment/sort-date can be handed to the fresh listing
+        // instead of being re-derived while the user watches. Binary search
+        // over the sorted removed indices: a select-all delete in a large
+        // mailbox makes the quadratic version real money.
+        let removedSorted = selectedMessageIDs.sorted()
+        var carryOver: [Int: MessageRow] = [:]
+        carryOver.reserveCapacity(max(0, rows.count - removedSorted.count))
+        for old in rows where !selectedMessageIDs.contains(old.id) {
+            var lo = 0, hi = removedSorted.count
+            while lo < hi {
+                let mid = (lo + hi) / 2
+                if removedSorted[mid] < old.id { lo = mid + 1 } else { hi = mid }
+            }
+            carryOver[old.id - lo] = old
+        }
+
+        // Photograph the list FIRST, while it still shows the pre-removal
+        // world — selection highlight included; that's the picture the user
+        // was just looking at. Everything after this line changes what's on
+        // screen.
+        removalVeilImage = captureListSnapshot?()
+
         selectMessage(nil)
         preview = nil
-        // Clear the rows rather than leaving them up during the re-list.
-        // Removing a message shifts every later index, so the rows on screen no
-        // longer describe the mailbox: clicking one would select a different
-        // message than the one shown. A blank list for the duration is honest;
-        // a stale one is not.
-        setRows([])
+        // The rows are deliberately NOT cleared. They used to be — removing a
+        // message shifts every later index, so the rows on screen no longer
+        // describe the mailbox, and a stale list that takes clicks is a lie.
+        // But blanking produced a worse experience: blank, rows back at the
+        // wrong offset, then the jump to the restored one. So the stale rows
+        // stay up as a *picture*, washed halfway to white under `removalVeil`
+        // with a label over them, and everything that could act on them is
+        // blocked while the veil is up — the overlay swallows clicks, and the
+        // right-click and double-click monitors stand down (see
+        // MessageListView and MessageContextMenu). The veil comes down when
+        // the re-listed rows AND their restored scroll position are in
+        // (`clearPendingScroll`), so neither the blank nor the jump is ever
+        // seen.
+        // Any restore still pending belongs to a load from *before* the
+        // removal; letting it apply against the stale picture — and worse,
+        // letting its `clearPendingScroll` take the veil down — would un-hide
+        // exactly the artifact the veil covers. The completion below sets the
+        // real one.
+        pendingScrollTopRow = nil
+        removalVeil = veil
+        removalVeilGeneration += 1
+        let generation = removalVeilGeneration
+        // Backstop only: if the scroll bridge never applies (a mailbox that
+        // fails to re-list, a torn-down table), the veil must not sit on a
+        // stale picture forever. Generous on purpose — re-listing a large
+        // mailbox after a Trash delete is a whole-file read that can take
+        // several honest seconds, and the veil expiring *mid-listing* would
+        // uncover the stale rows, re-arm the click paths over them, and then
+        // show the very swap-and-jump it exists to hide. Every normal removal
+        // ends via `clearPendingScroll` long before this fires.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+            guard let self, self.removalVeilGeneration == generation else { return }
+            self.dropRemovalVeil(showNotice: true)
+        }
         // The tree refresh runs *after* the rows are back, not alongside them.
         //
         // Publishing a new tree re-renders the sidebar over 6,699 nodes, and
@@ -2175,7 +2361,7 @@ final class AppModel: ObservableObject {
         // message. Sequencing them puts the list back immediately and lets the
         // sidebar's counts settle a moment later, which is the order that
         // matters to someone watching.
-        rebuildRows { [weak self] in
+        rebuildRows(carryingEnrichment: carryOver) { [weak self] in
             guard let self else { return }
             // Put the viewport back where it was. The top moves only by the
             // number of removed rows that sat *above* it (everything below them
@@ -2189,8 +2375,14 @@ final class AppModel: ObservableObject {
             if let top = priorTop, !self.rows.isEmpty {
                 let shifted = top - removedPositions.filter { $0 < top }.count
                 self.pendingScrollTopRow = max(0, min(shifted, self.rows.count - 1))
+                // The veil stays up: the rows are in but sitting at the wrong
+                // offset until the bridge applies this. `clearPendingScroll`
+                // takes it down.
             } else {
                 self.pendingScrollTopRow = nil
+                // Nothing to restore (empty list, or no remembered top), so
+                // the rows as published are the final picture.
+                self.dropRemovalVeil(showNotice: true)
             }
             self.reloadTree()
         }
@@ -2253,6 +2445,107 @@ final class AppModel: ObservableObject {
 
         showBanner("Deleted mailbox \u{201C}\(item.display)\u{201D}.")
         reloadTree()
+    }
+
+    // MARK: mailbox management (create)
+
+    /// Move to ▸ New… — Eudora 7's main way of creating mailboxes: prompt for
+    /// a name at the level the menu was opened on, create, and move the
+    /// current selection into the new mailbox, all one gesture. "Make it a
+    /// folder" creates the folder and re-prompts *inside* it, Eudora-style,
+    /// until a mailbox exists to receive the move (or Cancel — folders already
+    /// created stay, which is also what Eudora did).
+    func createMailboxAndMoveSelection(under parentID: MailboxItem.ID?) {
+        guard let rootURL else { return }
+
+        // The parent is resolved through `itemsByID` exactly once, *before*
+        // the first dialog, and carried through the loop as a directory URL
+        // from then on. The modal alert pumps the main runloop, so an
+        // in-flight tree walk can land mid-dialog and rebuild `itemsByID`
+        // from a snapshot older than a folder created two prompts ago —
+        // re-resolving each turn would find nothing and silently stop.
+        var directory: URL
+        var location: String
+        var idPrefix: MailboxItem.ID?
+        if let parentID {
+            guard let parent = itemsByID[parentID], parent.isFolder else {
+                showError("Couldn't find that folder any more — the mailbox list just changed. Try again.")
+                return
+            }
+            directory = parent.base
+            location = parent.display
+            idPrefix = parentID
+        } else {
+            directory = rootURL
+            location = rootURL.lastPathComponent
+            idPrefix = nil
+        }
+
+        while true {
+            guard let response = NewMailboxDialog.run(locationDisplay: location) else { return }
+            guard let created = createMailbox(named: response.name,
+                                              inDirectory: directory,
+                                              idPrefix: idPrefix,
+                                              asFolder: response.isFolder) else { return }
+            if response.isFolder {
+                directory = created.base
+                location = created.display
+                idPrefix = created.id
+                continue
+            }
+            // The selection can have emptied while the dialog was up — a mail
+            // check landing in the viewed mailbox re-lists it and clears the
+            // selection. Say so rather than silently creating-without-moving.
+            if selectedMessageIDs.isEmpty {
+                showBanner("Created \u{201C}\(created.display)\u{201D} — the selection changed, so nothing was moved.")
+            } else {
+                moveSelected(to: created.id)
+            }
+            return
+        }
+    }
+
+    /// Create a mailbox or folder in `directory` and return the synthesized
+    /// item — or nil, with the error already on a banner. `idPrefix` is the
+    /// parent's id (nil at the top level), so the new item's id is exactly
+    /// what `buildItems` will derive when the tree walk catches up.
+    ///
+    /// The new item goes into `itemsByID` *synchronously*: the caller's next
+    /// step is usually `moveSelected(to:)`, which resolves the destination
+    /// there, and the tree walk that would add it is async. The published
+    /// `tree` catches up when `reloadTree` lands (its shape changes, so
+    /// `treeStructureVersion` bumps and the sidebar and menus rebuild).
+    func createMailbox(named name: String,
+                       inDirectory directory: URL,
+                       idPrefix: MailboxItem.ID?,
+                       asFolder: Bool) -> MailboxItem? {
+        let filename: String
+        do {
+            filename = asFolder
+                ? try MailboxTreeMutator.createFolder(directory: directory, name: name)
+                : try MailboxTreeMutator.createMailbox(directory: directory, name: name)
+        } catch {
+            showError("Couldn't create \u{201C}\(name)\u{201D}: \(error.localizedDescription)")
+            return nil
+        }
+
+        // The same id and base derivations `buildItems` uses, so the async
+        // tree walk resolves to an identical item and nothing jumps.
+        let id = idPrefix.map { "\($0)/\(filename)" } ?? filename
+        let base = asFolder
+            ? directory.appendingPathComponent(filename)
+            : directory.appendingPathComponent(filename).deletingPathExtension()
+        let item = MailboxItem(id: id,
+                               display: name.trimmingCharacters(in: .whitespaces),
+                               type: asFolder ? .folder : .mailbox,
+                               base: base,
+                               isFolder: asFolder,
+                               messageCount: 0,
+                               hasUnread: false,
+                               children: asFolder ? [] : nil)
+        itemsByID[id] = item
+        reloadTree()
+        return item
     }
 
     // MARK: receiving (POP3)

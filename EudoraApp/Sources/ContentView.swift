@@ -1208,6 +1208,15 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         /// events on a long list (76208 → 76228 → 76247…) as SwiftUI refines its
         /// row estimates — so treat any single height reading as approximate.
         static let diagnose = false
+
+        /// Restore-path diagnostics: one line per apply / verify / confirm /
+        /// clear in `applyPendingScroll` and `verifyPendingScroll`, with the
+        /// clip origin, the computed target, the row count and the document
+        /// height at that instant. Turn on if the removal veil ever again
+        /// drops onto a list that then moves: the line whose `wantY` changes
+        /// *after* a PASS names the geometry that was still settling, and the
+        /// stage that cleared prematurely is the one to fix.
+        static let diagnoseRestore = false
     }
 
     /// `@unchecked Sendable` because the notification block below is `@Sendable`
@@ -1313,6 +1322,12 @@ struct TableScrollStateSyncer: NSViewRepresentable {
     /// witnesses inherit isolation.
     @MainActor
     private func attach(near view: NSView, coordinator: Coordinator, attemptsLeft: Int) {
+        // The camera is (re)installed on every pass, BEFORE the already-
+        // attached early-return: SwiftUI can replace the representable's
+        // NSView at will, and a camera installed once would keep a weak
+        // reference to the dead anchor and photograph nothing ever after.
+        installCamera(anchor: view)
+
         guard coordinator.table == nil else { return }
         guard let table = MessageTableFinder.table(near: view),
               let clipView = table.enclosingScrollView?.contentView else {
@@ -1362,6 +1377,84 @@ struct TableScrollStateSyncer: NSViewRepresentable {
                 guard model.pendingScrollTopRow == nil else { return }
                 model.rememberScroll(topRow: top)
             }
+        }
+    }
+
+    /// The removal veil's camera (see `AppModel.removalVeilImage`):
+    /// window-server capture of the *anchor* view's region — NOT the scroll
+    /// view's, and NOT via `cacheDisplay`. Two dead ends are recorded here so
+    /// nobody re-treads them (frame-stepped screen recording +
+    /// /tmp/eudora-veil.png, 2026 jul 22):
+    ///
+    /// • The Table's internal NSScrollView is WIDER than the visible pane —
+    ///   measured 1238 pt against a ~920 pt pane — because
+    ///   NavigationSplitView extends the detail content under the sidebar.
+    ///   Capturing `scrollView.bounds`, by any mechanism, therefore yields a
+    ///   picture ~318 pt (one sidebar) wider than the overlay that displays
+    ///   it, and top-leading alignment then shows alien pixels at the pane's
+    ///   left with the list shoved right.
+    ///
+    /// • The anchor — the representable's own background NSView — is sized
+    ///   by SwiftUI to exactly the Table's frame, which is exactly what the
+    ///   veil overlay covers. Capturing *it* makes the capture and the
+    ///   display agree by construction, whatever AppKit does with underlap.
+    ///
+    /// `CGWindowListCreateImage` (whole window by ID, cropped locally) copies
+    /// the composited pixels the user is actually looking at — selection
+    /// highlight included, which is what the veil wants to freeze — and
+    /// capturing our own window needs no screen-recording permission. The
+    /// crop uses only window-local math; a CG *global* rect was tried and is
+    /// not trustworthy. Only the anchor is captured, weakly: holding `model`
+    /// would cycle (model owns the closure), and a replaced anchor should
+    /// yield nil — which is why `attach` reinstalls this on every pass.
+    @MainActor
+    private func installCamera(anchor view: NSView) {
+        model.captureListSnapshot = { [weak view] in
+            guard let anchor = view,
+                  let window = anchor.window, window.windowNumber > 0 else {
+                if Scrolling.diagnoseRestore { print("[restore] SNAPSHOT failed: no anchor/window") }
+                return nil
+            }
+            let bounds = anchor.bounds
+            guard bounds.width > 0, bounds.height > 0 else {
+                if Scrolling.diagnoseRestore { print("[restore] SNAPSHOT failed: bounds \(bounds)") }
+                return nil
+            }
+            let rectInWindow = anchor.convert(bounds, to: nil)
+            guard let full = CGWindowListCreateImage(.null, .optionIncludingWindow,
+                                                     CGWindowID(window.windowNumber),
+                                                     [.boundsIgnoreFraming, .bestResolution]) else {
+                if Scrolling.diagnoseRestore { print("[restore] SNAPSHOT failed: CG capture") }
+                return nil
+            }
+            // Pixels per point, from the image actually returned rather than
+            // an assumed screen scale. The captured image spans the window's
+            // frame (shadow excluded by `boundsIgnoreFraming`); window-base
+            // coordinates are y-up, CGImage rows are y-down, hence the flip.
+            let frame = window.frame
+            guard frame.width > 0, frame.height > 0 else { return nil }
+            let scale = CGFloat(full.width) / frame.width
+            let crop = CGRect(x: rectInWindow.minX * scale,
+                              y: (frame.height - rectInWindow.maxY) * scale,
+                              width: rectInWindow.width * scale,
+                              height: rectInWindow.height * scale).integral
+            guard let cg = full.cropping(to: crop) else {
+                if Scrolling.diagnoseRestore { print("[restore] SNAPSHOT failed: crop \(crop)") }
+                return nil
+            }
+            if Scrolling.diagnoseRestore {
+                print("[restore] SNAPSHOT ok \(bounds.size) cg \(cg.width)x\(cg.height)"
+                        + "  paneInWindow \(rectInWindow)  windowFrame \(frame)  scale \(scale)")
+                // The exact bitmap the veil will show, openable in Preview.
+                // It must start at the message list's first column — no
+                // sidebar — and end at the pane's right edge.
+                let rep = NSBitmapImageRep(cgImage: cg)
+                try? rep.representation(using: .png, properties: [:])?
+                    .write(to: URL(fileURLWithPath: "/tmp/eudora-veil.png"))
+            }
+            // Point size = the pane's, whatever the pixel scale, so the
+            // picture overlays the live table 1:1.
+            return NSImage(cgImage: cg, size: bounds.size)
         }
     }
 
@@ -1574,6 +1667,16 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         }
     }
 
+    /// One restore-path diagnostic line; see `Scrolling.diagnoseRestore`.
+    private static func diagnoseRestore(_ stage: String, table: NSTableView,
+                                        clipView: NSClipView, attemptsLeft: Int) {
+        guard Scrolling.diagnoseRestore else { return }
+        let doc = table.enclosingScrollView?.documentView ?? table
+        print("[restore] \(stage)  clip.y \(clipView.bounds.origin.y)"
+                + "  rows \(table.numberOfRows)"
+                + "  doc.h \(doc.frame.height)  attempts \(attemptsLeft)")
+    }
+
     /// Scrolls to the remembered row, if the model is asking for one.
     @MainActor
     private func applyPendingScroll(coordinator: Coordinator, attemptsLeft: Int) {
@@ -1600,22 +1703,85 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         // would have put it, and neither can be fixed without the other.
         let clipView = scrollView.contentView
         let document = scrollView.documentView ?? table
-        clipView.scroll(to: NSPoint(x: clipView.bounds.origin.x,
-                                    y: Scrolling.originY(forTopRow: row, table: table,
-                                                         clipView: clipView,
-                                                         document: document)))
+        let targetY = Scrolling.originY(forTopRow: row, table: table,
+                                        clipView: clipView, document: document)
+        Self.diagnoseRestore("APPLY row \(row) y \(targetY)", table: table,
+                             clipView: clipView, attemptsLeft: attemptsLeft)
+        clipView.scroll(to: NSPoint(x: clipView.bounds.origin.x, y: targetY))
         scrollView.reflectScrolledClipView(clipView)
 
         // Let the resulting bounds notification land before recording again.
         DispatchQueue.main.async {
             guard coordinator.restoreGeneration == generation else { return }
             coordinator.isRestoring = false
-            model.clearPendingScroll()
-            // Write the restored position straight back: recording was
-            // suppressed throughout the restore, so without this the remembered
-            // value would only ever be rewritten by a later user scroll.
-            model.rememberScroll(topRow: row)
+            verifyPendingScroll(coordinator: coordinator, generation: generation,
+                                row: row, attemptsLeft: attemptsLeft, confirmed: false)
         }
+    }
+
+    /// The gatekeeper between "the scroll was applied" and "the restore is
+    /// done" (`clearPendingScroll` — which is also what drops the removal
+    /// veil). Two lessons are encoded here, each learned from a visible jerk:
+    ///
+    /// 1. **The apply can land on stale geometry.** After a delete, the
+    ///    previous listing's rows can still be realized when the scroll is
+    ///    applied (a delete only *shrinks* the count, so the numberOfRows
+    ///    guard passes), and SwiftUI's row diff then moves the clip. So the
+    ///    target is recomputed against the table as it is *now*, and a clip
+    ///    that isn't there gets the scroll applied again.
+    ///
+    /// 2. **Geometry that matches once can still be settling.** SwiftUI
+    ///    refines the table's row-height estimates for several turns after a
+    ///    listing lands — `document.frame.height` visibly grows between turns
+    ///    (recorded in the `Scrolling` diagnostics comment) — so a check one
+    ///    turn after the apply can pass and *then* the rows shift. Hence the
+    ///    two-step: a passing check only schedules a **confirmation** a beat
+    ///    later, and the restore is finished only when the position has held
+    ///    across both. Any drift in between re-applies and starts over.
+    ///
+    /// A superseding chain (every apply bumps `restoreGeneration`) kills
+    /// pending verifications, so at most one chain is ever live; exhaustion
+    /// of `attemptsLeft` clears unconditionally, and the model's veil backstop
+    /// covers anything this could conceivably miss.
+    @MainActor
+    private func verifyPendingScroll(coordinator: Coordinator, generation: Int,
+                                     row: Int, attemptsLeft: Int, confirmed: Bool) {
+        guard coordinator.restoreGeneration == generation else { return }
+        guard model.pendingScrollTopRow != nil else { return }
+
+        if attemptsLeft > 0,
+           let table = coordinator.table, table.numberOfRows > row,
+           let scrollView = table.enclosingScrollView {
+            let clip = scrollView.contentView
+            let doc = scrollView.documentView ?? table
+            let wantY = Scrolling.originY(forTopRow: row, table: table,
+                                          clipView: clip, document: doc)
+            if abs(clip.bounds.origin.y - wantY) > 0.5 {
+                Self.diagnoseRestore("DRIFT want \(wantY)", table: table,
+                                     clipView: clip, attemptsLeft: attemptsLeft)
+                applyPendingScroll(coordinator: coordinator,
+                                   attemptsLeft: attemptsLeft - 1)
+                return
+            }
+            if !confirmed {
+                Self.diagnoseRestore("PASS want \(wantY), confirming", table: table,
+                                     clipView: clip, attemptsLeft: attemptsLeft)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    verifyPendingScroll(coordinator: coordinator, generation: generation,
+                                        row: row, attemptsLeft: attemptsLeft,
+                                        confirmed: true)
+                }
+                return
+            }
+            Self.diagnoseRestore("CONFIRMED want \(wantY), clearing", table: table,
+                                 clipView: clip, attemptsLeft: attemptsLeft)
+        }
+
+        model.clearPendingScroll()
+        // Write the restored position straight back: recording was
+        // suppressed throughout the restore, so without this the remembered
+        // value would only ever be rewritten by a later user scroll.
+        model.rememberScroll(topRow: row)
     }
 }
 
@@ -1645,6 +1811,16 @@ struct MessageListView: View {
                             .font(.caption2).foregroundStyle(.tertiary)
                     }
                 }
+                // Fixed height, because the bar's natural height CHANGED when
+                // the enrichment spinner appeared — the small NSProgressIndicator
+                // has a ~17 pt intrinsic box (`scaleEffect` shrinks only the
+                // drawing), taller than the caption line, so the whole list
+                // below nudged down a couple of pixels mid-veil (caught in a
+                // frame-stepped recording). Pinning the *spinner's* frame
+                // instead triggered AppKit min<=max constraint complaints; the
+                // bar is the right thing to pin. The spinner overdraws the 14 pt
+                // by a hair, invisibly at 0.6 scale.
+                .frame(height: 14)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)
                 Divider()
@@ -1746,6 +1922,48 @@ struct MessageListView: View {
             .background(MessageHeaderSortInstaller(model: model))
             .background(TableHeaderIconStyler(icons: HeaderIcon.leadingColumns))
             .background(TableScrollStateSyncer(model: model))
+            // The removal veil: during a delete/move the stale rows stay up as
+            // a picture — washed halfway to white, label on top — instead of
+            // the old blank → wrong offset → jump. The Color swallows clicks
+            // (the rows beneath describe a mailbox that no longer exists);
+            // the AppKit right-click and double-click monitors stand down on
+            // their own (they check `removalVeil` — see MessageContextMenu).
+            // Comes down when the re-listed rows and their restored scroll
+            // position are both in; see `AppModel.afterRemoval`.
+            .overlay {
+                if let veil = model.removalVeil {
+                    ZStack {
+                        // The frozen pre-removal picture, opaque, so nothing
+                        // the live table does underneath — the row diff, the
+                        // scroll restore, geometry settling — can show
+                        // through. (A translucent wash over the live table
+                        // let every one of those read as a jerk.) Natural
+                        // size, pinned to the top-left the way the list is;
+                        // clipped if the pane resized under it.
+                        if let frozen = model.removalVeilImage {
+                            Image(nsImage: frozen)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity,
+                                       alignment: .topLeading)
+                                .clipped()
+                        }
+                        Color.white.opacity(0.5)
+                        Text(veil)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .background(.thinMaterial, in: Capsule())
+                    }
+                } else if let notice = model.removalNotice {
+                    // The completion message, in the veil label's exact spot
+                    // and dress — the capsule reads Deleting… → Moved to
+                    // Trash. without moving. Hit-testing off: the list under
+                    // it is live again and a click should reach it.
+                    Text(notice)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(.thinMaterial, in: Capsule())
+                        .allowsHitTesting(false)
+                }
+            }
         }
     }
 

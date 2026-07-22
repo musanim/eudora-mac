@@ -204,6 +204,264 @@ final class MailboxTreeMutatorTests: XCTestCase {
         }
     }
 
+    // MARK: creating
+
+    func testCreateMailboxAppendsLineAndFiles() throws {
+        try writeDescmap(lines: ["In,In.mbx,S,Y", "KEEP,KEEP.mbx,M,N"], terminator: "\r\n")
+        let before = try Data(contentsOf: descURL)
+
+        let filename = try MailboxTreeMutator.createMailbox(directory: root, name: "New Box")
+        XCTAssertEqual(filename, "New Box.mbx")
+
+        // Byte-exact: the original bytes untouched, one CRLF line appended.
+        var expected = before
+        expected.append(Data("New Box,New Box.mbx,M,N\r\n".utf8))
+        XCTAssertEqual(try Data(contentsOf: descURL), expected)
+
+        // The files exist and read as a real, empty mailbox.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: mbxPath("New Box")))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tocPath("New Box")))
+        let store = MailStore(root: root)
+        XCTAssertEqual(store.messageCount(base: root.appendingPathComponent("New Box")), 0)
+        let entry = DescMap.read(directory: root).last!
+        XCTAssertEqual(entry.display, "New Box")
+        XCTAssertEqual(entry.type, .mailbox)
+    }
+
+    func testCreateMatchesAnLFOnlyFile() throws {
+        try writeDescmap(lines: ["A,A.mbx,M,N"], terminator: "\n")
+        try MailboxTreeMutator.createMailbox(directory: root, name: "B")
+        XCTAssertEqual(try Data(contentsOf: descURL),
+                       descmapData(lines: ["A,A.mbx,M,N", "B,B.mbx,M,N"], terminator: "\n"))
+    }
+
+    /// A final line missing its terminator must get one before the append, or
+    /// the new line would merge into it and corrupt both.
+    func testCreateTerminatesAnUnterminatedFinalLine() throws {
+        try Data("A,A.mbx,M,N\r\nB,B.mbx,M,N".utf8).write(to: descURL)
+        try MailboxTreeMutator.createMailbox(directory: root, name: "C")
+        XCTAssertEqual(try Data(contentsOf: descURL),
+                       Data("A,A.mbx,M,N\r\nB,B.mbx,M,N\r\nC,C.mbx,M,N\r\n".utf8))
+    }
+
+    func testCreatePreservesTypedCase() throws {
+        try writeDescmap(lines: ["A,A.mbx,M,N"], terminator: "\r\n")
+        try MailboxTreeMutator.createMailbox(directory: root, name: "MiXeD Case")
+        let entry = DescMap.read(directory: root).last!
+        XCTAssertEqual(entry.display, "MiXeD Case")
+        XCTAssertEqual(entry.filename, "MiXeD Case.mbx")
+    }
+
+    func testCreateRefusesDuplicatesCaseInsensitively() throws {
+        try writeDescmap(lines: ["KEEP,KEEP.mbx,M,N", "Stuff,Stuff.fol,F,N"],
+                         terminator: "\r\n")
+        let before = try Data(contentsOf: descURL)
+
+        for name in ["KEEP", "keep", "Keep"] {
+            XCTAssertThrowsError(try MailboxTreeMutator.createMailbox(
+                directory: root, name: name)) { error in
+                XCTAssertEqual(error as? MailboxTreeMutator.CreateError, .duplicate("KEEP"))
+            }
+        }
+        // A mailbox may not shadow a folder's name either, nor vice versa.
+        XCTAssertThrowsError(try MailboxTreeMutator.createMailbox(directory: root, name: "stuff"))
+        XCTAssertThrowsError(try MailboxTreeMutator.createFolder(directory: root, name: "keep"))
+        XCTAssertEqual(try Data(contentsOf: descURL), before, "a refusal must change nothing")
+    }
+
+    func testCreateRefusesAnOrphanFileCollision() throws {
+        try writeDescmap(lines: ["A,A.mbx,M,N"], terminator: "\r\n")
+        // On disk but not in the index — must not be adopted or clobbered.
+        try Data("orphaned messages".utf8).write(to: root.appendingPathComponent("GHOST.mbx"))
+
+        XCTAssertThrowsError(try MailboxTreeMutator.createMailbox(
+            directory: root, name: "GHOST")) { error in
+            XCTAssertEqual(error as? MailboxTreeMutator.CreateError, .duplicate("GHOST"))
+        }
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("GHOST.mbx")),
+                       Data("orphaned messages".utf8))
+    }
+
+    func testCreateRefusesBadNames() throws {
+        try writeDescmap(lines: ["A,A.mbx,M,N"], terminator: "\r\n")
+        for bad in ["", "   "] {
+            XCTAssertThrowsError(try MailboxTreeMutator.createMailbox(
+                directory: root, name: bad)) { error in
+                XCTAssertEqual(error as? MailboxTreeMutator.CreateError, .emptyName)
+            }
+        }
+        for bad in ["a,b", "a/b", "a\\b", "a:b", "a?b", "émoji 🎉"] {
+            XCTAssertThrowsError(try MailboxTreeMutator.createMailbox(
+                directory: root, name: bad)) { error in
+                XCTAssertEqual(error as? MailboxTreeMutator.CreateError, .invalidName,
+                               "\u{201C}\(bad)\u{201D} should be refused")
+            }
+        }
+        // Latin-1 accents are fine — only characters *outside* Latin-1 are not.
+        XCTAssertNoThrow(try MailboxTreeMutator.createMailbox(directory: root, name: "Café"))
+    }
+
+    func testCreateFolderThenMailboxInsideIt() throws {
+        try writeDescmap(lines: ["In,In.mbx,S,Y"], terminator: "\r\n")
+
+        let folderName = try MailboxTreeMutator.createFolder(directory: root, name: "Projects")
+        XCTAssertEqual(folderName, "Projects.fol")
+        let dir = root.appendingPathComponent("Projects.fol")
+        var isDir: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir))
+        XCTAssertTrue(isDir.boolValue)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("descmap.pce").path))
+
+        try MailboxTreeMutator.createMailbox(directory: dir, name: "Music")
+
+        // The store sees the hierarchy exactly as built.
+        let tree = MailStore(root: root).tree()
+        XCTAssertEqual(tree.map(\.entry.display), ["In", "Projects"])
+        XCTAssertTrue(tree[1].isFolder)
+        XCTAssertEqual(tree[1].children.map(\.entry.display), ["Music"])
+        XCTAssertEqual(tree[1].children[0].entry.type, .mailbox)
+    }
+
+    /// A freshly created mailbox must be a first-class move destination: the
+    /// records land and their statuses travel, which needs the header-only
+    /// `.toc` the create wrote (appendRecord only extends an *existing* .toc).
+    func testMoveIntoAFreshlyCreatedMailboxKeepsStatuses() throws {
+        try writeDescmap(lines: ["SRC,SRC.mbx,M,N"], terminator: "\r\n")
+        try seedMailbox("SRC")
+
+        try MailboxTreeMutator.createMailbox(directory: root, name: "FRESH")
+        try MailboxMutator.moveMany(from: root.appendingPathComponent("SRC"),
+                                    indices: [1],
+                                    to: root.appendingPathComponent("FRESH"))
+
+        let listing = MailStore(root: root).list(at: root.appendingPathComponent("FRESH"),
+                                                 name: "FRESH")!
+        XCTAssertEqual(listing.source, .toc)
+        XCTAssertEqual(listing.rows.map(\.subject), ["S"])
+    }
+
+    /// Create then delete must round-trip the index to its original bytes.
+    func testCreateThenDeleteRoundTripsTheIndex() throws {
+        try writeDescmap(lines: ["A,A.mbx,M,N", "B,B.mbx,M,N"], terminator: "\r\n")
+        let original = try Data(contentsOf: descURL)
+
+        try MailboxTreeMutator.createMailbox(directory: root, name: "Temp")
+        try MailboxTreeMutator.deleteEmptyMailbox(directory: root, filename: "Temp.mbx")
+
+        XCTAssertEqual(try Data(contentsOf: descURL), original)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: mbxPath("Temp")))
+    }
+
+    func testCreateBacksUpTheIndexOnce() throws {
+        try writeDescmap(lines: ["A,A.mbx,M,N"], terminator: "\r\n")
+        let original = try Data(contentsOf: descURL)
+
+        try MailboxTreeMutator.createMailbox(directory: root, name: "One")
+        let bak = root.appendingPathComponent("descmap.pce.bak")
+        XCTAssertEqual(try Data(contentsOf: bak), original)
+
+        try MailboxTreeMutator.createMailbox(directory: root, name: "Two")
+        XCTAssertEqual(try Data(contentsOf: bak), original,
+                       "the backup is the original index, not the previous one")
+    }
+
+    // MARK: system mailboxes
+
+    func testFreshDirectoryGetsAllFourSystemMailboxes() throws {
+        let created = try MailboxTreeMutator.ensureSystemMailboxes(root: root)
+        XCTAssertEqual(created, ["In", "Out", "Junk", "Trash"])
+
+        XCTAssertEqual(try Data(contentsOf: descURL),
+                       descmapData(lines: ["In,In.mbx,S,N", "Out,Out.mbx,S,N",
+                                           "Junk,Junk.mbx,S,N", "Trash,Trash.mbx,S,N"],
+                                   terminator: "\r\n"))
+        let tree = MailStore(root: root).tree()
+        XCTAssertEqual(tree.map(\.entry.type), [.inbox, .outbox, .junk, .trash])
+        XCTAssertEqual(tree.map(\.messageCount), [0, 0, 0, 0])
+    }
+
+    /// The common case — every open of a real tree — must be a pure read.
+    func testCompleteTreeIsUntouched() throws {
+        try writeDescmap(lines: ["In,In.mbx,S,Y", "Out,Out.mbx,S,N",
+                                 "Junk,Junk.mbx,S,N", "Trash,Trash.mbx,S,N",
+                                 "KEEP,KEEP.mbx,M,N"], terminator: "\r\n")
+        let before = try Data(contentsOf: descURL)
+
+        XCTAssertEqual(try MailboxTreeMutator.ensureSystemMailboxes(root: root), [])
+        XCTAssertEqual(try Data(contentsOf: descURL), before)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("descmap.pce.bak").path),
+            "a no-op must not even back the file up")
+    }
+
+    func testOnlyTheMissingRoleIsAdded() throws {
+        try writeDescmap(lines: ["In,In.mbx,S,Y", "Out,Out.mbx,S,N",
+                                 "Junk,Junk.mbx,S,N"], terminator: "\r\n")
+        let before = try Data(contentsOf: descURL)
+
+        XCTAssertEqual(try MailboxTreeMutator.ensureSystemMailboxes(root: root), ["Trash"])
+
+        var expected = before
+        expected.append(Data("Trash,Trash.mbx,S,N\r\n".utf8))
+        XCTAssertEqual(try Data(contentsOf: descURL), expected)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: mbxPath("Trash")))
+    }
+
+    /// Legacy fixture type chars (I/O/T/J) count as present — resolveType
+    /// already honours them, and doubling In because its line says "I" would
+    /// be a regression against our own fixtures.
+    func testLegacyTypeCharsCountAsPresent() throws {
+        try writeDescmap(lines: ["In,In.mbx,I,Y", "Out,Out.mbx,O,N",
+                                 "Junk,Junk.mbx,J,N", "Trash,Trash.mbx,T,N"],
+                         terminator: "\r\n")
+        XCTAssertEqual(try MailboxTreeMutator.ensureSystemMailboxes(root: root), [])
+    }
+
+    /// An orphaned system .mbx — real mail whose index line went missing — is
+    /// adopted, never overwritten.
+    func testOrphanedSystemMailboxIsAdoptedNotReplaced() throws {
+        try writeDescmap(lines: ["Out,Out.mbx,S,N", "Junk,Junk.mbx,S,N",
+                                 "Trash,Trash.mbx,S,N"], terminator: "\r\n")
+        try seedMailbox("In")   // on disk, not in the index
+        let mail = try Data(contentsOf: root.appendingPathComponent("In.mbx"))
+
+        XCTAssertEqual(try MailboxTreeMutator.ensureSystemMailboxes(root: root), ["In"])
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("In.mbx")), mail,
+                       "adoption must not touch the mailbox's bytes")
+        // The adopted line is *appended*, and the tree keeps descmap order —
+        // so In sits last here, resolved to its proper role.
+        XCTAssertEqual(MailStore(root: root).tree().last?.entry.type, .inbox)
+    }
+
+    /// A role whose canonical name is already taken by an ordinary mailbox is
+    /// skipped: a second "In" line naming the same file would be worse than a
+    /// missing role.
+    func testRoleNameTakenByOrdinaryMailboxIsSkipped() throws {
+        try writeDescmap(lines: ["In,In.mbx,M,N", "Out,Out.mbx,S,N",
+                                 "Junk,Junk.mbx,S,N", "Trash,Trash.mbx,S,N"],
+                         terminator: "\r\n")
+        let before = try Data(contentsOf: descURL)
+
+        XCTAssertEqual(try MailboxTreeMutator.ensureSystemMailboxes(root: root), [])
+        XCTAssertEqual(try Data(contentsOf: descURL), before)
+    }
+
+    func testEnsureIsIdempotent() throws {
+        XCTAssertEqual(try MailboxTreeMutator.ensureSystemMailboxes(root: root).count, 4)
+        XCTAssertEqual(try MailboxTreeMutator.ensureSystemMailboxes(root: root), [])
+    }
+
+    func testEnsureMatchesAnLFOnlyFile() throws {
+        try writeDescmap(lines: ["In,In.mbx,S,Y", "Out,Out.mbx,S,N",
+                                 "Junk,Junk.mbx,S,N"], terminator: "\n")
+        try MailboxTreeMutator.ensureSystemMailboxes(root: root)
+        XCTAssertEqual(try Data(contentsOf: descURL),
+                       descmapData(lines: ["In,In.mbx,S,Y", "Out,Out.mbx,S,N",
+                                           "Junk,Junk.mbx,S,N", "Trash,Trash.mbx,S,N"],
+                                   terminator: "\n"))
+    }
+
     // MARK: fixture
 
     private var descURL: URL { root.appendingPathComponent("descmap.pce") }
