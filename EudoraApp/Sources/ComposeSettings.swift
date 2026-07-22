@@ -6,11 +6,12 @@ import EudoraRichText
 /// written in, and whether the body is antialiased.
 ///
 /// **These describe the *local* editing view, not the wire.** The face and size
-/// here are what Stephen sees while composing on his own non-Retina screen;
-/// outgoing HTML always declares Arial regardless (see
-/// `RichTextHTML.wireFontFamily`). Seeded with Arial 12 until he settles on a
-/// face — the size knob and the antialiasing toggle are both here so he can tune
-/// the on-screen look without a rebuild.
+/// here are what Stephen sees while composing on his own non-Retina screen; a
+/// run left in this default face declares no face on the wire, so recipients see
+/// it in their own default rather than having Stephen's screen font imposed.
+/// Seeded with Arial 12 until he settles on a face — the size knob and the
+/// antialiasing toggle are both here so he can tune the on-screen look without a
+/// rebuild.
 ///
 /// Persisted in UserDefaults, like `AccountStore`. A separate store rather than a
 /// section of that one: these are view preferences, not mail-account identity,

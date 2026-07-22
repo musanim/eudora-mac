@@ -85,64 +85,65 @@ final class RichTextHTMLTests: XCTestCase {
 
     // MARK: - generation
 
-    func testUnstyledBodyGeneratesBareEscapedText() {
-        let html = RichTextHTML.html(from: RichText(plain: "a < b & c"))
-        XCTAssertTrue(html.contains(">a &lt; b &amp; c</body>"), html)
-        XCTAssertFalse(html.contains("<span"), "a plain run needs no span")
+    func testUnstyledBodyGeneratesBareEscapedTextWithBreaks() {
+        let html = RichTextHTML.html(from: RichText(plain: "a < b & c\nx"))
+        XCTAssertEqual(bodyOf(html), "a &lt; b &amp; c<br>x")
+        XCTAssertFalse(html.contains("<span"), "the Eudora dialect uses no CSS spans")
+        XCTAssertFalse(html.contains("white-space"), "no pre-wrap — Eudora ignores it")
     }
 
-    func testStyledRunsBecomeSpans() {
+    /// Bold and italic are real presentational tags, not CSS — Eudora's renderer
+    /// only understands these.
+    func testBoldAndItalicUsePresentationalTags() {
         let rich = RichText(runs: [
             RichTextRun("plain "),
-            RichTextRun("bold", style: RichTextStyle(bold: true)),
-            RichTextRun(" and "),
-            RichTextRun("red", style: RichTextStyle(color: RichTextColor(r: 255, g: 0, b: 0))),
+            RichTextRun("bo", style: RichTextStyle(bold: true)),
+            RichTextRun("it", style: RichTextStyle(italic: true)),
+            RichTextRun("bi", style: RichTextStyle(bold: true, italic: true)),
         ])
-        let body = bodyOf(RichTextHTML.html(from: rich))
-        XCTAssertEqual(body, "plain <span style=\"font-weight: bold\">bold</span>"
-                             + " and <span style=\"color: #ff0000\">red</span>")
+        XCTAssertEqual(bodyOf(RichTextHTML.html(from: rich)),
+                       "plain <b>bo</b><i>it</i><b><i>bi</i></b>")
     }
 
-    /// Declaration order is fixed so the same style always produces the same
-    /// bytes — otherwise a draft would look edited every time it was saved.
-    func testDeclarationsAreEmittedInAFixedOrder() {
-        let style = RichTextStyle(bold: true, italic: true, face: "Courier New", size: 14,
-                                  color: RichTextColor(r: 0, g: 0, b: 255))
-        XCTAssertEqual(RichTextHTML.declarations(for: style),
-                       "font-family: 'Courier New'; font-size: 14pt; "
-                       + "font-weight: bold; font-style: italic; color: #0000ff")
+    /// Face, size and colour ride a `<font>` tag. Size carries both the `size`
+    /// attribute Eudora reads and the exact `font-size` style modern clients do.
+    func testFontAttributesRideAFontTag() {
+        let rich = RichText(runs: [
+            RichTextRun("x", style: RichTextStyle(face: "Courier New", size: 24,
+                                                  color: RichTextColor(r: 255, g: 0, b: 0)))])
+        XCTAssertEqual(bodyOf(RichTextHTML.html(from: rich)),
+                       "<font face=\"Courier New\" size=\"6\" color=\"#ff0000\" "
+                       + "style=\"font-size: 24pt\">x</font>")
     }
 
-    func testPlainStyleHasNoDeclarations() {
-        XCTAssertNil(RichTextHTML.declarations(for: .plain))
+    func testFontSizeBuckets() {
+        XCTAssertEqual(RichTextHTML.htmlFontSize(8), 1)
+        XCTAssertEqual(RichTextHTML.htmlFontSize(12), 3)
+        XCTAssertEqual(RichTextHTML.htmlFontSize(24), 6)
+        XCTAssertEqual(RichTextHTML.htmlFontSize(36), 7)
+        XCTAssertEqual(RichTextHTML.htmlFontSize(72), 7, "clamps to the top bucket")
     }
 
-    /// The outgoing face is Arial whatever the composer is displaying locally.
-    func testTheWireAlwaysDeclaresArial() {
-        let html = RichTextHTML.html(from: RichText(runs: [
-            RichTextRun("x", style: RichTextStyle(bold: true))]))
-        XCTAssertTrue(html.contains("font-family: Arial, sans-serif"), html)
-    }
-
-    /// A body tag followed by a newline would render as a blank first line under
-    /// `pre-wrap`, and be read back in — so a draft would grow a line every time
-    /// it was saved and reopened.
-    func testNoStrayNewlinesAroundTheBody() {
+    /// Content sits flush against the body tags so no stray whitespace is read
+    /// back in.
+    func testNoStrayWhitespaceAroundTheBody() {
         let html = RichTextHTML.html(from: RichText(plain: "hello"))
-        XCTAssertTrue(html.contains("pre-wrap\">hello</body>"), html)
+        XCTAssertTrue(html.contains("<body>hello</body>"), html)
     }
 
-    func testFontFamilyIsQuotedOnlyWhenItNeedsToBe() {
-        XCTAssertEqual(RichTextHTML.cssFamily("Helvetica"), "Helvetica")
-        XCTAssertEqual(RichTextHTML.cssFamily("Courier New"), "'Courier New'")
+    /// Leading spaces and runs of spaces are held open with `&nbsp;`; a single
+    /// interior space stays real so lines can wrap.
+    func testWhitespaceIsHeldOpenWithNbsp() {
+        XCTAssertEqual(bodyOf(RichTextHTML.html(from: RichText(plain: "   x"))),
+                       "&nbsp;&nbsp;&nbsp;x")
+        XCTAssertEqual(bodyOf(RichTextHTML.html(from: RichText(plain: "a  b"))), "a &nbsp;b")
+        XCTAssertEqual(bodyOf(RichTextHTML.html(from: RichText(plain: "a b c"))), "a b c")
     }
 
-    /// The family name ends up inside a `style="…"` attribute in a document
-    /// about to be sent to someone else.
-    func testFontFamilyCannotBreakOutOfTheAttribute() {
-        let escaped = RichTextHTML.cssFamily("Evil\"; behavior: url(x); font-family: \"A")
-        XCTAssertFalse(escaped.contains("\""))
-        XCTAssertFalse(escaped.contains(";"))
+    func testAttributeValueCannotBreakOutOfTheAttribute() {
+        let rich = RichText(runs: [RichTextRun("x", style: RichTextStyle(face: "E\"vil"))])
+        let body = bodyOf(RichTextHTML.html(from: rich))
+        XCTAssertTrue(body.contains("face=\"E&quot;vil\""), body)
     }
 
     func testSizesLoseTheirPointlessDecimal() {
@@ -152,23 +153,22 @@ final class RichTextHTMLTests: XCTestCase {
 
     // MARK: - round trip
 
-    /// The property the whole `pre-wrap` decision was made to get: whatever the
-    /// user typed comes back exactly, including the whitespace.
-    func testRoundTripPreservesAwkwardText() {
+    /// On "clean" text — no tabs, no trailing or multiple spaces beyond what
+    /// `&nbsp;` holds — the content comes back exactly. (Tabs collapse to
+    /// spaces and trailing spaces vanish; those are covered by the idempotence
+    /// checks in the Python model, not asserted exact here.)
+    func testRoundTripPreservesCleanText() {
         let cases = [
             "hello",
             "",
             "line one\nline two\n",
             "\n\n\nleading blank lines",
-            "trailing spaces   \nand more",
             "    indented with spaces",
-            "\ttab indented\t\tdouble",
             "double  spaces   everywhere",
             "angle < brackets > and & ampersands",
             "a &amp; that is literal text",
             "</body></html> in the body",
             "unicode: café — naïve — 日本語 — 🎹",
-            "a\u{00A0}non-breaking space",
         ]
         for text in cases {
             let rich = RichText(plain: text)
@@ -187,8 +187,16 @@ final class RichTextHTMLTests: XCTestCase {
                                                    color: RichTextColor(r: 0, g: 128, b: 0))),
             RichTextRun("\njumps over\n"),
             RichTextRun("it", style: RichTextStyle(bold: true, italic: true)),
+            RichTextRun(" 13pt", style: RichTextStyle(size: 13)),
         ])
         XCTAssertEqual(RichTextHTML.parse(RichTextHTML.html(from: rich)), rich)
+    }
+
+    /// A non-bucket size survives because the exact points ride a `font-size`
+    /// style alongside the bucketed `size` attribute.
+    func testNonBucketSizeSurvivesViaTheStyleBackup() {
+        let rich = RichText(runs: [RichTextRun("x", style: RichTextStyle(size: 13))])
+        XCTAssertEqual(RichTextHTML.parse(RichTextHTML.html(from: rich)).runs[0].style.size, 13)
     }
 
     /// CR is normalised on the way out, so the same typing produces the same
@@ -240,9 +248,9 @@ final class RichTextHTMLTests: XCTestCase {
     }
 
     /// A part on the wire has CRLF endings, so the HTML read back out of a saved
-    /// draft has CRLF where the author typed one newline — and `pre-wrap` would
-    /// otherwise preserve every CR. The window would show them, and `isDirty`
-    /// would report unsaved changes the instant the draft opened.
+    /// draft has CRLF where the author typed one newline. Both must fold to a
+    /// single break, or `isDirty` would report unsaved changes the instant the
+    /// draft opened.
     func testCRLFInTheSourceIsOneLineBreak() {
         let rich = RichText(plain: "one\ntwo\n")
         let onTheWire = RichTextHTML.html(from: rich)
@@ -301,7 +309,7 @@ final class RichTextHTMLTests: XCTestCase {
 
     /// The contents of `<body>`, for asserting on generated markup.
     private func bodyOf(_ html: String) -> String {
-        guard let open = html.range(of: "pre-wrap\">"),
+        guard let open = html.range(of: "<body>"),
               let close = html.range(of: "</body>") else {
             XCTFail("generated document has no body: \(html)")
             return ""

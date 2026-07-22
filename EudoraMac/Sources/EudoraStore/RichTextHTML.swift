@@ -14,97 +14,89 @@ import Foundation
 /// into a `WKWebView` under the no-network policy; nothing here is involved in
 /// showing someone else's message, and nothing here should grow to be.
 ///
-/// ### Whitespace: `pre-wrap`, and no `<br>`
+/// ### The dialect: legacy presentational HTML, because Eudora
 ///
-/// The generated document sets `white-space: pre-wrap` on `<body>` and emits the
-/// author's newlines and spaces literally, rather than the more traditional
-/// `<br>` plus `&nbsp;`. Three reasons, in order of weight:
+/// Generation emits `<b>`/`<i>`, `<font face size color>` and `<br>` — HTML 3.2
+/// presentational markup — **not** CSS. Eudora 7's built-in renderer ignores
+/// `<span style>` and `white-space` entirely and drops to the plain alternative
+/// when that is all a message's styling is; a first attempt using CSS arrived at
+/// Eudora unstyled for exactly that reason. This dialect is what Eudora itself
+/// emits and what its renderer reads.
 ///
-/// 1. It round-trips exactly. `parse(html(x)) == x` for every string, including
-///    tabs and runs of spaces. The `<br>`/`&nbsp;` encoding cannot manage that —
-///    a tab has no faithful spelling in it — and a draft that came back subtly
-///    different each time it was saved would be a genuinely nasty bug.
-/// 2. Indentation and alignment survive, which in a mail composer is content.
-/// 3. It is less to get wrong: no decisions about which spaces are significant.
-///
-/// The cost is a reader too old to honour `white-space`, which would show the
-/// message as one paragraph. That reader is served the `text/plain` alternative
-/// instead — which is exactly what `multipart/alternative` is for, and why this
-/// trade is affordable here when it wouldn't be in a HTML-only message.
+/// The cost is whitespace: `<br>` collapses tabs to spaces and drops a line's
+/// trailing spaces, where a `white-space: pre` body would have kept them.
+/// Leading indentation and interior runs of spaces are held open with `&nbsp;`,
+/// so what remains lost is invisible — and a font face declares no *local*
+/// display face on the wire (Stephen's screen font is a personal choice; a run
+/// with no chosen face is left to the recipient's default rather than imposed).
 public enum RichTextHTML {
 
-    /// What outgoing HTML declares as the body face, whatever the composer is
-    /// *displaying* locally.
-    ///
-    /// Deliberately not the display font setting. Stephen's local face is a
-    /// personal choice about how type looks on his own non-Retina screen (see
-    /// `EudoraFont`); imposing it on recipients would be both rude and useless,
-    /// since they almost certainly don't have it installed. Arial is what
-    /// Eudora 7 declared and is present nearly everywhere, with the generic
-    /// `sans-serif` behind it for when it isn't.
-    public static let wireFontFamily = "Arial, sans-serif"
-
     // MARK: - generation
+    //
+    // **Eudora-dialect HTML, deliberately not CSS.** Eudora 7's built-in HTML
+    // renderer understands only legacy presentational markup — `<b>`, `<i>`,
+    // `<font face size color>`, `<br>`. It ignores CSS `<span style>` and
+    // `white-space` completely, so a message that expresses its styling that way
+    // shows in Eudora as the *plain* alternative, unstyled. This was found the
+    // hard way: a styled test message arrived plain until the generator was
+    // rewritten to match what Eudora itself emits (confirmed against real
+    // Eudora-authored mail in the archive). The tolerant parser already reads
+    // this dialect, so drafts still round-trip.
 
     /// The complete HTML document for a styled body.
     public static func html(from rich: RichText) -> String {
         var body = ""
-        for run in rich.runs {
-            let text = escape(run.text)
-            if let css = declarations(for: run.style) {
-                body += "<span style=\"" + css + "\">" + text + "</span>"
-            } else {
-                body += text
-            }
-        }
+        for run in rich.runs { body += wrap(encode(run.text), style: run.style) }
         return prologue + body + epilogue
     }
 
     /// Everything before the first character of the body.
     ///
-    /// **Ends immediately after `<body …>` with no newline, and `epilogue`
-    /// starts immediately with `</body>`.** Under `white-space: pre-wrap` a
-    /// newline there would render as a blank first line, and a newline before
-    /// `</body>` as a trailing one — which would then be read back in, so a
-    /// draft would grow a line every time it was saved and reopened.
+    /// Content sits flush against `<body>` and `</body>` — no newline on either
+    /// side. Whitespace adjacent to the content there would be read back in (a
+    /// `<br>`-based body still collapses stray whitespace, but flush is simplest
+    /// and matches what Eudora emits).
     static let prologue =
         "<html>\n"
         + "<head>\n"
         + "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\">\n"
-        + "</head>\n"
-        + "<body style=\"font-family: " + wireFontFamily + "; white-space: pre-wrap\">"
+        + "</head>\n<body>"
 
-    /// No trailing newline: this string is a MIME part's content, and the line
-    /// ending before the closing boundary belongs to the boundary. Ending here
-    /// would put an empty line between the two.
     static let epilogue = "</body>\n</html>"
 
-    /// The CSS for one run's style, or nil when it has none.
-    ///
-    /// Only what the run overrides — the base face is on `<body>`, so a run that
-    /// merely happens to be in the default font says nothing about fonts.
-    static func declarations(for style: RichTextStyle) -> String? {
-        var parts: [String] = []
-        if let face = style.face { parts.append("font-family: " + cssFamily(face)) }
-        if let size = style.size { parts.append("font-size: " + points(size) + "pt") }
-        if style.bold { parts.append("font-weight: bold") }
-        if style.italic { parts.append("font-style: italic") }
-        if let color = style.color { parts.append("color: " + color.hex) }
-        return parts.isEmpty ? nil : parts.joined(separator: "; ")
+    /// The HTML `<font size>` scale, 1…7, in points — the buckets the parser
+    /// maps back. Matches `fontTagSize`.
+    static let fontSizeScale: [Double] = [8, 10, 12, 14, 18, 24, 36]
+
+    /// Wrap one run's text in the tags its style needs: a `<font>` for face,
+    /// size and colour, then `<i>` and `<b>` outside it.
+    static func wrap(_ inner: String, style: RichTextStyle) -> String {
+        var attrs = ""
+        if let face = style.face { attrs += " face=\"" + attrEscape(face) + "\"" }
+        // Size goes in the `size` attribute (1…7) that Eudora reads, plus an
+        // exact `font-size` style that Eudora ignores but modern clients — and
+        // our own parser — use, so a non-bucket size like 13pt survives a round
+        // trip instead of snapping to the nearest bucket.
+        var sizeStyle = ""
+        if let size = style.size {
+            attrs += " size=\"\(htmlFontSize(size))\""
+            sizeStyle = " style=\"font-size: " + points(size) + "pt\""
+        }
+        if let color = style.color { attrs += " color=\"" + color.hex + "\"" }
+
+        var s = inner
+        if !attrs.isEmpty { s = "<font" + attrs + sizeStyle + ">" + s + "</font>" }
+        if style.italic { s = "<i>" + s + "</i>" }
+        if style.bold { s = "<b>" + s + "</b>" }
+        return s
     }
 
-    /// A family name safe to drop into a `style="…"` attribute.
-    ///
-    /// Strips the characters that could end the attribute or the declaration
-    /// rather than escaping them. A font family containing a quote or a
-    /// semicolon does not exist; a *malicious* one might, and this string is
-    /// about to become part of a document sent to someone else.
-    static func cssFamily(_ name: String) -> String {
-        let cleaned = String(name.filter { !"\"'<>&;\\{}".contains($0) })
-            .trimmingCharacters(in: .whitespaces)
-        if cleaned.isEmpty { return "sans-serif" }
-        let bare = cleaned.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" }
-        return bare ? cleaned : "'" + cleaned + "'"
+    /// The nearest `<font size>` bucket (1…7) for a point size.
+    static func htmlFontSize(_ size: Double) -> Int {
+        var best = 0
+        for i in 1..<fontSizeScale.count
+        where abs(fontSizeScale[i] - size) < abs(fontSizeScale[best] - size) { best = i }
+        return best + 1
     }
 
     /// A point size without a pointless `.0`.
@@ -114,25 +106,55 @@ public enum RichTextHTML {
         return String(format: "%.1f", rounded)
     }
 
-    /// Escape text for HTML content. Newlines, tabs and spaces stay literal —
-    /// see the note on `pre-wrap` above.
-    ///
-    /// CR is folded into LF first so the same body produces the same bytes
-    /// whichever line ending the editor handed over.
-    static func escape(_ text: String) -> String {
+    /// Escape a value for a double-quoted attribute.
+    static func attrEscape(_ value: String) -> String {
         var out = ""
-        out.reserveCapacity(text.count + 16)
-        var previousWasCR = false
-        for ch in text {
+        out.reserveCapacity(value.count)
+        for ch in value {
             switch ch {
             case "&": out += "&amp;"
             case "<": out += "&lt;"
             case ">": out += "&gt;"
-            case "\r": out += "\n"
-            case "\n": if !previousWasCR { out += "\n" }
+            case "\"": out += "&quot;"
             default: out.append(ch)
             }
-            previousWasCR = (ch == "\r")
+        }
+        return out
+    }
+
+    /// Encode run text as HTML content: `<br>` for newlines, `&nbsp;` to hold a
+    /// run of spaces (or a leading space) open against HTML's whitespace
+    /// collapsing, and the three markup characters escaped.
+    ///
+    /// A single interior space stays a real space so lines can still wrap. Tabs
+    /// are treated as spaces; trailing spaces at a line's end collapse away —
+    /// both invisible losses a `<br>`-based body can't avoid, and neither
+    /// affects the styling or the visible text. CR is folded to LF first so the
+    /// same body encodes identically whichever line ending the editor handed
+    /// over.
+    static func encode(_ raw: String) -> String {
+        let text = raw
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        var out = ""
+        out.reserveCapacity(text.count + 16)
+        var lineStart = true
+        var prevSpace = false
+        for ch in text {
+            switch ch {
+            case "\n":
+                out += "<br>"
+                lineStart = true
+                prevSpace = false
+            case " ", "\t":
+                out += (lineStart || prevSpace) ? "&nbsp;" : " "
+                lineStart = false
+                prevSpace = true
+            case "&": out += "&amp;"; lineStart = false; prevSpace = false
+            case "<": out += "&lt;"; lineStart = false; prevSpace = false
+            case ">": out += "&gt;"; lineStart = false; prevSpace = false
+            default: out.append(ch); lineStart = false; prevSpace = false
+            }
         }
         return out
     }
@@ -146,19 +168,11 @@ public enum RichTextHTML {
     /// outside `<body>` is dropped, as are `<head>`, `<style>`, `<script>` and
     /// `<title>` contents — this must never surface markup as if it were text.
     public static func parse(_ source: String) -> RichText {
-        // Newlines first, and this is load-bearing rather than tidiness.
-        //
-        // A part on the wire has CRLF endings — `OutgoingMessage` normalises
-        // every body it writes — so the HTML read back out of a saved draft has
-        // CRLF where the author typed a single newline. In `pre-wrap` those CRs
-        // are preserved verbatim, and reopening a styled draft would put a
-        // literal CR at the end of every line: the editor would show them, and
-        // `ComposeView.isDirty` compares text, so the window would announce
-        // unsaved changes the instant it opened.
-        //
-        // Doing it here rather than at the app boundary is also what HTML
-        // itself specifies — CR and CRLF in the input stream are a single line
-        // break — and it mirrors the same fold `escape` does on the way out.
+        // Fold line endings first: CR and CRLF in an HTML input stream are a
+        // single line break (per the spec), and a part on the wire arrives with
+        // CRLF endings, so this keeps a `<pre>`-mode read of foreign HTML from
+        // surfacing literal CRs — and mirrors the fold `encode` does on the way
+        // out.
         let chars = Array(source
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n"))
