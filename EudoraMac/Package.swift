@@ -8,6 +8,7 @@ let package = Package(
         .library(name: "EudoraStore", targets: ["EudoraStore"]),
         .library(name: "EudoraSearch", targets: ["EudoraSearch"]),
         .library(name: "EudoraNet", targets: ["EudoraNet"]),
+        .library(name: "EudoraRichText", targets: ["EudoraRichText"]),
         .executable(name: "eudora-spike", targets: ["eudora-spike"]),
     ],
     targets: [
@@ -26,6 +27,12 @@ let package = Package(
         // the SMTP client + account/Keychain. Uses system Network + Security.
         .target(name: "EudoraNet", dependencies: ["EudoraStore"]),
 
+        // The composer's styled-text bridge: RichText ⇄ NSAttributedString.
+        // Its own target, not part of EudoraStore, because it imports AppKit and
+        // the store is kept UI-framework-free — but still inside the package so
+        // `swift test` covers the trickiest conversion logic without the app.
+        .target(name: "EudoraRichText", dependencies: ["EudoraStore"]),
+
         // Phase 0 spike, in the target language: tree / list / dump / search.
         .executableTarget(name: "eudora-spike", dependencies: ["EudoraStore", "EudoraSearch"]),
 
@@ -33,5 +40,6 @@ let package = Package(
         .testTarget(name: "EudoraStoreTests", dependencies: ["EudoraStore"]),
         .testTarget(name: "EudoraSearchTests", dependencies: ["EudoraStore", "EudoraSearch"]),
         .testTarget(name: "EudoraNetTests", dependencies: ["EudoraNet"]),
+        .testTarget(name: "EudoraRichTextTests", dependencies: ["EudoraRichText"]),
     ]
 )

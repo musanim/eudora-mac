@@ -5,6 +5,7 @@ import AppKit
 struct EudoraApp: App {
     @StateObject private var model = AppModel()
     @StateObject private var accounts = AccountStore()
+    @StateObject private var composeSettings = ComposeSettings()
     @Environment(\.openWindow) private var openWindow
 
     /// Arms the splash before SwiftUI builds its scenes, so the main window can
@@ -39,6 +40,7 @@ struct EudoraApp: App {
             ComposeWindow(draftID: draftID)
                 .environmentObject(model)
                 .environmentObject(accounts)
+                .environmentObject(composeSettings)
         }
         // No `New Message` in the File menu for this group — the app's own
         // command creates the draft record first, and a window opened by
@@ -57,6 +59,7 @@ struct EudoraApp: App {
         Settings {
             SettingsView()
                 .environmentObject(accounts)
+                .environmentObject(composeSettings)
         }
     }
 

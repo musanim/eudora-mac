@@ -6,9 +6,20 @@ import EudoraNet
 struct ComposeView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var accounts: AccountStore
+    @EnvironmentObject var composeSettings: ComposeSettings
 
     let draftID: ComposeDraft.ID
     let seed: ComposeDraft
+
+    /// The body editor's shared controller. Owned here so it outlives render
+    /// passes; handed to the `RichTextEditor` representable and the `FormatStrip`
+    /// so the strip mirrors and drives the same text view.
+    @StateObject private var editor = RichTextEditorController()
+
+    /// The content the editor was seeded with, resolved once at init. Loading it
+    /// is the representable's job (see `RichTextEditor.attach`); this just holds
+    /// the value to hand over.
+    private let seedContent: RichText
 
     /// Closes this window.
     @Environment(\.dismiss) private var dismiss
@@ -22,7 +33,6 @@ struct ComposeView: View {
     @State private var cc: String
     @State private var bcc: String
     @State private var subject: String
-    @State private var bodyText: String
     @State private var sending = false
     @State private var error: String?
 
@@ -39,7 +49,7 @@ struct ComposeView: View {
     /// didn't touch.
     private var isDirty: Bool {
         to != draft.to || cc != draft.cc || bcc != draft.bcc
-            || subject != draft.subject || bodyText != draft.body
+            || subject != draft.subject || editor.content != draft.content
     }
 
     /// True for a message that has never been saved and never edited — ⌘N
@@ -60,12 +70,12 @@ struct ComposeView: View {
     init(draftID: ComposeDraft.ID, seed: ComposeDraft) {
         self.draftID = draftID
         self.seed = seed
+        self.seedContent = seed.content
         _draft = State(initialValue: seed)
         _to = State(initialValue: seed.to)
         _cc = State(initialValue: seed.cc)
         _bcc = State(initialValue: seed.bcc)
         _subject = State(initialValue: seed.subject)
-        _bodyText = State(initialValue: seed.body)
         // A failure to pre-save shows here rather than as a banner: this window
         // goes up on top of the main one immediately, so a banner would be
         // hidden before it could be read.
@@ -76,10 +86,13 @@ struct ComposeView: View {
         VStack(spacing: 0) {
             headerFields
             Divider()
-            TextEditor(text: $bodyText)
-                .font(.system(.body, design: .monospaced))
+            FormatStrip(controller: editor)
+            Divider()
+            RichTextEditor(controller: editor,
+                           seed: seedContent,
+                           defaults: composeSettings.richTextDefaults,
+                           antialias: composeSettings.antialiasBody)
                 .frame(minHeight: 220)
-                .focused($focus, equals: .body)
             Divider()
             footer
         }
@@ -144,9 +157,12 @@ struct ComposeView: View {
 
     // MARK: focus order
 
-    /// The editable fields, in the order Tab walks them.
+    /// The editable header fields, in the order Tab walks them. The body is not
+    /// here: it's an `NSTextView` that owns its own first-responder handling, so
+    /// SwiftUI `@FocusState` neither tracks nor moves it. Shift-Tab from the
+    /// first header field wraps to the last header field, not into the body.
     private enum Field: Hashable, CaseIterable {
-        case to, cc, bcc, subject, body
+        case to, cc, bcc, subject
     }
 
     @FocusState private var focus: Field?
@@ -276,7 +292,12 @@ struct ComposeView: View {
         current.cc = cc
         current.bcc = bcc
         current.subject = subject
-        current.body = bodyText
+        // The plain text is authoritative; the styled body rides alongside it
+        // only when the user actually formatted something, which is what keeps
+        // an unstyled message on the plain-text path. See `ComposeDraft`.
+        let content = editor.content
+        current.body = content.plainText
+        current.styledBody = content.isStyled ? content : nil
         return current
     }
 
@@ -372,10 +393,15 @@ struct ComposeView: View {
 
         let account = accounts.account
         let password = accounts.password
+        // Same styling gate as the saved record: HTML only when the user
+        // formatted something, so an unstyled message is delivered as exactly
+        // today's text/plain bytes.
+        let content = editor.content
+        let html = content.isStyled ? RichTextHTML.html(from: content) : nil
         let message = OutgoingMessage(
             fromName: account.fromName, fromAddress: account.fromAddress,
             to: toList, cc: model.splitAddresses(cc), bcc: model.splitAddresses(bcc),
-            subject: subject, body: bodyText,
+            subject: subject, body: content.plainText, htmlBody: html,
             inReplyTo: seed.inReplyTo, references: seed.references)
 
         sending = true

@@ -28,8 +28,12 @@ func openSettingsWindowLegacy() {
 
 struct SettingsView: View {
     @EnvironmentObject var accounts: AccountStore
+    @EnvironmentObject var composeSettings: ComposeSettings
     /// The Settings window, so Save can close it. Captured by `WindowGrabber`.
     @State private var window: NSWindow?
+
+    /// Installed font families, resolved once for the composing-face picker.
+    private static let families: [String] = NSFontManager.shared.availableFontFamilies
 
     var body: some View {
         Form {
@@ -59,6 +63,26 @@ struct SettingsView: View {
                     Text("Messages are deleted only after they're written to your local archive.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+            }
+            Section("Composing") {
+                Picker("Body font", selection: $composeSettings.bodyFontName) {
+                    // Keep the current face selectable even if it's not installed,
+                    // so the picker never shows blank.
+                    if !Self.families.contains(composeSettings.bodyFontName) {
+                        Text(composeSettings.bodyFontName).tag(composeSettings.bodyFontName)
+                    }
+                    ForEach(Self.families, id: \.self) { Text($0).tag($0) }
+                }
+                Picker("Size", selection: $composeSettings.bodyFontSize) {
+                    ForEach([8.0, 9, 10, 11, 12, 13, 14, 16, 18, 24], id: \.self) { size in
+                        Text(size == size.rounded() ? String(Int(size)) : String(format: "%.1f", size))
+                            .tag(size)
+                    }
+                }
+                Toggle("Antialias body text", isOn: $composeSettings.antialiasBody)
+                Text("Applies to the compose window on your screen. Sent mail always "
+                        + "declares Arial, so recipients see it in their own Arial.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section {
                 // Save writes to the Keychain and closes the window — the close

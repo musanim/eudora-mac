@@ -166,6 +166,21 @@ struct ComposeDraft: Identifiable {
     var bcc: String = ""
     var subject: String = ""
     var body: String = ""
+
+    /// The styled body, set only when the user actually formatted something.
+    ///
+    /// **Nil is the plain-text guarantee, carried up from `OutgoingMessage`.**
+    /// When nil the message assembles exactly as it did before rich text
+    /// existed — a single `text/plain` entity — and `body` is the whole of it.
+    /// When set, its `plainText` *is* `body` (the editor keeps them in step), so
+    /// `body` stays the authoritative plain-text alternative and the source for
+    /// the `who`/subject TOC fields; the styling is the extra.
+    var styledBody: RichText? = nil
+
+    /// The body as a single value, whichever way it is held. The editor binds to
+    /// this; the plain and styled fields are derived from it on save.
+    var content: RichText { styledBody ?? RichText(plain: body) }
+
     var inReplyTo: String? = nil
     var references: [String] = []
 
@@ -1691,6 +1706,11 @@ final class AppModel: ObservableObject {
     /// written before Settings has been filled in simply has an empty From,
     /// which is what an unconfigured Eudora showed too.
     private func draftBytes(_ draft: ComposeDraft) -> Data {
+        // HTML only when the user styled something. `styledBody` is nil for an
+        // unstyled draft, so `htmlBody` stays nil and `rfc822` takes its
+        // original single-part path — the message is byte-for-byte what it was
+        // before rich text existed. See `OutgoingMessage.htmlBody`.
+        let html = draft.styledBody.map { RichTextHTML.html(from: $0) }
         let message = OutgoingMessage(
             fromName: accounts?.account.fromName ?? "",
             fromAddress: accounts?.account.fromAddress ?? "",
@@ -1699,6 +1719,7 @@ final class AppModel: ObservableObject {
             bcc: splitAddresses(draft.bcc),
             subject: draft.subject,
             body: draft.body,
+            htmlBody: html,
             inReplyTo: draft.inReplyTo,
             references: draft.references)
         // The draft's own ID, every time — that's what makes the record
@@ -1905,11 +1926,21 @@ final class AppModel: ObservableObject {
             return
         }
 
+        // A styled draft was written as multipart/alternative with an HTML
+        // part; rebuild the styled body from it so reopening restores the
+        // formatting rather than flattening it to plain text. `styledBody` is
+        // set only when the HTML actually carries styling — a message that
+        // happens to be MIME but formats nothing reopens as a plain draft, and
+        // so re-saves to today's plain bytes. When there's no HTML part this is
+        // nil and everything behaves as it did before rich text.
+        let styled = Self.styledBody(of: part)
+
         var draft = ComposeDraft(
             to: HeaderDecoder.decode(part.header("To") ?? ""),
             cc: HeaderDecoder.decode(part.header("Cc") ?? ""),
             subject: HeaderDecoder.decode(part.header("Subject") ?? ""),
-            body: Self.plainText(of: part),
+            body: styled?.plainText ?? Self.plainText(of: part),
+            styledBody: styled,
             inReplyTo: part.header("In-Reply-To")?.trimmingCharacters(in: .whitespaces),
             references: (part.header("References") ?? "")
                 .split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init))
@@ -2025,6 +2056,30 @@ final class AppModel: ObservableObject {
             if !inTag { out.append(ch) }
         }
         return out
+    }
+
+    /// The styled body of a draft record, or nil when it carries no styling.
+    ///
+    /// Reopening a draft this app wrote as `multipart/alternative` should
+    /// restore the formatting, not flatten it. This finds the `text/html`
+    /// alternative, parses it back to `RichText`, and returns it **only if it is
+    /// actually styled** — an HTML part that formats nothing (or a record with
+    /// no HTML part at all) yields nil, so the reopened draft is plain and
+    /// re-saves to today's plain-text bytes rather than needlessly staying MIME.
+    ///
+    /// Restricted to a genuine `multipart/alternative`. A received message
+    /// Eudora flattened into a lone `text/html` leaf (the `<x-html>` form) is
+    /// somebody else's mail being forwarded/edited, not a draft of ours, and its
+    /// arbitrary markup is not something the composer should try to round-trip —
+    /// `plainText(of:)` handles that the way it always has.
+    static func styledBody(of part: MIMEPart) -> RichText? {
+        guard part.contentType == "multipart/alternative" else { return nil }
+        for p in part.walk() where !p.isMultipart && p.mainType == "text" && p.subType == "html" {
+            let text = CharsetDecoder.smartDecode(p.decodedPayload(), declared: p.charset).text
+            let rich = RichTextHTML.parse(text)
+            return rich.isStyled ? rich : nil
+        }
+        return nil
     }
 
     private func quotedReply(_ part: MIMEPart, from: String) -> String {
