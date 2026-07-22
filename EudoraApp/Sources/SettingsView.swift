@@ -28,7 +28,8 @@ func openSettingsWindowLegacy() {
 
 struct SettingsView: View {
     @EnvironmentObject var accounts: AccountStore
-    @State private var saved = false
+    /// The Settings window, so Save can close it. Captured by `WindowGrabber`.
+    @State private var window: NSWindow?
 
     var body: some View {
         Form {
@@ -60,17 +61,13 @@ struct SettingsView: View {
                 }
             }
             Section {
-                HStack {
-                    Button("Save") {
-                        accounts.save()
-                        saved = true
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    if saved {
-                        Label("Saved to Keychain", systemImage: "checkmark.circle")
-                            .foregroundStyle(.secondary).font(.caption)
-                    }
+                // Save writes to the Keychain and closes the window — the close
+                // is the confirmation now, so the old "Saved" checkmark is gone.
+                Button("Save") {
+                    accounts.save()
+                    window?.close()
                 }
+                .keyboardShortcut(.defaultAction)
                 if accounts.account.security == .startTLS {
                     Label("STARTTLS (587) isn't implemented yet — use SSL/TLS on 465 for now.",
                           systemImage: "exclamationmark.triangle.fill")
@@ -80,8 +77,32 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 460, height: 640)
-        .onChange(of: accounts.password) { _ in saved = false }
+        // Tall enough to show every section without the form scrolling. Sized by
+        // estimate rather than measurement (there's no way to render here); if a
+        // little dead space shows at the bottom, or a rare state still scrolls,
+        // this height is the one number to nudge.
+        .frame(width: 480, height: 740)
+        // The `!==` guard matters: `updateNSView` re-resolves on every
+        // invalidation, and assigning the same window back would re-invalidate
+        // the view and spin once per runloop turn while Settings sits open.
+        .background(WindowGrabber { if window !== $0 { window = $0 } })
         .navigationTitle("Settings")
+    }
+}
+
+/// Hands back the `NSWindow` hosting this view, once it exists — so Settings can
+/// close itself on Save. `dismiss` isn't reliable for the Settings scene on
+/// macOS 13, and `NSApp.keyWindow` can be the wrong window; the hosting view's
+/// own `window` is unambiguous.
+private struct WindowGrabber: NSViewRepresentable {
+    let onResolve: (NSWindow?) -> Void
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView(frame: .zero)
+        // `window` is nil while the view is being made; read it next runloop turn.
+        DispatchQueue.main.async { [weak v] in onResolve(v?.window) }
+        return v
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async { [weak nsView] in onResolve(nsView?.window) }
     }
 }
