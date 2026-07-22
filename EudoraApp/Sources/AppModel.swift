@@ -1951,13 +1951,17 @@ final class AppModel: ObservableObject {
     /// it doesn't go away in a release build, and it was being paid after every
     /// new message, every draft save, every delete and every mark-as-read.
     ///
-    /// Nothing needs the result synchronously. The structure of the tree doesn't
-    /// change under our own mutations — only counts and unread flags do — so
-    /// `itemsByID`, `base(ofType:)` and the listing all stay valid while this is
-    /// in flight, and the sidebar's numbers settle a moment later. Nothing in
-    /// the app creates or deletes a *mailbox*; the one capability given up is
-    /// noticing one made in the Finder while the app is running, which now needs
-    /// a File ▸ Open rather than arriving on the next mutation.
+    /// Nothing needs the result synchronously. Under the message mutations —
+    /// counts and unread flags — `itemsByID`, `base(ofType:)` and the listing
+    /// all stay valid while this is in flight, and the sidebar's numbers settle
+    /// a moment later. `deleteMailbox` *does* change the structure now: for the
+    /// moment this walk takes, the deleted mailbox is still clickable in the
+    /// sidebar, which degrades to an empty listing — `deleteMailbox` tears down
+    /// its own selection first, and `shapeSignature` bumps
+    /// `treeStructureVersion` when the walk lands, so the Move menus rebuild.
+    /// The one capability given up is noticing a mailbox made in the Finder
+    /// while the app is running, which needs a File ▸ Open rather than arriving
+    /// on the next mutation.
     private func reloadTree() {
         guard store != nil else { return }
         guard !treeReloadInFlight else {
@@ -2191,6 +2195,64 @@ final class AppModel: ObservableObject {
             self.reloadTree()
         }
         PerfLog.mark("afterRemoval returned")
+    }
+
+    // MARK: mailbox management (delete)
+
+    /// Live emptiness check for the sidebar's right-click menu — a stat, not a
+    /// read (`messageCount` prefers the .toc's size). The row's own count badge
+    /// comes from the same source, so the menu and the badge agree. The
+    /// primitive is more permissive (it trusts the .mbx, not the .toc), so a
+    /// stale .toc can grey the menu out for a genuinely empty mailbox — a safe
+    /// failure, resolved by the next re-list rewriting the .toc.
+    ///
+    /// Only a regular, non-folder mailbox is ever "deletable-empty": system
+    /// mailboxes and folders return false so the menu offers nothing for them.
+    func mailboxIsDeletablyEmpty(_ id: MailboxItem.ID) -> Bool {
+        guard let store, let item = itemsByID[id],
+              !item.isFolder, item.type == .mailbox else { return false }
+        return store.messageCount(base: item.base) == 0
+    }
+
+    /// Sidebar right-click ▸ Delete. The heavy lifting — descmap.pce edit,
+    /// file removal, and the *authoritative* emptiness check against the .mbx —
+    /// is `MailboxTreeMutator.deleteEmptyMailbox`; the menu's grey-out is only
+    /// a courtesy, so a stale count here degrades to an error banner, never to
+    /// a deleted message.
+    func deleteMailbox(_ id: MailboxItem.ID) {
+        guard let item = itemsByID[id], !item.isFolder, item.type == .mailbox else { return }
+        // The descmap filename is the id's last path component — buildItems
+        // constructs ids by joining exactly those (`item.base` has the
+        // extension stripped and can't be used for the match).
+        let filename = id.split(separator: "/").last.map(String.init) ?? id
+        do {
+            try MailboxTreeMutator.deleteEmptyMailbox(
+                directory: item.base.deletingLastPathComponent(),
+                filename: filename)
+        } catch {
+            showError("Couldn't delete \(item.display): \(error.localizedDescription)")
+            return
+        }
+
+        // If the deleted mailbox was on screen, clear everything that points
+        // at it — same teardown a mailbox switch does, then no mailbox at all.
+        if selectedMailboxID == id {
+            beginMailboxSwitch()
+            selectedMailboxID = nil
+            listedMailboxID = nil
+            selectMessage(nil)
+        }
+
+        // Its remembered view state would otherwise linger forever keyed on an
+        // id nothing can select again.
+        viewState.sortByMailbox[id] = nil
+        viewState.scrollTopRowByMailbox[id] = nil
+        viewState.selectedMessageOffsetByMailbox[id] = nil
+        if viewState.selectedMailbox == id { viewState.selectedMailbox = nil }
+        if let root = rootURL?.path { ViewStateStore.save(viewState, forRoot: root) }
+
+        showBanner("Deleted mailbox \u{201C}\(item.display)\u{201D}.")
+        reloadTree()
     }
 
     // MARK: receiving (POP3)

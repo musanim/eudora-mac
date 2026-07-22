@@ -262,7 +262,9 @@ struct SidebarView: View {
                 MailboxTree(tree: model.tree,
                             treeVersion: model.treeVersion,
                             selected: model.selectedMailboxID,
-                            selection: model.mailboxSelection)
+                            selection: model.mailboxSelection,
+                            mailboxIsDeletablyEmpty: { model.mailboxIsDeletablyEmpty($0) },
+                            onDeleteMailbox: { model.deleteMailbox($0) })
                     .equatable()
             }
         }
@@ -293,6 +295,13 @@ struct MailboxTree: View, Equatable {
     let selected: MailboxItem.ID?
     let selection: Binding<MailboxItem.ID?>
 
+    /// Live emptiness check and the delete action, queried only when a row's
+    /// context menu is actually opened. Closures rather than the model itself,
+    /// so this view stays insulated from `AppModel`'s publishes (the whole
+    /// point of its `Equatable` — see the type comment). Excluded from `==`.
+    let mailboxIsDeletablyEmpty: (MailboxItem.ID) -> Bool
+    let onDeleteMailbox: (MailboxItem.ID) -> Void
+
     static func == (a: MailboxTree, b: MailboxTree) -> Bool {
         a.treeVersion == b.treeVersion && a.selected == b.selected
     }
@@ -302,6 +311,32 @@ struct MailboxTree: View, Equatable {
             OutlineGroup(tree, children: \.children) { item in
                 MailboxRow(item: item)
                     .tag(item.id)
+                    // A SwiftUI `.contextMenu`, and deliberately so despite the
+                    // "menus over the mailbox tree must be AppKit" rule. That
+                    // rule exists because SwiftUI builds *nested* menu content
+                    // eagerly — a Move submenu materialised all 2,657 mailboxes
+                    // per right-click. This menu is one flat item, built only
+                    // when the row is actually right-clicked; there is nothing
+                    // for the eager builder to be eager about. If this menu
+                    // ever grows a submenu that walks the tree, it must move to
+                    // AppKit (see MessageContextMenu for the pattern).
+                    .contextMenu { contextMenu(for: item) }
+            }
+        }
+    }
+
+    /// Eudora 7's behaviour: Delete only for an *empty* mailbox; a non-empty
+    /// one shows the item greyed out, labelled with the reason. System
+    /// mailboxes (In/Out/Junk/Trash) and folders get no menu at all — an empty
+    /// `@ViewBuilder` result means no menu appears.
+    @ViewBuilder
+    private func contextMenu(for item: MailboxItem) -> some View {
+        if item.type == .mailbox && !item.isFolder {
+            if mailboxIsDeletablyEmpty(item.id) {
+                Button("Delete") { onDeleteMailbox(item.id) }
+            } else {
+                Button("Delete (not empty)") {}
+                    .disabled(true)
             }
         }
     }
