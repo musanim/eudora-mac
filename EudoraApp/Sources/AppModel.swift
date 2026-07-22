@@ -2027,6 +2027,16 @@ final class AppModel: ObservableObject {
     /// The selected message left the current mailbox: clear it and refresh.
     private func afterRemoval() {
         PerfLog.mark("afterRemoval begins")
+
+        // Where the list is looking, and where in it the departing message sits —
+        // both captured now, before `setRows([])` wipes them, so the viewport can
+        // be put back after the rebuild. Without this the list was left wherever
+        // the empty→repopulate cycle happened to park it, a position unrelated to
+        // the message just removed. `rows` here is still the pre-removal list, so
+        // the index is a display position in it.
+        let priorTop = selectedMailboxID.flatMap { viewState.scrollTopRowByMailbox[$0] }
+        let removedPos = selectedMessageID.flatMap { id in rows.firstIndex { $0.id == id } }
+
         selectedMessageID = nil
         preview = nil
         // Clear the rows rather than leaving them up during the re-list.
@@ -2046,7 +2056,22 @@ final class AppModel: ObservableObject {
         // sidebar's counts settle a moment later, which is the order that
         // matters to someone watching.
         rebuildRows { [weak self] in
-            self?.reloadTree()
+            guard let self else { return }
+            // Put the viewport back where it was. One row is gone, so the top
+            // moves only if the removed message sat *above* it (everything below
+            // shifted up by one); a message removed at or below the top leaves
+            // the rows above it — and the top — untouched. In the common case
+            // where you delete the row you were looking at, that keeps the row
+            // just after it sitting where the deleted one was. Clamped to what
+            // the mailbox now holds. Handed to the same AppKit bridge, and via
+            // the same `pendingScrollTopRow`, that `loadListing` restores through.
+            if let top = priorTop, !self.rows.isEmpty {
+                let shifted = (removedPos.map { $0 < top } ?? false) ? top - 1 : top
+                self.pendingScrollTopRow = max(0, min(shifted, self.rows.count - 1))
+            } else {
+                self.pendingScrollTopRow = nil
+            }
+            self.reloadTree()
         }
         PerfLog.mark("afterRemoval returned")
     }
