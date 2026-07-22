@@ -11,6 +11,9 @@ question, including the ones that would otherwise be a natural fit for it:
 clarifying scope, choosing between approaches, confirming a design decision.
 Write the options out as ordinary text and let him answer however he likes.
 
+Housekeeping Claude may do without asking: commit Stephen's moves of old
+handoffs into `handoffs/archive/`.
+
 ## Building
 
 Claude cannot compile: there is no Swift toolchain in the sandbox. The loop is
