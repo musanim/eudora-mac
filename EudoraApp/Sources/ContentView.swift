@@ -584,10 +584,14 @@ enum RowIcon {
     /// so always had a line box, whereas an empty `Group` would collapse to zero
     /// and leave the table's row height resting on the text columns alone.
     ///
-    /// Also the density knob for the list: it's ~2 pt above the text line box, so
-    /// each point trimmed here removes roughly half a pixel above and half below
-    /// the text. 15 drops the row one pixel top and bottom from the original 17.
-    static let height: CGFloat = 15
+    /// Also the density knob for the list — *up to a point*: the row can only be
+    /// as short as the taller of this slot and the Arial-13 text line box (~15
+    /// pt), plus whatever fixed padding SwiftUI's `Table` adds around cell
+    /// content. Below the text line box, trimming this stops helping and the
+    /// real lever becomes the `NSTableView.rowHeight` itself. `RowDensityProbe`
+    /// (in `TableScrollStateSyncer.attach`) prints the actual geometry so we can
+    /// tell which regime we're in rather than guessing. 13 = original 17 − 4.
+    static let height: CGFloat = 13
 
     /// A row glyph centred in its sub-column, or empty space of the same size.
     static func view(_ name: String, show: Bool, width: CGFloat) -> some View {
@@ -601,6 +605,34 @@ enum RowIcon {
             }
         }
         .frame(width: width, height: height)
+    }
+}
+
+/// One-shot readout of the message list's real row geometry.
+///
+/// Investigation (2026-07): trimming `RowIcon.height` didn't visibly tighten the
+/// rows, so we need the actual `NSTableView.rowHeight` (plus intercell spacing
+/// and the measured row rect) to tell whether the content height drives the row
+/// or SwiftUI's `Table` floors it. If `rowHeight` tracks `RowIcon.height`, the
+/// slot is the knob; if it sits well above it, the real lever is `rowHeight`
+/// itself and we set that directly. Flip `enabled` off once settled.
+enum RowDensityProbe {
+    static let enabled = true
+    private static var scheduled = false
+
+    static func reportOnce(_ table: NSTableView) {
+        guard enabled, !scheduled else { return }
+        scheduled = true
+        // A beat later: `rowHeight` is set by SwiftUI's own layout, which may not
+        // have run when the table is first found, and rows may not be in yet.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            let rowRect = table.numberOfRows > 0 ? table.rect(ofRow: 0).height : -1
+            print("[rowdensity] rowHeight \(table.rowHeight)"
+                + "  intercellSpacing.h \(table.intercellSpacing.height)"
+                + "  rect(ofRow:0).height \(rowRect)"
+                + "  rows \(table.numberOfRows)"
+                + "  RowIcon.height \(RowIcon.height)")
+        }
     }
 }
 
@@ -1352,6 +1384,7 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         }
 
         coordinator.table = table
+        RowDensityProbe.reportOnce(table)
         clipView.postsBoundsChangedNotifications = true
         installScrollMonitor(coordinator: coordinator)
 
