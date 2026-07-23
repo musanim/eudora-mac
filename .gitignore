@@ -19,3 +19,6 @@ reference/
 # Real mail — private test data, never commit (repo is public)
 phaseX/
 Eudora_*.zip
+
+# Personal scratchpad — not tracked
+EudoraDevelopmentNotes.txt
