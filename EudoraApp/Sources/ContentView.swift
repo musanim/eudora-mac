@@ -583,10 +583,12 @@ enum RowIcon {
     /// so always had a line box, whereas an empty `Group` would collapse to zero.
     ///
     /// **Not** the row-density knob. The probe proved SwiftUI's `Table` floors
-    /// the row at a fixed 24 pt no matter how short the content is, so density is
-    /// forced directly — see `MessageRowMetrics.rowHeight`. This only needs to be
-    /// ≤ that row height so the glyph isn't clipped.
-    static let height: CGFloat = 17
+    /// the row no matter how short the content is, so density is forced directly
+    /// — see `MessageRowMetrics.rowHeight`. This only needs to be ≤ that row
+    /// height so the glyph isn't clipped. Held equal to it: the attachment icon
+    /// is 16 pt tall, so at a 16 pt row the slot has to be 16 too, or that icon
+    /// loses a half-pixel top and bottom.
+    static let height: CGFloat = 16
 
     /// A row glyph centred in its sub-column, or empty space of the same size.
     static func view(_ name: String, show: Bool, width: CGFloat) -> some View {
@@ -608,13 +610,14 @@ enum RowIcon {
 /// SwiftUI's `Table` gives every row a self-sizing ~25 pt on macOS and offers no
 /// API to change it, so the only lever is the AppKit `rowHeight` (with automatic
 /// row heights turned off), set and re-asserted by `TableScrollStateSyncer`. The
-/// Arial-13 text line box is ~15 pt, so this can't go much below ~16 without
-/// clipping; 18 is where Stephen tuned it down from the original ~25.
+/// Arial-13 text line box is ~15 pt and the attachment icon is 16 pt, so 16 is
+/// the floor — below it text and that icon start to clip. Tuned down from the
+/// original ~25 to here.
 ///
 /// The scroll bridge reads `rowHeight` live for its step arithmetic, so changing
 /// it here stays consistent with `rect(ofRow:)` and the wheel math.
 enum MessageRowMetrics {
-    static let rowHeight: CGFloat = 18
+    static let rowHeight: CGFloat = 16
 }
 
 /// One-shot readout of the message list's real row geometry.
