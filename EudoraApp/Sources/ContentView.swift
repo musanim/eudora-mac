@@ -576,22 +576,17 @@ enum RowIcon {
     /// A message whose send was attempted and failed.
     static let sendError = "RowSendError"
 
-    /// Height of the glyph slot — and, in practice, the row's content height,
-    /// since this is a couple of points taller than the Arial-13 text line box.
+    /// Height of the glyph slot.
     ///
     /// Given explicitly so a row with no glyph is the same height as one with:
     /// the cell used to always hold a `Text` (status was `" "` for read mail) and
-    /// so always had a line box, whereas an empty `Group` would collapse to zero
-    /// and leave the table's row height resting on the text columns alone.
+    /// so always had a line box, whereas an empty `Group` would collapse to zero.
     ///
-    /// Also the density knob for the list — *up to a point*: the row can only be
-    /// as short as the taller of this slot and the Arial-13 text line box (~15
-    /// pt), plus whatever fixed padding SwiftUI's `Table` adds around cell
-    /// content. Below the text line box, trimming this stops helping and the
-    /// real lever becomes the `NSTableView.rowHeight` itself. `RowDensityProbe`
-    /// (in `TableScrollStateSyncer.attach`) prints the actual geometry so we can
-    /// tell which regime we're in rather than guessing. 13 = original 17 − 4.
-    static let height: CGFloat = 13
+    /// **Not** the row-density knob. The probe proved SwiftUI's `Table` floors
+    /// the row at a fixed 24 pt no matter how short the content is, so density is
+    /// forced directly — see `MessageRowMetrics.rowHeight`. This only needs to be
+    /// ≤ that row height so the glyph isn't clipped.
+    static let height: CGFloat = 17
 
     /// A row glyph centred in its sub-column, or empty space of the same size.
     static func view(_ name: String, show: Bool, width: CGFloat) -> some View {
@@ -606,6 +601,20 @@ enum RowIcon {
         }
         .frame(width: width, height: height)
     }
+}
+
+/// The message list's row height, forced onto the underlying `NSTableView`.
+///
+/// SwiftUI's `Table` gives every row a fixed 24 pt on macOS and offers no API to
+/// change it, so the only lever is the AppKit `rowHeight`, set (and re-asserted)
+/// by `TableScrollStateSyncer`. The Arial-13 text line box is ~15 pt, so this
+/// can't go much below ~16 without clipping; 20 is the original 24 less the four
+/// points Stephen asked to trim (one pixel, then another, top and bottom).
+///
+/// The scroll bridge reads `rowHeight` live for its step arithmetic, so changing
+/// it here stays consistent with `rect(ofRow:)` and the wheel math.
+enum MessageRowMetrics {
+    static let rowHeight: CGFloat = 20
 }
 
 /// One-shot readout of the message list's real row geometry.
@@ -1307,9 +1316,24 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         let coordinator = context.coordinator
         DispatchQueue.main.async {
             attach(near: nsView, coordinator: coordinator, attemptsLeft: 5)
+            // Re-assert the row height after any update: SwiftUI rebuilds the
+            // table on a re-list and can put its default 24 pt back, so one set
+            // in `attach` wouldn't survive switching mailboxes.
+            if let table = coordinator.table { Self.enforceRowHeight(table) }
             applyPendingScroll(coordinator: coordinator, attemptsLeft: 5)
             applyPendingReveal(coordinator: coordinator, attemptsLeft: 5)
             applyPendingFocus(coordinator: coordinator, attemptsLeft: 5)
+        }
+    }
+
+    /// Force the row height SwiftUI's `Table` won't otherwise let us set.
+    ///
+    /// Guarded so it only assigns when the value differs: assigning triggers a
+    /// row relayout, and doing that on every pass would be visible. If SwiftUI
+    /// resets it on a re-list, the next `updateNSView` puts it back.
+    static func enforceRowHeight(_ table: NSTableView) {
+        if table.rowHeight != MessageRowMetrics.rowHeight {
+            table.rowHeight = MessageRowMetrics.rowHeight
         }
     }
 
@@ -1384,6 +1408,7 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         }
 
         coordinator.table = table
+        Self.enforceRowHeight(table)
         RowDensityProbe.reportOnce(table)
         clipView.postsBoundsChangedNotifications = true
         installScrollMonitor(coordinator: coordinator)
