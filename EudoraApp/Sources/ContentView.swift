@@ -622,14 +622,17 @@ enum MessageRowMetrics {
 
 /// One-shot readout of the message list's real row geometry.
 ///
-/// Investigation (2026-07): trimming `RowIcon.height` didn't visibly tighten the
-/// rows, so we need the actual `NSTableView.rowHeight` (plus intercell spacing
-/// and the measured row rect) to tell whether the content height drives the row
-/// or SwiftUI's `Table` floors it. If `rowHeight` tracks `RowIcon.height`, the
-/// slot is the knob; if it sits well above it, the real lever is `rowHeight`
-/// itself and we set that directly. Flip `enabled` off once settled.
+/// Investigation (2026-07): trimming `RowIcon.height` didn't tighten the rows.
+/// The probe found why — SwiftUI's `Table` runs with *automatic* row heights, so
+/// the `rowHeight` property was only an estimate (settable to 20 while
+/// `rect(ofRow:)` stayed ~25) and each row self-sized to its content plus
+/// SwiftUI's cell padding. The fix was `usesAutomaticRowHeights = false` plus a
+/// forced `rowHeight` (see `MessageRowMetrics.rowHeight`); density then landed at
+/// 16, the floor set by the Arial-13 text and the 16 pt attachment icon.
+///
+/// Switched off but kept intact, per CLAUDE.md's diagnostics convention.
 enum RowDensityProbe {
-    static let enabled = true
+    static let enabled = false
     private static var scheduled = false
 
     static func reportOnce(_ table: NSTableView) {
