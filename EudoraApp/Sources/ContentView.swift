@@ -576,13 +576,18 @@ enum RowIcon {
     /// A message whose send was attempted and failed.
     static let sendError = "RowSendError"
 
-    /// Height of the glyph slot.
+    /// Height of the glyph slot — and, in practice, the row's content height,
+    /// since this is a couple of points taller than the Arial-13 text line box.
     ///
     /// Given explicitly so a row with no glyph is the same height as one with:
     /// the cell used to always hold a `Text` (status was `" "` for read mail) and
     /// so always had a line box, whereas an empty `Group` would collapse to zero
     /// and leave the table's row height resting on the text columns alone.
-    static let height: CGFloat = 17
+    ///
+    /// Also the density knob for the list: it's ~2 pt above the text line box, so
+    /// each point trimmed here removes roughly half a pixel above and half below
+    /// the text. 15 drops the row one pixel top and bottom from the original 17.
+    static let height: CGFloat = 15
 
     /// A row glyph centred in its sub-column, or empty space of the same size.
     static func view(_ name: String, show: Bool, width: CGFloat) -> some View {
