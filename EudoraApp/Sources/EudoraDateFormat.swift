@@ -30,10 +30,12 @@ enum EudoraDateFormat {
     private static let eudoraOut: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
-        // YYYYmmmDD with the month lowercased below — "2026jul22". `MMM` yields
-        // "Jul" (en_US_POSIX is always English regardless of the machine's
-        // locale, which is what keeps the format stable); `display` lowercases.
-        f.dateFormat = "yyyyMMMdd"
+        // YYYYmmmDD then 24-hour HH:mm:ss, month lowercased below —
+        // "2026jul22 16:26:35". `MMM` yields "Jul" (en_US_POSIX is always
+        // English regardless of the machine's locale, which is what keeps the
+        // format stable); `display` lowercases. `mm` is minutes; `HH` is the
+        // 24-hour hour, so there's no AM/PM.
+        f.dateFormat = "yyyyMMMdd HH:mm:ss"
         return f
     }()
 
@@ -88,10 +90,11 @@ enum EudoraDateFormat {
         return rfc822In.date(from: h) ?? rfc822InNoDay.date(from: h)
     }
 
-    /// Render a date as `YYYYmmmDD` with a lowercase month ("2026jul22").
+    /// Render a date as `YYYYmmmDD HH:mm:ss`, lowercase month, 24-hour clock
+    /// ("2026jul22 16:26:35").
     static func display(_ date: Date) -> String { eudoraOut.string(from: date).lowercased() }
 
-    /// Parse an RFC-822 Date header and render it `YYYYmmmDD`.
+    /// Parse an RFC-822 Date header and render it `YYYYmmmDD HH:mm:ss`.
     static func eudoraDate(_ header: String?) -> String? { parse(header).map(display) }
 
     /// Format a TOC-cached date string for display, falling back to the raw

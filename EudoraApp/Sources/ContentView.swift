@@ -450,7 +450,9 @@ enum MessageTableMetrics {
 /// artwork. Retune freely: unlike the metrics, these are taste, not measurement.
 enum MessageColumnWidths {
     static let who: CGFloat = 247
-    static let date: CGFloat = 123
+    // Widened from 123 to fit "2026jul22 16:26:35" — the YYYYmmmDD HH:mm:ss
+    // date runs ~111 pt at Arial 13, which the old width left no margin for.
+    static let date: CGFloat = 145
 
     /// Per column, in `TableColumn` order; `nil` means "let it flex".
     /// Only the trailing column may be `nil`.
