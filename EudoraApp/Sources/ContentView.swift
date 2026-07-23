@@ -1329,11 +1329,18 @@ struct TableScrollStateSyncer: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {
         let coordinator = context.coordinator
+        // Re-assert the row height *synchronously*, in this same update pass,
+        // before the screen refreshes — SwiftUI resets the table to its 24 pt
+        // automatic height on any update (a selection change included), and doing
+        // this from the async block below let one padded frame paint before the
+        // override landed, which read as a flicker on every selection. Only when
+        // the table is already found; the first attach still happens async.
+        if let table = coordinator.table { Self.enforceRowHeight(table) }
         DispatchQueue.main.async {
             attach(near: nsView, coordinator: coordinator, attemptsLeft: 5)
-            // Re-assert the row height after any update: SwiftUI rebuilds the
-            // table on a re-list and can put its default 24 pt back, so one set
-            // in `attach` wouldn't survive switching mailboxes.
+            // Backstop for the async paths: the first attach (when the table
+            // wasn't found yet above) and any relayout SwiftUI schedules after
+            // this pass.
             if let table = coordinator.table { Self.enforceRowHeight(table) }
             applyPendingScroll(coordinator: coordinator, attemptsLeft: 5)
             applyPendingReveal(coordinator: coordinator, attemptsLeft: 5)
