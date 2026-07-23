@@ -358,6 +358,15 @@ struct MailboxRow: View {
             Text(item.display)
                 .font(EudoraFont.list)
                 .fontWeight(item.hasUnread ? .semibold : .regular)
+            // Eudora's green "unsent" glyph, just right of the label, when Out
+            // holds mail waiting to go. Native art, drawn crisp (no smoothing),
+            // at its own size. Only ever set for the Out row — see
+            // `MailboxItem.hasUnsent`.
+            if item.hasUnsent {
+                Image(RowIcon.unsent)
+                    .interpolation(.none)
+                    .help("Unsent mail waiting to be sent")
+            }
             Spacer()
             if !item.isFolder && item.messageCount > 0 {
                 Text("\(item.messageCount)")

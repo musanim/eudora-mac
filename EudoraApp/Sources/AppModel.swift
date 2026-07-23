@@ -23,6 +23,11 @@ struct MailboxItem: Identifiable, Hashable {
     let isFolder: Bool
     let messageCount: Int
     let hasUnread: Bool
+    /// Whether this mailbox holds at least one unsent (status-9) message. Only
+    /// ever true for Out — it's the flag behind the green Unsent badge on the Out
+    /// row in the sidebar. Computed off-main during the tree build, so it rides
+    /// the same `treeVersion` bump that re-renders the (Equatable) mailbox tree.
+    let hasUnsent: Bool
     let children: [MailboxItem]?
 
     /// SF Symbol for the row icon, chosen by Eudora mailbox role.
@@ -1015,10 +1020,12 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private static func buildItems(_ nodes: [MailboxNode], prefix: String) -> [MailboxItem] {
+    private static func buildItems(_ nodes: [MailboxNode], prefix: String,
+                                   outboxUnsent: Bool) -> [MailboxItem] {
         nodes.map { n in
             let path = prefix.isEmpty ? n.entry.filename : prefix + "/" + n.entry.filename
-            let kids = n.isFolder ? buildItems(n.children, prefix: path) : nil
+            let kids = n.isFolder ? buildItems(n.children, prefix: path,
+                                               outboxUnsent: outboxUnsent) : nil
             return MailboxItem(id: path,
                                display: n.entry.display,
                                type: n.entry.type,
@@ -1026,8 +1033,29 @@ final class AppModel: ObservableObject {
                                isFolder: n.isFolder,
                                messageCount: n.messageCount,
                                hasUnread: n.entry.hasUnread,
+                               hasUnsent: n.entry.type == .outbox && outboxUnsent,
                                children: kids)
         }
+    }
+
+    /// The Out mailbox in a freshly-walked tree, if there is one.
+    nonisolated private static func firstOutbox(in nodes: [MailboxNode]) -> MailboxNode? {
+        for n in nodes {
+            if n.entry.type == .outbox { return n }
+            if let found = firstOutbox(in: n.children) { return found }
+        }
+        return nil
+    }
+
+    /// Whether Out holds at least one unsent (status-9) message. Read from the
+    /// TOC via the ordinary listing — Out is small, and this runs off the main
+    /// thread as part of the tree walk. A send-error message (status 10) does not
+    /// count: the badge is specifically the *unsent* one.
+    nonisolated private static func outboxHasUnsent(in nodes: [MailboxNode],
+                                                    store: MailStore) -> Bool {
+        guard let outbox = firstOutbox(in: nodes),
+              let listing = store.list(at: outbox.base) else { return false }
+        return listing.rows.contains { $0.status == MailboxMutator.statusUnsent }
     }
 
     // MARK: listing a mailbox
@@ -2292,8 +2320,12 @@ final class AppModel: ObservableObject {
         let generation = treeReloadGeneration
         PerfLog.mark("tree walk queued")
         Task { [weak self] in
-            let nodes = await Task.detached(priority: .userInitiated) {
-                store.tree()
+            let (nodes, outboxUnsent) = await Task.detached(priority: .userInitiated) {
+                // Both off the main thread: the tree walk, and the Out scan for
+                // the unsent badge (it lists Out's TOC, which is cheap but still
+                // I/O, so it has no business on the main actor).
+                let nodes = store.tree()
+                return (nodes, Self.outboxHasUnsent(in: nodes, store: store))
             }.value
             PerfLog.mark("tree walk done: \(nodes.count) roots")
             guard let self else { return }
@@ -2302,7 +2334,7 @@ final class AppModel: ObservableObject {
             // it would put the old folder's mailboxes in the sidebar — the same
             // failure `cancelBackgroundWork` guards against for listings.
             guard self.treeReloadGeneration == generation else { return }
-            let items = Self.buildItems(nodes, prefix: "")
+            let items = Self.buildItems(nodes, prefix: "", outboxUnsent: outboxUnsent)
             let shape = Self.shapeSignature(items)
             self.tree = items
             self.treeVersion &+= 1
@@ -2731,6 +2763,9 @@ final class AppModel: ObservableObject {
                                isFolder: asFolder,
                                messageCount: 0,
                                hasUnread: false,
+                               // A freshly made mailbox/folder is never Out and
+                               // never unsent; the tree walk will confirm it.
+                               hasUnsent: false,
                                children: asFolder ? [] : nil)
         itemsByID[id] = item
         reloadTree()
