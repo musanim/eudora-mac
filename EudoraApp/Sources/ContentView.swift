@@ -1328,10 +1328,19 @@ struct TableScrollStateSyncer: NSViewRepresentable {
 
     /// Force the row height SwiftUI's `Table` won't otherwise let us set.
     ///
-    /// Guarded so it only assigns when the value differs: assigning triggers a
-    /// row relayout, and doing that on every pass would be visible. If SwiftUI
-    /// resets it on a re-list, the next `updateNSView` puts it back.
+    /// **Two things, not one.** SwiftUI runs the table with *automatic* row
+    /// heights, so the `rowHeight` property is only an estimate and each row
+    /// self-sizes to its content plus SwiftUI's cell padding (~25 pt) — which is
+    /// why setting `rowHeight` alone changed the property but not the rows.
+    /// Turning automatic heights off makes `rowHeight` authoritative, and then 20
+    /// is what every row gets. The content (17 pt glyph slot, ~15 pt text) fits
+    /// inside 20 with room, so nothing clips.
+    ///
+    /// Guarded so it only assigns when values differ: each assignment triggers a
+    /// relayout, and doing that every pass would be visible. If SwiftUI restores
+    /// the defaults on a re-list, the next `updateNSView` puts these back.
     static func enforceRowHeight(_ table: NSTableView) {
+        if table.usesAutomaticRowHeights { table.usesAutomaticRowHeights = false }
         if table.rowHeight != MessageRowMetrics.rowHeight {
             table.rowHeight = MessageRowMetrics.rowHeight
         }
