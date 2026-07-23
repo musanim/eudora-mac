@@ -1317,7 +1317,11 @@ final class AppModel: ObservableObject {
                               // from that cache, and far better than a blank
                               // column while the parse catches up.
                               who: r.who,
-                              date: r.date,
+                              // Formatted from the TOC's cached date so the
+                              // column shows YYYYmmmDD immediately, in the same
+                              // shape the parse will confirm — not the raw TOC
+                              // string flipping format when enrichment lands.
+                              date: EudoraDateFormat.displayCached(r.date),
                               hasAttachment: false,
                               // The TOC's cached string, read as an instant so
                               // the Date column can sort before the parse lands.

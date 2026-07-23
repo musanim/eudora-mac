@@ -30,7 +30,10 @@ enum EudoraDateFormat {
     private static let eudoraOut: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "M/d/yy h:mm a"
+        // YYYYmmmDD with the month lowercased below — "2026jul22". `MMM` yields
+        // "Jul" (en_US_POSIX is always English regardless of the machine's
+        // locale, which is what keeps the format stable); `display` lowercases.
+        f.dateFormat = "yyyyMMMdd"
         return f
     }()
 
@@ -85,11 +88,22 @@ enum EudoraDateFormat {
         return rfc822In.date(from: h) ?? rfc822InNoDay.date(from: h)
     }
 
-    /// Render a date the way Eudora's message list did ("12/17/02 9:04 AM").
-    static func display(_ date: Date) -> String { eudoraOut.string(from: date) }
+    /// Render a date as `YYYYmmmDD` with a lowercase month ("2026jul22").
+    static func display(_ date: Date) -> String { eudoraOut.string(from: date).lowercased() }
 
-    /// Parse an RFC-822 Date header and render it Eudora-style.
+    /// Parse an RFC-822 Date header and render it `YYYYmmmDD`.
     static func eudoraDate(_ header: String?) -> String? { parse(header).map(display) }
+
+    /// Format a TOC-cached date string for display, falling back to the raw
+    /// string when it doesn't parse.
+    ///
+    /// So the message list shows the same `YYYYmmmDD` shape *before* the
+    /// background parse lands as after — the Date column used to flip from the
+    /// TOC's raw "10:02 PM 12/5/2025" to the formatted value as enrichment
+    /// caught up, which on a big mailbox was visible for seconds.
+    static func displayCached(_ cached: String) -> String {
+        tocDate(cached).map(display) ?? cached
+    }
 
     /// Parse the date string Eudora cached in the `.toc`, for sorting.
     ///
