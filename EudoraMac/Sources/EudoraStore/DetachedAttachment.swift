@@ -87,6 +87,21 @@ public enum DetachedAttachment {
     private static let binaryMainTypes: Set<String> =
         ["image", "audio", "video", "application", "model"]
 
+    /// Whether a detached-attachment marker line appears in raw body bytes.
+    ///
+    /// For `MessageDigest`, which settles the message-list paperclip without
+    /// building a part tree. Recognition is exactly `scan`'s — a marker at a line
+    /// start with a non-empty path — just over undifferentiated bytes. Safe on
+    /// the digest's fast path because that path is only ever taken for
+    /// non-multipart mail, whose single (text) leaf is what `scan` would have
+    /// examined anyway; a binary leaf, which `scan` skips, only reaches here as a
+    /// bare attachment, and that is caught by the header check first.
+    public static func markerPresent(inRawBody bytes: [UInt8]) -> Bool {
+        var found = false
+        _ = scan(bytes) { _ in found = true; return .stop }
+        return found
+    }
+
     /// Calls `body` with the recorded path from each marker line.
     private static func forEachMarkerLine(in message: MIMEPart,
                                           _ body: (String) -> Continuation) {

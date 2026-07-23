@@ -257,6 +257,28 @@ public struct MailStore: Sendable {
         }
     }
 
+    /// Like `forEachMessage`, but hands back a `MessageDigest` — the Who/Date
+    /// headers and the attachment flag — instead of a fully parsed `MIMEPart`.
+    ///
+    /// This is what the message list's background enrichment uses: it avoids the
+    /// full MIME parse (body scan, tree build) for the ~97% of messages that
+    /// don't need it. The file read and record scan are identical to
+    /// `forEachMessage`, and `isCancelled` is consulted the same way.
+    public func forEachMessageDigest(at base: URL,
+                                     isCancelled: () -> Bool = { false },
+                                     body: (_ index: Int, _ digest: MessageDigest) -> Bool) {
+        if isCancelled() { return }
+        guard let data = try? Data(contentsOf: mbxURL(base)) else { return }
+        if isCancelled() { return }
+        let bytes = [UInt8](data)
+        let records = Mbox.findRecords(bytes)
+        if isCancelled() { return }
+        for (i, rec) in records.enumerated() {
+            if isCancelled() { return }
+            if !body(i + 1, MessageDigest.parse(Mbox.messageBytes(bytes, rec))) { return }
+        }
+    }
+
     public func loadMessages(at base: URL) -> [(index: Int, record: MboxRecord, part: MIMEPart)] {
         guard let data = try? Data(contentsOf: mbxURL(base)) else { return [] }
         let bytes = [UInt8](data)

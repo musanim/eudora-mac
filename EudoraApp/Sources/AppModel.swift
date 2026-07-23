@@ -1381,20 +1381,20 @@ final class AppModel: ObservableObject {
             let stream = AsyncStream<[RowEnrichment]> { continuation in
                 let work = Task.detached(priority: .utility) {
                     var batch: [RowEnrichment] = []
-                    store.forEachMessage(at: base, isCancelled: { Task.isCancelled }) { index, _, part in
+                    // The digest read, not a full parse: Who and Date are single
+                    // headers and the attachment flag is settled from the top
+                    // headers for all but genuine multipart mail. See
+                    // `MessageDigest`. This is what took the big-mailbox
+                    // enrichment from ~20s of body-scanning down to a header read.
+                    store.forEachMessageDigest(at: base, isCancelled: { Task.isCancelled }) { index, digest in
                         if Task.isCancelled { return false }
                         // Argument order follows RowEnrichment's declaration.
                         batch.append(RowEnrichment(
                             index: index,
-                            who: AppModel.correspondent(part, outgoing: outgoing),
-                            date: EudoraDateFormat.parse(part.header("Date")),
-                            // Both forms count: mail Eudora processed has no MIME
-                            // attachment left (it detached the bytes to disk and
-                            // wrote an "Attachment Converted:" line into the
-                            // body), while mail it never touched, and everything
-                            // outgoing, still carries real MIME parts.
-                            hasAttachment: part.walk().contains(where: { $0.isAttachment })
-                                || DetachedAttachment.isPresent(in: part)))
+                            who: AppModel.correspondent(from: digest.from, to: digest.to,
+                                                        outgoing: outgoing),
+                            date: EudoraDateFormat.parse(digest.date),
+                            hasAttachment: digest.hasAttachment))
                         if batch.count >= enrichBatchSize {
                             continuation.yield(batch)
                             batch = []
@@ -1466,10 +1466,17 @@ final class AppModel: ObservableObject {
 
     /// From (incoming) or To (outgoing), reduced to a display name.
     nonisolated static func correspondent(_ part: MIMEPart, outgoing: Bool) -> String {
-        let primary = outgoing ? "To" : "From"
-        let fallback = outgoing ? "From" : "To"
-        let raw = HeaderDecoder.decode(part.header(primary) ?? part.header(fallback) ?? "")
-        return displayName(raw)
+        correspondent(from: part.header("From"), to: part.header("To"), outgoing: outgoing)
+    }
+
+    /// The list's Who, from the raw From/To header values — outgoing mail shows
+    /// the recipient, incoming the sender, each falling back to the other. The
+    /// digest path feeds this directly; `correspondent(_:outgoing:)` routes a
+    /// parsed part through the same logic so the two can't drift.
+    nonisolated static func correspondent(from: String?, to: String?, outgoing: Bool) -> String {
+        let primary = outgoing ? to : from
+        let fallback = outgoing ? from : to
+        return displayName(HeaderDecoder.decode(primary ?? fallback ?? ""))
     }
 
     /// "Steve Dorner <d@x>" → "Steve Dorner"; "a@b (Name)" → "Name"; else the
