@@ -2012,6 +2012,13 @@ final class AppModel: ObservableObject {
     }
 
     /// Build a forward from the selected message.
+    ///
+    /// The quoted message keeps its formatting — font, size, colour, bold,
+    /// italic, the whole of what the composer can hold — carried across as
+    /// editable runs, with the "Forwarded message" header lines plain on top.
+    /// Anything richer in the source (links, images, tables) flattens, because
+    /// the model can't represent it. A forward of an unstyled message stays
+    /// plain and so still assembles to today's `text/plain` bytes.
     func forward() {
         guard let part = selectedPart() else { return }
         let subject = HeaderDecoder.decode(part.header("Subject") ?? "")
@@ -2025,9 +2032,12 @@ final class AppModel: ObservableObject {
         To: \(part.header("To") ?? "")
 
         """
-        beginCompose(ComposeDraft(
+        let combined = RichText(runs: [RichTextRun(intro)] + Self.styledText(of: part).runs)
+        var draft = ComposeDraft(
             subject: subject.lowercased().hasPrefix("fwd:") ? subject : "Fwd: \(subject)",
-            body: intro + Self.plainText(of: part)))
+            body: combined.plainText)
+        draft.styledBody = combined.isStyled ? combined : nil
+        beginCompose(draft)
     }
 
     private func selectedPart() -> MIMEPart? {
@@ -2080,6 +2090,31 @@ final class AppModel: ObservableObject {
             return rich.isStyled ? rich : nil
         }
         return nil
+    }
+
+    /// A message's body as editable `RichText`, for forwarding.
+    ///
+    /// Unlike `styledBody(of:)` this is *not* gated on the message being one of
+    /// our own drafts, and not on there being any styling: forwarding carries a
+    /// received message's formatting across whatever its source. It prefers the
+    /// HTML alternative (or a flattened `<x-html>` leaf) and parses it back to
+    /// runs — recovering font, size, colour, bold and italic, dropping the rest
+    /// — and falls back to the plain text when there is no HTML part. The
+    /// tolerant `RichTextHTML.parse` is exactly the same reader that reopens a
+    /// draft, so it copes with arbitrary foreign markup without throwing.
+    static func styledText(of part: MIMEPart) -> RichText {
+        var htmlText: String?
+        var plain: String?
+        for p in part.walk() where !p.isMultipart && !p.isAttachment && p.mainType == "text" {
+            let text = CharsetDecoder.smartDecode(p.decodedPayload(), declared: p.charset).text
+            if p.subType == "html" {
+                if htmlText == nil { htmlText = text }
+            } else if plain == nil {
+                plain = text
+            }
+        }
+        if let htmlText { return RichTextHTML.parse(htmlText) }
+        return RichText(plain: plain ?? "")
     }
 
     private func quotedReply(_ part: MIMEPart, from: String) -> String {
