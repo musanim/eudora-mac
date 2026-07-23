@@ -20,6 +20,9 @@ struct HTMLMailView: NSViewRepresentable {
     /// Called (on the main thread) when a link's URL is copied, so the app can
     /// show a brief confirmation.
     var onCopyLink: (String) -> Void = { _ in }
+    /// Forward the message being shown — the body's right-click menu offers it,
+    /// since that is where the eye is when the urge strikes.
+    var onForward: () -> Void = {}
 
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -30,12 +33,14 @@ struct HTMLMailView: NSViewRepresentable {
 
         let view = TrimmedMenuWebView(frame: .zero, configuration: config)
         view.navigationDelegate = context.coordinator
+        view.onForward = onForward
         return view
     }
 
     func updateNSView(_ view: WKWebView, context: Context) {
         context.coordinator.images = images
         context.coordinator.onCopyLink = onCopyLink
+        (view as? TrimmedMenuWebView)?.onForward = onForward
         // Avoid reloading (and flicker) when nothing changed.
         if context.coordinator.loadedHTML != html {
             context.coordinator.loadedHTML = html
@@ -142,8 +147,11 @@ struct HTMLMailView: NSViewRepresentable {
 
 /// WKWebView that trims the right-click menu to the copy affordances — no
 /// "Open Link", "Open in New Window", or "Download" (all of which would
-/// navigate or fetch). "Copy Link" is kept because it yields the *true* href.
+/// navigate or fetch) — and adds "Forward" at the top. "Copy Link" is kept
+/// because it yields the *true* href.
 private final class TrimmedMenuWebView: WKWebView {
+    var onForward: (() -> Void)?
+
     private static let blocked: Set<String> = [
         "WKMenuItemIdentifierOpenLink",
         "WKMenuItemIdentifierOpenLinkInNewWindow",
@@ -157,13 +165,32 @@ private final class TrimmedMenuWebView: WKWebView {
         "WKMenuItemIdentifierGoBack",
         "WKMenuItemIdentifierGoForward",
         "WKMenuItemIdentifierShareMenu",
+        // Newer WebKit adds animation controls. Meaningless here — every image
+        // has already been replaced with a static text box (img-src 'none'), so
+        // nothing animates — and out of place in a mail reader.
+        "WKMenuItemIdentifierPlayAllAnimations",
+        "WKMenuItemIdentifierPauseAllAnimations",
     ]
 
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
         menu.items.removeAll { item in
             guard let id = item.identifier?.rawValue else { return false }
-            return Self.blocked.contains(id)
+            // Substring match on "Animation" as well as the explicit ids, so a
+            // future rename of the animation items (they are recent and the
+            // exact identifier could shift) doesn't let them creep back in.
+            return Self.blocked.contains(id) || id.contains("Animation")
         }
+
+        // Forward at the top, then a separator before whatever survived (Copy,
+        // Copy Link, Look Up…). No separator when nothing else is left.
+        let forward = NSMenuItem(title: "Forward",
+                                 action: #selector(forwardMessage), keyEquivalent: "")
+        forward.target = self
+        if !menu.items.isEmpty { menu.insertItem(.separator(), at: 0) }
+        menu.insertItem(forward, at: 0)
+
         super.willOpenMenu(menu, with: event)
     }
+
+    @objc private func forwardMessage() { onForward?() }
 }

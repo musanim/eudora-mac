@@ -2160,9 +2160,9 @@ struct PreviewView: View {
                 headers(p)
                 Divider()
                 if p.isHTML {
-                    HTMLMailView(html: p.content, images: p.images) { url in
-                        model.showBanner("Link copied: \(url)")
-                    }
+                    HTMLMailView(html: p.content, images: p.images,
+                                 onCopyLink: { url in model.showBanner("Link copied: \(url)") },
+                                 onForward: { model.forward() })
                 } else {
                     ScrollView {
                         // An attachment-only message genuinely has no text, so
