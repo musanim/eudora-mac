@@ -2702,6 +2702,88 @@ final class AppModel: ObservableObject {
         reloadTree()
     }
 
+    // MARK: reordering & folder delete
+
+    /// Whether this mailbox or folder can move up/down — i.e. there is a
+    /// same-group neighbour on that side. The menu greys the item out otherwise;
+    /// `MailboxTreeMutator.moveEntry` is the authority and throws `.atBoundary`
+    /// if the courtesy check is ever stale.
+    func canMove(_ id: MailboxItem.ID, up: Bool) -> Bool {
+        guard let item = itemsByID[id] else { return false }
+        let siblings = siblingList(of: id)
+        guard let idx = siblings.firstIndex(where: { $0.id == id }) else { return false }
+        let neighbour = up ? idx - 1 : idx + 1
+        guard neighbour >= 0, neighbour < siblings.count else { return false }
+        return Self.sameMovableGroup(item, siblings[neighbour])
+    }
+
+    /// Move a mailbox or folder one place within its group and re-list the tree.
+    func moveTreeItem(_ id: MailboxItem.ID, up: Bool) {
+        guard let item = itemsByID[id] else { return }
+        let filename = descmapFilename(of: id)
+        do {
+            try MailboxTreeMutator.moveEntry(directory: item.base.deletingLastPathComponent(),
+                                             filename: filename, direction: up ? .up : .down)
+        } catch {
+            showError("Couldn't move \u{201C}\(item.display)\u{201D}: \(error.localizedDescription)")
+            return
+        }
+        reloadTree()
+    }
+
+    /// A folder with nothing listed inside it. The menu's grey-out; the mutator
+    /// makes the authoritative on-disk check (descmap empty *and* no stray
+    /// `.mbx`/`.fol`), so a folder holding orphaned mail is refused there.
+    func folderIsDeletablyEmpty(_ id: MailboxItem.ID) -> Bool {
+        guard let item = itemsByID[id], item.isFolder else { return false }
+        return item.children?.isEmpty ?? true
+    }
+
+    /// Sidebar right-click ▸ Delete for a folder — the parallel of
+    /// `deleteMailbox`. Only ever reaches an empty folder (the menu gates it),
+    /// and the mutator refuses one that isn't, so no mail is destroyed.
+    func deleteFolder(_ id: MailboxItem.ID) {
+        guard let item = itemsByID[id], item.isFolder else { return }
+        let filename = descmapFilename(of: id)
+        do {
+            try MailboxTreeMutator.deleteEmptyFolder(directory: item.base.deletingLastPathComponent(),
+                                                     filename: filename)
+        } catch {
+            showError("Couldn't delete folder \u{201C}\(item.display)\u{201D}: "
+                + error.localizedDescription)
+            return
+        }
+        showBanner("Deleted folder \u{201C}\(item.display)\u{201D}.")
+        reloadTree()
+    }
+
+    /// The descmap filename (second field, extension included) for a tree id —
+    /// its last path component, since `buildItems` joins ids from exactly those.
+    private func descmapFilename(of id: MailboxItem.ID) -> String {
+        id.split(separator: "/").last.map(String.init) ?? id
+    }
+
+    /// The siblings an item sits among in tree order: its parent's children, or
+    /// the root-level items for a top-level entry.
+    private func siblingList(of id: MailboxItem.ID) -> [MailboxItem] {
+        if let slash = id.lastIndex(of: "/") {
+            return itemsByID[String(id[..<slash])]?.children ?? []
+        }
+        return tree
+    }
+
+    /// Two items reorder together only if both are movable — a regular mailbox
+    /// or a folder, not a system mailbox — and of the same kind, so a mailbox
+    /// never swaps past a folder and the standard mailboxes stay pinned on top.
+    private static func sameMovableGroup(_ a: MailboxItem, _ b: MailboxItem) -> Bool {
+        func group(_ x: MailboxItem) -> Int? {
+            if x.isFolder { return 2 }
+            return x.type == .mailbox ? 1 : nil     // nil = system, unmovable
+        }
+        guard let ga = group(a), let gb = group(b) else { return false }
+        return ga == gb
+    }
+
     // MARK: mailbox management (create)
 
     /// Move to ▸ New… — Eudora 7's main way of creating mailboxes: prompt for

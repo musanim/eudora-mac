@@ -103,6 +103,157 @@ public enum MailboxTreeMutator {
         try? fm.removeItem(at: base.appendingPathExtension("toc"))
     }
 
+    /// Delete an *empty* folder that `directory`'s descmap lists under `filename`
+    /// (e.g. "Projects.fol"): remove the line, then the `.fol` directory.
+    ///
+    /// Empty means its own `descmap.pce` lists nothing **and** no `.mbx`/`.fol`
+    /// sit inside it — a folder holding an orphaned mailbox (mail the index
+    /// forgot) or a subfolder is refused, never destroyed. Same ordering as
+    /// `deleteEmptyMailbox`: index first, files after.
+    public static func deleteEmptyFolder(directory: URL, filename: String) throws {
+        let fm = FileManager.default
+        let descURL = directory.appendingPathComponent("descmap.pce")
+        guard let descData = try? Data(contentsOf: descURL) else { throw DeleteError.notFound }
+        guard let line = lineRange(of: filename, in: descData) else { throw DeleteError.notFound }
+
+        let lineText = String(data: descData.subdata(in: line.range), encoding: .isoLatin1) ?? ""
+        let parts = lineText.trimmingCharacters(in: .newlines).components(separatedBy: ",")
+        guard parts.count >= 3,
+              DescMap.resolveType(char: parts[2], display: parts[0]) == .folder else {
+            throw DeleteError.notAMailbox
+        }
+
+        let folderDir = directory.appendingPathComponent(filename, isDirectory: true)
+        guard DescMap.read(directory: folderDir).isEmpty else { throw DeleteError.notEmpty }
+        if let names = try? fm.contentsOfDirectory(atPath: folderDir.path) {
+            for n in names where ["mbx", "fol"].contains((n as NSString).pathExtension.lowercased()) {
+                throw DeleteError.notEmpty
+            }
+        }
+
+        var newDesc = descData
+        newDesc.removeSubrange(line.range)
+        do {
+            try MailboxIO.backupOnce(descURL)
+            try MailboxIO.atomicWrite(newDesc, to: descURL)
+        } catch { throw DeleteError.ioError(error.localizedDescription) }
+
+        try? fm.removeItem(at: folderDir)
+    }
+
+    // MARK: reordering
+
+    public enum MoveDirection { case up, down }
+
+    public enum MoveError: LocalizedError, Equatable {
+        /// No descmap.pce, or no line in it names this file.
+        case notFound
+        /// A system mailbox (In/Out/Junk/Trash) — pinned, never reordered.
+        case notMovable
+        /// Already at the top/bottom of its group (mailboxes among mailboxes,
+        /// folders among folders): there is no same-group neighbour to swap with.
+        case atBoundary
+        case ioError(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .notFound:       return "that item isn't in the folder's index"
+            case .notMovable:     return "the standard mailboxes stay put"
+            case .atBoundary:     return "it's already at the end of its group"
+            case .ioError(let m): return m
+            }
+        }
+    }
+
+    /// One descmap line's spans and role, for reordering.
+    struct Line { let full: Range<Data.Index>; let text: Range<Data.Index>; let group: Group }
+
+    /// The reorder group a line belongs to. System mailboxes don't move, and a
+    /// mailbox only ever swaps with a mailbox, a folder only with a folder — so
+    /// the standard mailboxes stay at the top and the mailbox-before-folder
+    /// grouping is preserved without anyone having to enforce it.
+    enum Group: Equatable { case system, mailbox, folder }
+
+    /// Move a mailbox or folder one place up or down **within its own group** by
+    /// swapping its `descmap.pce` line with the adjacent same-group line. The
+    /// swapped lines keep their exact text bytes (display name, filename, type,
+    /// unread flag); only line terminators are normalised to the file's dialect,
+    /// as `create` already does. Everything else in the file is untouched.
+    ///
+    /// - Throws: `.atBoundary` when the neighbour on that side is a different
+    ///   group (or absent) — which is exactly when the menu greys the item out.
+    public static func moveEntry(directory: URL, filename: String,
+                                 direction: MoveDirection) throws {
+        let descURL = directory.appendingPathComponent("descmap.pce")
+        guard let data = try? Data(contentsOf: descURL) else { throw MoveError.notFound }
+        let lines = descLines(in: data)
+        guard let i = lines.firstIndex(where: { lineFilename($0, in: data) == filename }) else {
+            throw MoveError.notFound
+        }
+        guard lines[i].group != .system else { throw MoveError.notMovable }
+
+        // The lower of the two positions to swap. Up swaps (i-1, i); down (i, i+1).
+        let lower = (direction == .up) ? i - 1 : i
+        guard lower >= 0, lower + 1 < lines.count,
+              lines[lower].group == lines[lower + 1].group else { throw MoveError.atBoundary }
+
+        let a = lines[lower], b = lines[lower + 1]
+        let term = lineTerminator(of: data)
+        var out = Data()
+        out.append(data.subdata(in: data.startIndex..<a.full.lowerBound))
+        out.append(data.subdata(in: b.text))      // b's text, then…
+        out.append(contentsOf: term)
+        // Any bytes between the two entries — blank lines `descLines` skipped —
+        // are preserved in place rather than dropped with the replaced span, so
+        // the file stays byte-for-byte but for the swap. (Real Eudora writes no
+        // interior blanks, but the promise everywhere else is to keep them.)
+        out.append(data.subdata(in: a.full.upperBound..<b.full.lowerBound))
+        out.append(data.subdata(in: a.text))      // …a's text — the swap
+        out.append(contentsOf: term)
+        out.append(data.subdata(in: b.full.upperBound..<data.endIndex))
+
+        do {
+            try MailboxIO.backupOnce(descURL)
+            try MailboxIO.atomicWrite(out, to: descURL)
+        } catch { throw MoveError.ioError(error.localizedDescription) }
+    }
+
+    /// Every descmap line, in file order, with its byte spans and group.
+    static func descLines(in data: Data) -> [Line] {
+        var out: [Line] = []
+        var start = data.startIndex
+        while start < data.endIndex {
+            var lf = start
+            while lf < data.endIndex, data[lf] != 0x0A { lf = data.index(after: lf) }
+            let rangeEnd = lf < data.endIndex ? data.index(after: lf) : lf
+            var textEnd = lf
+            if textEnd > start, data[data.index(before: textEnd)] == 0x0D {
+                textEnd = data.index(before: textEnd)
+            }
+            // Skip blank lines — they carry no entry. `moveEntry` preserves the
+            // bytes between the two lines it swaps, so a skipped blank between
+            // them survives rather than being dropped with the replaced span.
+            if textEnd > start,
+               let text = String(data: data.subdata(in: start..<textEnd), encoding: .isoLatin1) {
+                let parts = text.components(separatedBy: ",")
+                if parts.count >= 3 {
+                    let type = DescMap.resolveType(char: parts[2], display: parts[0])
+                    let group: Group = type == .folder ? .folder
+                        : type == .mailbox ? .mailbox : .system
+                    out.append(Line(full: start..<rangeEnd, text: start..<textEnd, group: group))
+                }
+            }
+            start = rangeEnd
+        }
+        return out
+    }
+
+    private static func lineFilename(_ line: Line, in data: Data) -> String? {
+        guard let text = String(data: data.subdata(in: line.text), encoding: .isoLatin1) else { return nil }
+        let parts = text.components(separatedBy: ",")
+        return parts.count >= 2 ? parts[1] : nil
+    }
+
     // MARK: creating
 
     public enum CreateError: LocalizedError, Equatable {

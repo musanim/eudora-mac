@@ -269,7 +269,11 @@ struct SidebarView: View {
                             selected: model.selectedMailboxID,
                             selection: model.mailboxSelection,
                             mailboxIsDeletablyEmpty: { model.mailboxIsDeletablyEmpty($0) },
-                            onDeleteMailbox: { model.deleteMailbox($0) })
+                            onDeleteMailbox: { model.deleteMailbox($0) },
+                            folderIsDeletablyEmpty: { model.folderIsDeletablyEmpty($0) },
+                            onDeleteFolder: { model.deleteFolder($0) },
+                            canMove: { model.canMove($0, up: $1) },
+                            onMove: { model.moveTreeItem($0, up: $1) })
                     .equatable()
             }
         }
@@ -300,12 +304,16 @@ struct MailboxTree: View, Equatable {
     let selected: MailboxItem.ID?
     let selection: Binding<MailboxItem.ID?>
 
-    /// Live emptiness check and the delete action, queried only when a row's
-    /// context menu is actually opened. Closures rather than the model itself,
-    /// so this view stays insulated from `AppModel`'s publishes (the whole
-    /// point of its `Equatable` — see the type comment). Excluded from `==`.
+    /// Live checks and actions, queried only when a row's context menu is
+    /// actually opened. Closures rather than the model itself, so this view stays
+    /// insulated from `AppModel`'s publishes (the whole point of its `Equatable`
+    /// — see the type comment). Excluded from `==`.
     let mailboxIsDeletablyEmpty: (MailboxItem.ID) -> Bool
     let onDeleteMailbox: (MailboxItem.ID) -> Void
+    let folderIsDeletablyEmpty: (MailboxItem.ID) -> Bool
+    let onDeleteFolder: (MailboxItem.ID) -> Void
+    let canMove: (MailboxItem.ID, _ up: Bool) -> Bool
+    let onMove: (MailboxItem.ID, _ up: Bool) -> Void
 
     static func == (a: MailboxTree, b: MailboxTree) -> Bool {
         a.treeVersion == b.treeVersion && a.selected == b.selected
@@ -330,20 +338,41 @@ struct MailboxTree: View, Equatable {
         }
     }
 
-    /// Eudora 7's behaviour: Delete only for an *empty* mailbox; a non-empty
-    /// one shows the item greyed out, labelled with the reason. System
-    /// mailboxes (In/Out/Junk/Trash) and folders get no menu at all — an empty
-    /// `@ViewBuilder` result means no menu appears.
+    /// A regular mailbox or a folder gets Move Up / Move Down (within its group)
+    /// and Delete (only when empty; a non-empty item shows the reason, greyed).
+    /// System mailboxes (In/Out/Junk/Trash) get no menu at all — an empty
+    /// `@ViewBuilder` result means none appears.
+    ///
+    /// Kept to flat items on purpose: no submenu that walks the tree (see the
+    /// note at the call site). The `canMove`/emptiness closures run only on the
+    /// right-click that opens this menu, so this stays cheap.
     @ViewBuilder
     private func contextMenu(for item: MailboxItem) -> some View {
-        if item.type == .mailbox && !item.isFolder {
+        if item.isFolder {
+            moveItems(for: item)
+            Divider()
+            if folderIsDeletablyEmpty(item.id) {
+                Button("Delete") { onDeleteFolder(item.id) }
+            } else {
+                Button("Delete (not empty)") {}.disabled(true)
+            }
+        } else if item.type == .mailbox {
+            moveItems(for: item)
+            Divider()
             if mailboxIsDeletablyEmpty(item.id) {
                 Button("Delete") { onDeleteMailbox(item.id) }
             } else {
-                Button("Delete (not empty)") {}
-                    .disabled(true)
+                Button("Delete (not empty)") {}.disabled(true)
             }
         }
+    }
+
+    @ViewBuilder
+    private func moveItems(for item: MailboxItem) -> some View {
+        Button("Move Up") { onMove(item.id, true) }
+            .disabled(!canMove(item.id, true))
+        Button("Move Down") { onMove(item.id, false) }
+            .disabled(!canMove(item.id, false))
     }
 }
 
