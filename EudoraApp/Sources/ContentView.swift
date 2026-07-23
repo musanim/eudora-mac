@@ -605,16 +605,16 @@ enum RowIcon {
 
 /// The message list's row height, forced onto the underlying `NSTableView`.
 ///
-/// SwiftUI's `Table` gives every row a fixed 24 pt on macOS and offers no API to
-/// change it, so the only lever is the AppKit `rowHeight`, set (and re-asserted)
-/// by `TableScrollStateSyncer`. The Arial-13 text line box is ~15 pt, so this
-/// can't go much below ~16 without clipping; 20 is the original 24 less the four
-/// points Stephen asked to trim (one pixel, then another, top and bottom).
+/// SwiftUI's `Table` gives every row a self-sizing ~25 pt on macOS and offers no
+/// API to change it, so the only lever is the AppKit `rowHeight` (with automatic
+/// row heights turned off), set and re-asserted by `TableScrollStateSyncer`. The
+/// Arial-13 text line box is ~15 pt, so this can't go much below ~16 without
+/// clipping; 18 is where Stephen tuned it down from the original ~25.
 ///
 /// The scroll bridge reads `rowHeight` live for its step arithmetic, so changing
 /// it here stays consistent with `rect(ofRow:)` and the wheel math.
 enum MessageRowMetrics {
-    static let rowHeight: CGFloat = 20
+    static let rowHeight: CGFloat = 18
 }
 
 /// One-shot readout of the message list's real row geometry.
