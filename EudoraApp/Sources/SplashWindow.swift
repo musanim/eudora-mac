@@ -211,26 +211,37 @@ enum SplashWindow {
 struct MainWindowAccessor: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
 
-    /// Takes ⌘W away from the main window. Only ⌘Q ends the app.
+    /// Makes the main window's close button quit the app.
     ///
-    /// Dropping `.closable` rather than vetoing the close in a delegate. A veto
-    /// leaves a fully live-looking close button that silently does nothing;
-    /// without the trait AppKit draws it dimmed and disables File ▸ Close by
-    /// itself, so both the button and the menu state the situation rather than
-    /// lying about it. (The button is dimmed, not absent — the three traffic
-    /// lights are still drawn.)
+    /// The button is live again (the `.closable` trait it was born with is left
+    /// in place, so the red light isn't dimmed), but every route that would
+    /// *close* the window — the button, ⌘W, File ▸ Close — is redirected to
+    /// `NSApp.terminate`. Closing the mailbox list makes no sense on its own, so
+    /// it means Quit; and routing through `terminate` means it goes past the
+    /// unsaved-compose-windows review like any other Quit. Non-standard, but
+    /// deliberate.
+    ///
+    /// A `windowShouldClose` delegate, not a dropped trait: the trait would grey
+    /// the button out, and we want it to look and act like a real button that
+    /// happens to quit. The proxy forwards every other delegate message to
+    /// SwiftUI's own delegate, the same pattern `WindowCloseGuard` uses.
     ///
     /// Only this window. `MainWindowAccessor` is attached to `ContentView`
-    /// alone, so compose and Find windows keep ⌘W — which is the point: closing
-    /// an editor is routine, closing the mailbox list is not something you ever
-    /// mean to do.
-    ///
-    /// Guarded on the live value because this runs on every `updateNSView`, and
-    /// assigning `styleMask` forces a titlebar rebuild — doing that on every
-    /// published model change would be visible.
-    static func makeUnclosable(_ window: NSWindow) {
-        guard window.styleMask.contains(.closable) else { return }
-        window.styleMask.remove(.closable)
+    /// alone; compose and Find windows keep ordinary close behaviour.
+    private func installCloseToQuit(_ window: NSWindow, coordinator: Coordinator) {
+        if let proxy = coordinator.closeProxy {
+            // SwiftUI reassigns the delegate on some scene updates; re-take the
+            // slot if it did, so the redirect can't silently fall off.
+            if window.delegate !== proxy {
+                proxy.original = window.delegate
+                window.delegate = proxy
+            }
+            return
+        }
+        let proxy = CloseToQuitProxy()
+        proxy.original = window.delegate
+        window.delegate = proxy
+        coordinator.closeProxy = proxy
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
@@ -250,7 +261,7 @@ struct MainWindowAccessor: NSViewRepresentable {
 
     private func attach(_ window: NSWindow, context: Context) {
         SplashWindow.mainWindowDidAppear(window)
-        Self.makeUnclosable(window)
+        installCloseToQuit(window, coordinator: context.coordinator)
 
         guard context.coordinator.observers.isEmpty else { return }
         for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification] {
@@ -268,6 +279,37 @@ struct MainWindowAccessor: NSViewRepresentable {
 
     final class Coordinator: @unchecked Sendable {
         var observers: [NSObjectProtocol] = []
+        var closeProxy: CloseToQuitProxy?
         deinit { observers.forEach(NotificationCenter.default.removeObserver) }
+    }
+}
+
+/// Redirects a window's close to `NSApp.terminate`, forwarding every other
+/// delegate message to the delegate that was there before.
+///
+/// `windowShouldClose` returns false — the window never closes on its own; the
+/// terminate either takes the whole app down or is cancelled by the unsaved-
+/// changes review, in which case the window rightly stays. See
+/// `MainWindowAccessor.installCloseToQuit`.
+final class CloseToQuitProxy: NSObject, NSWindowDelegate {
+    /// Strong, deliberately — the same reasoning as `WindowCloseGuard.CloseProxy`:
+    /// `NSWindow.delegate` is a weak reference, so once this proxy takes the slot
+    /// nothing else retains SwiftUI's delegate, and a forwarded message would
+    /// vanish if it deallocated.
+    var original: NSWindowDelegate?
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        NSApp.terminate(nil)
+        return false
+    }
+
+    override func responds(to aSelector: Selector!) -> Bool {
+        if aSelector == #selector(NSWindowDelegate.windowShouldClose(_:)) { return true }
+        return super.responds(to: aSelector) || (original?.responds(to: aSelector) ?? false)
+    }
+
+    override func forwardingTarget(for aSelector: Selector!) -> Any? {
+        if original?.responds(to: aSelector) == true { return original }
+        return super.forwardingTarget(for: aSelector)
     }
 }

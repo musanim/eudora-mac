@@ -108,6 +108,13 @@ struct ComposeView: View {
             if isDirty { showingSavePrompt = true; return false }
             return true
         }, handle: windowHandle))
+        // Keep the model's copy of this window's live content and dirty state
+        // current, so a Quit can review (and save) unsaved edits even though the
+        // save prompt itself lives in this SwiftUI view. One snapshot covers
+        // every field the review cares about; `reviewSnapshot` folds them so a
+        // single `onChange` fires for any of them. See `AppModel.reviewComposeBeforeQuit`.
+        .onAppear { pushReview() }
+        .onChange(of: reviewSnapshot) { _ in pushReview() }
         .onDisappear { model.closeDraft(draftID) }
         .confirmationDialog("Save changes to this message?",
                             isPresented: $showingSavePrompt) {
@@ -299,6 +306,26 @@ struct ComposeView: View {
         current.body = content.plainText
         current.styledBody = content.isStyled ? content : nil
         return current
+    }
+
+    /// Everything the Quit review needs to know about this window, folded into
+    /// one `Equatable` value so a single `onChange` catches any change — a field
+    /// edit, a body edit, or `isDirty` flipping after a save.
+    private struct ReviewSnapshot: Equatable {
+        var to: String, cc: String, bcc: String, subject: String
+        var content: RichText
+        var isDirty: Bool
+    }
+
+    private var reviewSnapshot: ReviewSnapshot {
+        ReviewSnapshot(to: to, cc: cc, bcc: bcc, subject: subject,
+                       content: editor.content, isDirty: isDirty)
+    }
+
+    /// Push this window's live content and dirty state into the model, so a Quit
+    /// can save or discard it. See `AppModel.reviewComposeBeforeQuit`.
+    private func pushReview() {
+        model.noteComposeLiveState(currentDraft(), isDirty: isDirty)
     }
 
     /// Write the current fields into the draft's record in Out, still unsent.

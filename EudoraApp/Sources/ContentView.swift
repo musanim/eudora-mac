@@ -175,6 +175,11 @@ struct ContentView: View {
             // value forward rather than opening a second, which is what makes
             // double-clicking an already-open draft focus it.
             model.presentDraftWindow = { openWindow(id: ComposeWindow.groupID, value: $0) }
+            // Route the app-terminate decision through the model, so Quit by any
+            // route asks about unsaved compose windows first. Set here because
+            // this is where the model is in hand; the closure is main-actor work
+            // behind a plain closure type, as `AppDelegate.onQuit` documents.
+            AppDelegate.shared?.onQuit = { model.reviewComposeBeforeQuit() }
             // Splash first — the main window exists by now, so it can be
             // centered over it, and the run loop is running, so it paints.
             SplashWindow.show()

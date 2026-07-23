@@ -1639,6 +1639,102 @@ final class AppModel: ObservableObject {
     /// session ends.
     func closeDraft(_ id: ComposeDraft.ID) {
         openDrafts.removeValue(forKey: id)
+        composeLiveState.removeValue(forKey: id)
+    }
+
+    // MARK: - unsaved-changes review on Quit
+
+    /// Each open compose window's live content and whether it has unsaved edits.
+    ///
+    /// **Deliberately not `@Published`.** `ComposeView` pushes here on every
+    /// keystroke so a Quit can save the *current* text, and republishing that
+    /// would re-render everything observing the model on every character typed
+    /// in a compose window. The quit review is the only reader, and it runs on
+    /// the main thread like every writer, so a plain dictionary is right.
+    private var composeLiveState: [ComposeDraft.ID: (draft: ComposeDraft, isDirty: Bool)] = [:]
+
+    /// `ComposeView` reporting its live state. See `composeLiveState`.
+    func noteComposeLiveState(_ draft: ComposeDraft, isDirty: Bool) {
+        composeLiveState[draft.id] = (draft, isDirty)
+    }
+
+    /// Ask about every compose window with unsaved edits before the app quits,
+    /// and say whether the quit may proceed.
+    ///
+    /// Run synchronously from `applicationShouldTerminate` (via the closure
+    /// `AppDelegate.onQuit`), which is why it uses modal `NSAlert`s rather than
+    /// SwiftUI dialogs: it has to return a verdict on the same call, and
+    /// `runModal()` gives that while the compose windows' own SwiftUI Save prompt
+    /// couldn't. Each dirty window is brought to the front so the prompt names
+    /// the message it's about.
+    ///
+    /// The three answers mirror the compose window's own Close prompt: Save
+    /// writes the live content to Out, Discard Changes drops them (removing a
+    /// never-saved shell, or reverting to the last saved version), Cancel stops
+    /// the quit outright.
+    @MainActor
+    func reviewComposeBeforeQuit() -> NSApplication.TerminateReply {
+        // A stable order so the prompts don't jump around between runs.
+        let dirtyIDs = composeLiveState
+            .filter { $0.value.isDirty }
+            .keys
+            .sorted { ($0.uuidString) < ($1.uuidString) }
+        guard !dirtyIDs.isEmpty else { return .terminateNow }
+
+        for id in dirtyIDs {
+            guard let state = composeLiveState[id] else { continue }
+            presentDraftWindow?(id)
+
+            let subject = state.draft.subject.trimmingCharacters(in: .whitespaces)
+            let alert = NSAlert()
+            alert.messageText = "Save changes to \u{201C}"
+                + (subject.isEmpty ? "New Message" : subject) + "\u{201D} before quitting?"
+            alert.informativeText = "If you don\u{2019}t save, your changes will be lost."
+            alert.addButton(withTitle: "Save")             // .alertFirstButtonReturn
+            alert.addButton(withTitle: "Cancel")            // .alertSecondButtonReturn
+            alert.addButton(withTitle: "Discard Changes")   // .alertThirdButtonReturn
+
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                do {
+                    try saveComposeLive(id)
+                } catch {
+                    let fail = NSAlert()
+                    fail.messageText = "Couldn\u{2019}t save this message."
+                    fail.informativeText = describe(error)
+                    fail.addButton(withTitle: "OK")
+                    fail.runModal()
+                    // Don't quit over a message that couldn't be saved — the
+                    // user would lose it with no way back.
+                    return .terminateCancel
+                }
+            case .alertThirdButtonReturn:
+                discardComposeChanges(id)
+            default:
+                return .terminateCancel
+            }
+        }
+        return .terminateNow
+    }
+
+    /// Save a compose window's live content to Out, refreshing the record's
+    /// location from the model first (as `ComposeView.currentDraft` does, and
+    /// for the same reason: an earlier save may have moved it).
+    private func saveComposeLive(_ id: ComposeDraft.ID) throws {
+        guard var draft = composeLiveState[id]?.draft else { return }
+        if let live = openDrafts[id] { draft.outOffset = live.outOffset }
+        let saved = try saveDraft(draft)
+        composeLiveState[id] = (saved, false)
+    }
+
+    /// Drop a compose window's unsaved edits, mirroring the Close prompt's
+    /// Don't Save: a never-saved draft's record is the empty shell written on
+    /// open, so it goes; a saved one reverts to its last saved version, which is
+    /// already what sits in Out.
+    private func discardComposeChanges(_ id: ComposeDraft.ID) {
+        guard let state = composeLiveState[id] else { return }
+        if !state.draft.hasBeenSaved { discardDraft(state.draft) }
+        composeLiveState[id] = (state.draft, false)
     }
 
     /// Fold a window's edits back into the model's copy.

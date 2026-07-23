@@ -6,6 +6,10 @@ struct EudoraApp: App {
     @StateObject private var model = AppModel()
     @StateObject private var accounts = AccountStore()
     @StateObject private var composeSettings = ComposeSettings()
+    // The delegate exists for one thing: `applicationShouldTerminate`, so Quit
+    // by *any* route (⌘Q, the Apple menu, the Dock, the main window's close
+    // button) reviews unsaved compose windows first. See `AppDelegate`.
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.openWindow) private var openWindow
 
     /// Arms the splash before SwiftUI builds its scenes, so the main window can
@@ -181,6 +185,37 @@ struct EudoraApp: App {
                 .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(!deleteCommandEnabled)
         }
+    }
+}
+
+/// The one reason this app has an application delegate: to review unsaved
+/// compose windows before the app quits.
+///
+/// `applicationShouldTerminate` is the only hook that catches Quit by every
+/// route — ⌘Q, the Apple and Dock menus, and (because the main window's close
+/// button is wired to `NSApp.terminate`) the red button too. It defers the whole
+/// decision to `onQuit`, a closure `ContentView` points at the model's review;
+/// the closure is a plain (non-isolated) type on purpose, matching
+/// `WindowCloseGuard.shouldClose` — it runs on the main thread, but
+/// `applicationShouldTerminate` is a nonisolated requirement a `@MainActor`
+/// method can't satisfy directly.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Set once the delegate exists, so `ContentView` — which has the model —
+    /// can install the review closure.
+    static weak var shared: AppDelegate?
+
+    /// Whether Quit may proceed. Replaced by `ContentView.onAppear` with the
+    /// model's review; until then, and if there's nothing to review, quitting is
+    /// unobstructed.
+    var onQuit: () -> NSApplication.TerminateReply = { .terminateNow }
+
+    override init() {
+        super.init()
+        Self.shared = self
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        onQuit()
     }
 }
 
