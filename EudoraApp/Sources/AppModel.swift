@@ -722,7 +722,11 @@ final class AppModel: ObservableObject {
         store = s
         rootURL = url
         let nodes = s.tree()
-        tree = Self.buildItems(nodes, prefix: "")
+        // Scanned inline here — this is the initial open, so the badge is right
+        // from the first paint (a launch with unsent mail already shows it), and
+        // Out is always small enough that the extra TOC read costs nothing.
+        tree = Self.buildItems(nodes, prefix: "",
+                               outboxUnsent: Self.outboxHasUnsent(in: nodes, store: s))
         treeVersion &+= 1
         itemsByID = [:]
         indexItems(tree)
