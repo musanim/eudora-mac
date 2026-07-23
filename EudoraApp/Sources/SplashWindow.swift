@@ -75,7 +75,12 @@ enum SplashWindow {
     /// Puts the splash on screen immediately. Safe to call more than once.
     static func show() {
         guard enabled, !hasRun else { return }
-        guard window == nil, let art = NSImage(named: "EudoraSplash8") else { return }
+        // Loaded as a loose bundle resource (see `project.yml`), not from the
+        // asset catalog: the source PNG in `assets/` is copied straight into the
+        // bundle, so there is one file and no imageset copy to drift out of sync.
+        guard window == nil,
+              let url = Bundle.main.url(forResource: "EudoraSplash8", withExtension: "png"),
+              let art = NSImage(contentsOf: url) else { return }
 
         let size = art.size
         let panel = NSWindow(contentRect: NSRect(origin: .zero, size: size),
@@ -99,8 +104,8 @@ enum SplashWindow {
         imageView.imageScaling = .scaleNone
         imageView.autoresizingMask = [.width, .height]
         // The art is 1x only, so a Retina display upscales it 2x. Nearest-
-        // neighbour keeps Eudora's pixels crisp instead of blurring them; a 2x
-        // entry in the imageset would be sharper still, if one can be had.
+        // neighbour keeps Eudora's pixels crisp instead of blurring them; a
+        // dedicated 2x image would be sharper still, if one can be had.
         imageView.wantsLayer = true
         imageView.layer?.magnificationFilter = .nearest
         panel.contentView = imageView

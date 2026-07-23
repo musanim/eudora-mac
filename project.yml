@@ -33,6 +33,12 @@ targets:
       # Asset catalog: the Eudora 7 column-header icons (ColumnStatus,
       # ColumnAttachment). Adding files here needs `xcodegen generate`.
       - path: EudoraApp/Resources
+      # The launch splash, copied straight into the bundle from its source in
+      # `assets/` — the single source of truth. `SplashWindow` loads it by URL
+      # (Bundle.main.url), so there is no imageset copy to keep in sync. Edit
+      # `assets/EudoraSplash8.png` and rebuild; no re-sync, no `xcodegen`.
+      - path: assets/EudoraSplash8.png
+        buildPhase: resources
     dependencies:
       - package: EudoraMac
         product: EudoraStore
