@@ -1296,6 +1296,10 @@ struct TableScrollStateSyncer: NSViewRepresentable {
     final class Coordinator: @unchecked Sendable {
         weak var table: NSTableView?
         var observer: NSObjectProtocol?
+        /// KVO pins that keep the forced row height in place against SwiftUI's
+        /// resets — see `pinRowHeight`. Invalidated automatically when this
+        /// coordinator (and so the array) deallocates, or replaced on re-attach.
+        var rowHeightObservers: [NSKeyValueObservation] = []
         var scrollMonitor: Any?
         /// Leftover trackpad delta below one row's worth, carried to the next
         /// event so slow scrolling still advances instead of rounding to nothing
@@ -1329,18 +1333,11 @@ struct TableScrollStateSyncer: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {
         let coordinator = context.coordinator
-        // Re-assert the row height *synchronously*, in this same update pass,
-        // before the screen refreshes — SwiftUI resets the table to its 24 pt
-        // automatic height on any update (a selection change included), and doing
-        // this from the async block below let one padded frame paint before the
-        // override landed, which read as a flicker on every selection. Only when
-        // the table is already found; the first attach still happens async.
-        if let table = coordinator.table { Self.enforceRowHeight(table) }
         DispatchQueue.main.async {
             attach(near: nsView, coordinator: coordinator, attemptsLeft: 5)
-            // Backstop for the async paths: the first attach (when the table
-            // wasn't found yet above) and any relayout SwiftUI schedules after
-            // this pass.
+            // Backstop only. The row height is really held by the KVO pins set
+            // up in `attach` (see `pinRowHeight`), which catch SwiftUI's reset
+            // synchronously; this re-enforce is here in case those ever miss.
             if let table = coordinator.table { Self.enforceRowHeight(table) }
             applyPendingScroll(coordinator: coordinator, attemptsLeft: 5)
             applyPendingReveal(coordinator: coordinator, attemptsLeft: 5)
@@ -1358,6 +1355,33 @@ struct TableScrollStateSyncer: NSViewRepresentable {
     /// is what every row gets. The content (17 pt glyph slot, ~15 pt text) fits
     /// inside 20 with room, so nothing clips.
     ///
+    /// Keep the forced row height pinned against SwiftUI, without a flash.
+    ///
+    /// SwiftUI re-enables automatic row heights on its updates (a selection
+    /// change included), and correcting that from `updateNSView` — async *or*
+    /// sync — let a padded 24 pt frame paint before the fix landed, the visible
+    /// flicker. KVO catches the reset **synchronously, inside SwiftUI's own
+    /// setter**, so the table never lays out at the wrong height and nothing
+    /// wrong ever reaches the screen.
+    ///
+    /// Both properties are pinned: `usesAutomaticRowHeights` back to false (which
+    /// makes `rowHeight` authoritative) and `rowHeight` back to our value.
+    /// Reentrancy is bounded — assigning re-fires the observer, but the guard
+    /// then sees the value already correct and stops after one hop.
+    static func pinRowHeight(_ table: NSTableView) -> [NSKeyValueObservation] {
+        enforceRowHeight(table)
+        return [
+            table.observe(\.usesAutomaticRowHeights, options: [.new]) { t, _ in
+                if t.usesAutomaticRowHeights { t.usesAutomaticRowHeights = false }
+            },
+            table.observe(\.rowHeight, options: [.new]) { t, _ in
+                if t.rowHeight != MessageRowMetrics.rowHeight {
+                    t.rowHeight = MessageRowMetrics.rowHeight
+                }
+            },
+        ]
+    }
+
     /// Guarded so it only assigns when values differ: each assignment triggers a
     /// relayout, and doing that every pass would be visible. If SwiftUI restores
     /// the defaults on a re-list, the next `updateNSView` puts these back.
@@ -1439,7 +1463,7 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         }
 
         coordinator.table = table
-        Self.enforceRowHeight(table)
+        coordinator.rowHeightObservers = Self.pinRowHeight(table)
         RowDensityProbe.reportOnce(table)
         clipView.postsBoundsChangedNotifications = true
         installScrollMonitor(coordinator: coordinator)
