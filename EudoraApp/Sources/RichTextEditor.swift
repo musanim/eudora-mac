@@ -51,14 +51,17 @@ final class BodyTextView: NSTextView {
 /// the *resolved* font — its PostScript name, family and size — for each
 /// `NSFont`-based body surface, plus a one-time dump of every installed family
 /// whose name contains "arial", so a stray install (e.g. a "Pixel Arial") that
-/// shadows the name can't hide. If "Arial" resolves to `ArialMT` the font is
-/// real Arial and the difference is rendering (antialiasing/hinting); anything
-/// else is a resolution bug.
+/// shadows the name couldn't hide.
 ///
-/// Kept intact but flip `enabled` to false once settled, per CLAUDE.md's
-/// diagnostics convention.
+/// **Finding: no bug.** "Arial" resolved to `ArialMT`, family Arial — the real
+/// system Arial. The apparent difference was purely rendering: un-antialiased
+/// AppKit Arial at a small size has ~1px solid-black stems and looks nothing
+/// like the smoothed Arial in Word/Font Book, which surprised us both. Turning
+/// antialiasing on and adjusting the size resolved it.
+///
+/// Switched off but kept intact, per CLAUDE.md's diagnostics convention.
 enum FontDiagnostics {
-    static let enabled = true
+    static let enabled = false
     private static var dumpedFamilies = false
 
     static func logResolution(of name: String, size: Double, context: String) {
