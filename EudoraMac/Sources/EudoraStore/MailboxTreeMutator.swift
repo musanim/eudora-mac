@@ -254,6 +254,83 @@ public enum MailboxTreeMutator {
         return parts.count >= 2 ? parts[1] : nil
     }
 
+    // MARK: renaming
+
+    public enum RenameError: LocalizedError, Equatable {
+        /// No descmap.pce, or no line in it names this file.
+        case notFound
+        case emptyName
+        /// Same rule as create: a comma (descmap is unquoted CSV), a character
+        /// no filename can hold, or one outside Latin-1.
+        case invalidName
+        /// Another entry at this level already uses this name (case-insensitive,
+        /// by display or filename stem). Carries the existing name, in its case.
+        case duplicate(String)
+        case ioError(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .notFound:         return "that item isn't in the folder's index"
+            case .emptyName:        return "the name can't be empty"
+            case .invalidName:      return "the name can't contain , / \\ : * ? \" < > | or characters outside Latin-1"
+            case .duplicate(let d): return "\u{201C}\(d)\u{201D} already exists here"
+            case .ioError(let m):   return m
+            }
+        }
+    }
+
+    /// Rename the *display name* of the descmap line `directory`'s descmap lists
+    /// under `filename` — the first, comma-delimited field — leaving the
+    /// physical `.mbx`/`.fol` filename (and therefore the item's id and every
+    /// descendant's) untouched. Real Eudora reads the display name from this
+    /// same field, so both apps show the new name; the file keeping its old name
+    /// is invisible in either UI, and stability of the id is worth far more than
+    /// cosmetic filename agreement (an id change would break selection, saved
+    /// column/scroll state, and — for a folder — every descendant id at once).
+    ///
+    /// The edit is byte-level: only field 1's bytes are replaced, so the
+    /// filename, type, unread flag, terminator, and every other line survive
+    /// exactly. Validation and the case-insensitive duplicate check mirror
+    /// `create`, the renamed entry itself excepted.
+    public static func rename(directory: URL, filename: String, to newName: String) throws {
+        let trimmed = newName.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { throw RenameError.emptyName }
+        guard trimmed.rangeOfCharacter(from: bannedNameCharacters) == nil,
+              let newDisplay = trimmed.data(using: .isoLatin1) else {
+            throw RenameError.invalidName
+        }
+
+        // Duplicates at this level, excluding the entry being renamed — so a
+        // no-op rename (or a case-only change of its own name) is allowed.
+        let lower = trimmed.lowercased()
+        for e in DescMap.read(directory: directory) where e.filename != filename {
+            let stem = (e.filename as NSString).deletingPathExtension
+            if e.display.lowercased() == lower || stem.lowercased() == lower {
+                throw RenameError.duplicate(e.display)
+            }
+        }
+
+        let descURL = directory.appendingPathComponent("descmap.pce")
+        guard let data = try? Data(contentsOf: descURL),
+              let line = lineRange(of: filename, in: data) else { throw RenameError.notFound }
+
+        // Field 1 (display) runs from the line's start to its first comma; the
+        // display name can't hold a comma (banned above and at create), so the
+        // first comma in the line is unambiguously the field separator.
+        var comma = line.range.lowerBound
+        while comma < line.range.upperBound, data[comma] != 0x2C {
+            comma = data.index(after: comma)
+        }
+        guard comma < line.range.upperBound else { throw RenameError.notFound }
+
+        var out = data
+        out.replaceSubrange(line.range.lowerBound..<comma, with: newDisplay)
+        do {
+            try MailboxIO.backupOnce(descURL)
+            try MailboxIO.atomicWrite(out, to: descURL)
+        } catch { throw RenameError.ioError(error.localizedDescription) }
+    }
+
     // MARK: creating
 
     public enum CreateError: LocalizedError, Equatable {

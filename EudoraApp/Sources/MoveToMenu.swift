@@ -275,6 +275,32 @@ enum NewMailboxDialog {
     }
 }
 
+/// The rename prompt: an NSAlert prefilled with the current display name, its
+/// text selected so a rename is one gesture (type, Return). Like
+/// `NewMailboxDialog`, it's a modal run from a menu action — outside any SwiftUI
+/// update pass — and returns the name untrimmed and unvalidated;
+/// `MailboxTreeMutator.rename` owns the rules and its errors carry the reason.
+@MainActor
+enum RenameDialog {
+    static func run(currentName: String, isFolder: Bool) -> String? {
+        let kind = isFolder ? "folder" : "mailbox"
+        let alert = NSAlert()
+        alert.messageText = "Rename \(kind.capitalized)"
+        alert.informativeText = "New name for the \(kind) \u{201C}\(currentName)\u{201D}:"
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 230, height: 24))
+        field.stringValue = currentName
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        field.selectText(nil)   // whole name selected: typing replaces it
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return field.stringValue
+    }
+}
+
 /// An empty `NSView` that exists only to give the menu somewhere to hang from.
 private final class MenuAnchorView: NSView {
     /// See the positioning note in `MoveToMenuController.popUp`.

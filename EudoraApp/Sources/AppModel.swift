@@ -2757,6 +2757,29 @@ final class AppModel: ObservableObject {
         reloadTree()
     }
 
+    /// Sidebar right-click ▸ Rename. Prompts for a new *display* name and
+    /// rewrites the descmap line's first field; the physical `.mbx`/`.fol`
+    /// filename — and therefore this id and every descendant id — is left
+    /// untouched, so selection, saved view state, and folder children all
+    /// survive the rename with no id churn. System mailboxes are refused: their
+    /// role is resolved from the display name ("In"→inbox), so renaming one
+    /// would demote it to an ordinary mailbox.
+    func renameTreeItem(_ id: MailboxItem.ID) {
+        guard let item = itemsByID[id], item.isFolder || item.type == .mailbox else { return }
+        guard let newName = RenameDialog.run(currentName: item.display,
+                                             isFolder: item.isFolder) else { return }
+        let filename = descmapFilename(of: id)
+        do {
+            try MailboxTreeMutator.rename(directory: item.base.deletingLastPathComponent(),
+                                          filename: filename, to: newName)
+        } catch {
+            showError("Couldn't rename \u{201C}\(item.display)\u{201D}: "
+                + error.localizedDescription)
+            return
+        }
+        reloadTree()
+    }
+
     /// The descmap filename (second field, extension included) for a tree id —
     /// its last path component, since `buildItems` joins ids from exactly those.
     private func descmapFilename(of id: MailboxItem.ID) -> String {

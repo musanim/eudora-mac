@@ -273,7 +273,8 @@ struct SidebarView: View {
                             folderIsDeletablyEmpty: { model.folderIsDeletablyEmpty($0) },
                             onDeleteFolder: { model.deleteFolder($0) },
                             canMove: { model.canMove($0, up: $1) },
-                            onMove: { model.moveTreeItem($0, up: $1) })
+                            onMove: { model.moveTreeItem($0, up: $1) },
+                            onRename: { model.renameTreeItem($0) })
                     .equatable()
             }
         }
@@ -314,6 +315,7 @@ struct MailboxTree: View, Equatable {
     let onDeleteFolder: (MailboxItem.ID) -> Void
     let canMove: (MailboxItem.ID, _ up: Bool) -> Bool
     let onMove: (MailboxItem.ID, _ up: Bool) -> Void
+    let onRename: (MailboxItem.ID) -> Void
 
     static func == (a: MailboxTree, b: MailboxTree) -> Bool {
         a.treeVersion == b.treeVersion && a.selected == b.selected
@@ -349,6 +351,8 @@ struct MailboxTree: View, Equatable {
     @ViewBuilder
     private func contextMenu(for item: MailboxItem) -> some View {
         if item.isFolder {
+            Button("Rename…") { onRename(item.id) }
+            Divider()
             moveItems(for: item)
             Divider()
             if folderIsDeletablyEmpty(item.id) {
@@ -357,6 +361,8 @@ struct MailboxTree: View, Equatable {
                 Button("Delete (not empty)") {}.disabled(true)
             }
         } else if item.type == .mailbox {
+            Button("Rename…") { onRename(item.id) }
+            Divider()
             moveItems(for: item)
             Divider()
             if mailboxIsDeletablyEmpty(item.id) {

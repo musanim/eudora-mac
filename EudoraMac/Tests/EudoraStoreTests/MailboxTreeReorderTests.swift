@@ -97,6 +97,85 @@ final class MailboxTreeReorderTests: XCTestCase {
         XCTAssertEqual(text, "Bbb,Bbb.mbx,M,N\r\n\r\nAaa,Aaa.mbx,M,N\r\n")
     }
 
+    // MARK: rename
+
+    private func displays() -> [String] { DescMap.read(directory: dir).map(\.display) }
+
+    func testRenameChangesDisplayKeepsEverythingElse() throws {
+        try writeDescmap(sample)
+        try MailboxTreeMutator.rename(directory: dir, filename: "Aaa.mbx", to: "Alpha")
+        // Display changes; filename, order, and the rest of the file do not.
+        XCTAssertEqual(displays(), ["In", "Out", "Alpha", "Bbb", "Proj"])
+        XCTAssertEqual(order(), ["In.mbx", "Out.mbx", "Aaa.mbx", "Bbb.mbx", "Proj.fol"])
+        let text = String(data: try Data(contentsOf: dir.appendingPathComponent("descmap.pce")),
+                          encoding: .isoLatin1)
+        XCTAssertEqual(text,
+            "In,In.mbx,S,N\r\nOut,Out.mbx,S,N\r\nAlpha,Aaa.mbx,M,N\r\nBbb,Bbb.mbx,M,N\r\nProj,Proj.fol,F,N\r\n")
+    }
+
+    func testRenameFolder() throws {
+        try writeDescmap("Aaa,Aaa.mbx,M,N\r\nP,P.fol,F,N\r\n")
+        try MailboxTreeMutator.rename(directory: dir, filename: "P.fol", to: "Projects")
+        XCTAssertEqual(displays(), ["Aaa", "Projects"])
+        XCTAssertEqual(order(), ["Aaa.mbx", "P.fol"])   // filename unchanged
+    }
+
+    func testRenameRefusesDuplicateDisplay() throws {
+        try writeDescmap(sample)
+        XCTAssertThrowsError(try MailboxTreeMutator.rename(
+            directory: dir, filename: "Aaa.mbx", to: "Bbb")) {
+            XCTAssertEqual($0 as? MailboxTreeMutator.RenameError, .duplicate("Bbb"))
+        }
+        XCTAssertEqual(displays(), ["In", "Out", "Aaa", "Bbb", "Proj"])
+    }
+
+    func testRenameRefusesDuplicateFilenameStem() throws {
+        // New name collides with another entry's filename stem, even though no
+        // display name matches — create guards this too.
+        try writeDescmap("Aaa,Aaa.mbx,M,N\r\nShown,Bbb.mbx,M,N\r\n")
+        XCTAssertThrowsError(try MailboxTreeMutator.rename(
+            directory: dir, filename: "Aaa.mbx", to: "Bbb")) {
+            XCTAssertEqual($0 as? MailboxTreeMutator.RenameError, .duplicate("Shown"))
+        }
+    }
+
+    func testRenameToOwnCaseChangeAllowed() throws {
+        try writeDescmap(sample)
+        try MailboxTreeMutator.rename(directory: dir, filename: "Aaa.mbx", to: "AAA")
+        XCTAssertEqual(displays(), ["In", "Out", "AAA", "Bbb", "Proj"])
+    }
+
+    func testRenameRejectsCommaAndEmpty() throws {
+        try writeDescmap(sample)
+        XCTAssertThrowsError(try MailboxTreeMutator.rename(
+            directory: dir, filename: "Aaa.mbx", to: "A,B")) {
+            XCTAssertEqual($0 as? MailboxTreeMutator.RenameError, .invalidName)
+        }
+        XCTAssertThrowsError(try MailboxTreeMutator.rename(
+            directory: dir, filename: "Aaa.mbx", to: "   ")) {
+            XCTAssertEqual($0 as? MailboxTreeMutator.RenameError, .emptyName)
+        }
+        XCTAssertEqual(displays(), ["In", "Out", "Aaa", "Bbb", "Proj"])
+    }
+
+    func testRenameUnknownFilename() throws {
+        try writeDescmap(sample)
+        XCTAssertThrowsError(try MailboxTreeMutator.rename(
+            directory: dir, filename: "Nope.mbx", to: "X")) {
+            XCTAssertEqual($0 as? MailboxTreeMutator.RenameError, .notFound)
+        }
+    }
+
+    /// LF-only file, unterminated last line: renaming the last entry must not
+    /// disturb the dialect or merge lines.
+    func testRenamePreservesDialect() throws {
+        try writeDescmap("Aaa,Aaa.mbx,M,N\nBbb,Bbb.mbx,M,N")
+        try MailboxTreeMutator.rename(directory: dir, filename: "Bbb.mbx", to: "Beta")
+        let text = String(data: try Data(contentsOf: dir.appendingPathComponent("descmap.pce")),
+                          encoding: .isoLatin1)
+        XCTAssertEqual(text, "Aaa,Aaa.mbx,M,N\nBeta,Bbb.mbx,M,N")
+    }
+
     // MARK: folder delete
 
     private func makeFolder(_ filename: String, contents: [(String, Data)] = []) throws -> URL {
