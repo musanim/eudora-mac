@@ -199,6 +199,7 @@ struct PlainMailView: NSViewRepresentable {
     let antialias: Bool
 
     func makeNSView(context: Context) -> NSScrollView {
+        FontDiagnostics.logResolution(of: fontName, size: fontSize, context: "plain-text reader")
         let textView = BodyTextView(frame: NSRect(x: 0, y: 0, width: 300, height: 200))
         textView.isEditable = false
         textView.isSelectable = true

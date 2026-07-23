@@ -42,6 +42,50 @@ final class BodyTextView: NSTextView {
     }
 }
 
+// MARK: - font diagnostics
+
+/// Reports what the Default font name actually resolves to.
+///
+/// Investigation (2026-07): the Default font is set to "Arial", but the on-
+/// screen glyphs didn't look like the system Arial in Word/Font Book. This logs
+/// the *resolved* font — its PostScript name, family and size — for each
+/// `NSFont`-based body surface, plus a one-time dump of every installed family
+/// whose name contains "arial", so a stray install (e.g. a "Pixel Arial") that
+/// shadows the name can't hide. If "Arial" resolves to `ArialMT` the font is
+/// real Arial and the difference is rendering (antialiasing/hinting); anything
+/// else is a resolution bug.
+///
+/// Kept intact but flip `enabled` to false once settled, per CLAUDE.md's
+/// diagnostics convention.
+enum FontDiagnostics {
+    static let enabled = true
+    private static var dumpedFamilies = false
+
+    static func logResolution(of name: String, size: Double, context: String) {
+        guard enabled else { return }
+        if let font = NSFont(name: name, size: CGFloat(size)) {
+            print("[font] \(context): \"\(name)\" \(size)pt -> \(font.fontName) "
+                + "(family \(font.familyName ?? "?"), \(font.pointSize)pt)")
+        } else {
+            print("[font] \(context): \"\(name)\" \(size)pt did NOT resolve -> fell back to "
+                + NSFont.systemFont(ofSize: CGFloat(size)).fontName)
+        }
+        dumpArialFamiliesOnce()
+    }
+
+    private static func dumpArialFamiliesOnce() {
+        guard !dumpedFamilies else { return }
+        dumpedFamilies = true
+        let manager = NSFontManager.shared
+        for family in manager.availableFontFamilies
+        where family.lowercased().contains("arial") {
+            let members = (manager.availableMembers(ofFontFamily: family) ?? [])
+                .compactMap { $0.first as? String }
+            print("[font] installed family \"\(family)\": \(members)")
+        }
+    }
+}
+
 // MARK: - the controller
 
 /// Mediates between the `NSTextView` and SwiftUI.
@@ -99,6 +143,8 @@ final class RichTextEditorController: NSObject, ObservableObject, NSTextViewDele
     func attach(_ textView: BodyTextView, seed: RichText, defaults: RichTextDefaults) {
         self.textView = textView
         self.defaults = defaults
+        FontDiagnostics.logResolution(of: defaults.family, size: defaults.size,
+                                      context: "compose editor")
         textView.delegate = self
         textView.typingAttributes = [.font: defaultFont, .foregroundColor: NSColor.textColor]
         textView.textStorage?.setAttributedString(
