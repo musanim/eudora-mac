@@ -31,6 +31,11 @@ public struct ListingRow {
     public let priority: String
     public let date: String
     public let size: Int
+    /// Byte offset of this message's record in the `.mbx` (the envelope line
+    /// start). With `size` it locates the record for a later per-message read —
+    /// what the message list's enrichment uses to fetch just the messages it
+    /// needs instead of re-reading the whole file. See `forEachMessageDigest`.
+    public let offset: Int
     public let who: String
     public let subject: String
 }
@@ -190,6 +195,7 @@ public struct MailStore: Sendable {
                                   status: e.status,
                                   priority: String(e.priority),
                                   date: e.date, size: recs[idx - 1].length,
+                                  offset: recs[idx - 1].offset,
                                   who: e.to, subject: e.subject)
             }
             return Listing(name: label, source: source, rows: rows)
@@ -204,6 +210,7 @@ public struct MailStore: Sendable {
                               statusGlyph: "?", status: -1, priority: "-",
                               date: msg.header("Date") ?? "",
                               size: rec.length,
+                              offset: rec.offset,
                               who: msg.header("From") ?? msg.header("To") ?? "",
                               subject: HeaderDecoder.decode(msg.header("Subject") ?? ""))
         }
@@ -257,25 +264,32 @@ public struct MailStore: Sendable {
         }
     }
 
-    /// Like `forEachMessage`, but hands back a `MessageDigest` — the Who/Date
-    /// headers and the attachment flag — instead of a fully parsed `MIMEPart`.
+    /// Hands back a `MessageDigest` — the Who/Date headers and the attachment
+    /// flag — for a known set of records, reading each one directly rather than
+    /// scanning the whole `.mbx`.
     ///
-    /// This is what the message list's background enrichment uses: it avoids the
-    /// full MIME parse (body scan, tree build) for the ~97% of messages that
-    /// don't need it. The file read and record scan are identical to
-    /// `forEachMessage`, and `isCancelled` is consulted the same way.
+    /// This is what the message list's background enrichment uses. The listing
+    /// already found every live message's byte offset (see `ListingRow.offset`),
+    /// so there is no reason to re-read and re-scan the 613 MB file: the mailbox
+    /// is memory-mapped (no eager copy) and each record is sliced out by offset.
+    /// Crucially it is **cancellable between messages** — the old whole-file
+    /// slurp-and-scan couldn't be stopped mid-read, so switching away from a big
+    /// mailbox left the abandoned enrichment holding a thread; this stops at the
+    /// next record. `records` carries `(index, offset, length)` where `index` is
+    /// the row id, `offset` the record's envelope-line start, `length` its size.
     public func forEachMessageDigest(at base: URL,
+                                     records: [(index: Int, offset: Int, length: Int)],
                                      isCancelled: () -> Bool = { false },
                                      body: (_ index: Int, _ digest: MessageDigest) -> Bool) {
         if isCancelled() { return }
-        guard let data = try? Data(contentsOf: mbxURL(base)) else { return }
-        if isCancelled() { return }
-        let bytes = [UInt8](data)
-        let records = Mbox.findRecords(bytes)
-        if isCancelled() { return }
-        for (i, rec) in records.enumerated() {
+        guard let data = try? Data(contentsOf: mbxURL(base), options: .mappedIfSafe) else { return }
+        let total = data.count
+        for r in records {
             if isCancelled() { return }
-            if !body(i + 1, MessageDigest.parse(Mbox.messageBytes(bytes, rec))) { return }
+            let end = r.offset + r.length
+            guard r.offset >= 0, r.length > 0, end <= total else { continue }
+            let record = [UInt8](data[(data.startIndex + r.offset)..<(data.startIndex + end)])
+            if !body(r.index, MessageDigest.parse(Mbox.messageBytes(fromRecord: record))) { return }
         }
     }
 

@@ -253,6 +253,16 @@ struct BuiltListing: Sendable {
     let rows: [MessageRow]
     let source: String
     let summary: String
+    /// Each live message's `(row id, byte offset, length)` in the `.mbx`, so
+    /// enrichment can read messages directly instead of re-scanning the file.
+    let records: [MessageLocation]
+}
+
+/// Where one message lives in the `.mbx`, for the per-message enrichment read.
+struct MessageLocation: Sendable {
+    let index: Int
+    let offset: Int
+    let length: Int
 }
 
 /// How many messages one enrichment batch covers.
@@ -1239,8 +1249,8 @@ final class AppModel: ObservableObject {
             self.isListing = false
             self.isEnriching = false
             completion?()
-            if built != nil {
-                self.startEnrichment(store: store, base: base,
+            if let built {
+                self.startEnrichment(store: store, base: base, records: built.records,
                                      outgoing: outgoing, generation: generation)
             }
         }
@@ -1360,19 +1370,29 @@ final class AppModel: ObservableObject {
                               sortDate: EudoraDateFormat.tocDate(r.date))
         }
         let sizeK = max(1, (rows.reduce(0) { $0 + $1.size } + 1023) / 1024)
+        let records = listing.rows.map {
+            MessageLocation(index: $0.index, offset: $0.offset, length: $0.size)
+        }
         return BuiltListing(rows: rows,
                             source: listing.source.rawValue,
                             summary: "\(rows.count) messages"
                                 + (unread > 0 ? ", \(unread) unread" : "")
-                                + " · \(sizeK)K")
+                                + " · \(sizeK)K",
+                            records: records)
     }
 
     /// Parse the mailbox in the background and fill in Who and the attachment
     /// glyph, applying results in batches so the list settles progressively
     /// rather than in one jump at the end.
-    private func startEnrichment(store: MailStore, base: URL,
+    private func startEnrichment(store: MailStore, base: URL, records: [MessageLocation],
                                  outgoing: Bool, generation: Int) {
         isEnriching = true
+
+        // The listing already located every message; hand the offsets to the
+        // reader as a plain tuple array so it can seek to each without a second
+        // scan of the file. Built here, off the detached task, so `MessageLocation`
+        // stays an app type.
+        let locations = records.map { (index: $0.index, offset: $0.offset, length: $0.length) }
 
         enrichTask = Task { [weak self] in
             // Unbounded on purpose: a buffering policy would silently *drop*
@@ -1383,10 +1403,13 @@ final class AppModel: ObservableObject {
                     var batch: [RowEnrichment] = []
                     // The digest read, not a full parse: Who and Date are single
                     // headers and the attachment flag is settled from the top
-                    // headers for all but genuine multipart mail. See
-                    // `MessageDigest`. This is what took the big-mailbox
-                    // enrichment from ~20s of body-scanning down to a header read.
-                    store.forEachMessageDigest(at: base, isCancelled: { Task.isCancelled }) { index, digest in
+                    // headers for all but genuine multipart mail. And it reads
+                    // each message directly by offset (the memory-mapped file),
+                    // cancellable between messages — so switching away from a big
+                    // mailbox abandons this at once instead of finishing a
+                    // whole-file read. See `MessageDigest` / `forEachMessageDigest`.
+                    store.forEachMessageDigest(at: base, records: locations,
+                                               isCancelled: { Task.isCancelled }) { index, digest in
                         if Task.isCancelled { return false }
                         // Argument order follows RowEnrichment's declaration.
                         batch.append(RowEnrichment(

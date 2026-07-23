@@ -33,9 +33,15 @@ public enum Mbox {
     public static func messageBytes(_ bytes: [UInt8], _ rec: MboxRecord) -> [UInt8] {
         let end = min(rec.offset + rec.length, bytes.count)
         guard rec.offset < end else { return [] }
-        let slice = Array(bytes[rec.offset..<end])
-        if let nl = slice.firstIndex(of: 0x0a) { return Array(slice[(nl + 1)...]) }
-        return slice
+        return messageBytes(fromRecord: Array(bytes[rec.offset..<end]))
+    }
+
+    /// The message bytes for a record already isolated into its own array — the
+    /// same envelope-line strip as above, for callers that read a single record
+    /// directly (by offset) rather than slicing it out of the whole file.
+    public static func messageBytes(fromRecord record: [UInt8]) -> [UInt8] {
+        if let nl = record.firstIndex(of: 0x0a) { return Array(record[(nl + 1)...]) }
+        return record
     }
 
     // MARK: writing
