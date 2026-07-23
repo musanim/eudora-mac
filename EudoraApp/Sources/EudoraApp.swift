@@ -21,6 +21,7 @@ struct EudoraApp: App {
             ContentView()
                 .environmentObject(model)
                 .environmentObject(accounts)
+                .environmentObject(composeSettings)
                 .frame(minWidth: 900, minHeight: 560)
         }
         .commands { eudoraCommands }

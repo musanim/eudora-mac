@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import WebKit
 import EudoraStore
 
@@ -24,6 +25,13 @@ struct HTMLMailView: NSViewRepresentable {
     /// since that is where the eye is when the urge strikes.
     var onForward: () -> Void = {}
 
+    /// The default reading font — the same one the composer uses. Sets the
+    /// document's base font, which the message's own styling overrides where it
+    /// has any. See `ComposeSettings`.
+    var fontName: String = "Arial"
+    var fontSize: Double = 12
+    var antialias: Bool = true
+
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         let prefs = WKWebpagePreferences()
@@ -41,10 +49,13 @@ struct HTMLMailView: NSViewRepresentable {
         context.coordinator.images = images
         context.coordinator.onCopyLink = onCopyLink
         (view as? TrimmedMenuWebView)?.onForward = onForward
-        // Avoid reloading (and flicker) when nothing changed.
-        if context.coordinator.loadedHTML != html {
-            context.coordinator.loadedHTML = html
-            view.loadHTMLString(Self.wrap(html), baseURL: nil)
+        // Reload when the document *or* the reading font changes — the font is
+        // baked into the wrapper's CSS, so a settings change while a message is
+        // open has to re-wrap. The key folds both in.
+        let doc = Self.wrap(html, fontName: fontName, fontSize: fontSize, antialias: antialias)
+        if context.coordinator.loadedDoc != doc {
+            context.coordinator.loadedDoc = doc
+            view.loadHTMLString(doc, baseURL: nil)
         }
     }
 
@@ -55,7 +66,9 @@ struct HTMLMailView: NSViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate {
         var images: [String: EmbeddedImage]
         var onCopyLink: (String) -> Void
-        var loadedHTML: String?
+        /// The last document actually loaded — the *wrapped* HTML, so a change to
+        /// either the body or the reading font triggers a reload.
+        var loadedDoc: String?
 
         init(images: [String: EmbeddedImage], onCopyLink: @escaping (String) -> Void) {
             self.images = images
@@ -110,15 +123,28 @@ struct HTMLMailView: NSViewRepresentable {
 
     /// Wrap the (already-rewritten) message HTML with a strict CSP, baseline
     /// styling, and the styling for the image boxes.
-    private static func wrap(_ body: String) -> String {
-        """
+    ///
+    /// The base `font-family`/`font-size` are the reading font — the same
+    /// default the composer uses — so unstyled and plain-styled mail reads in it;
+    /// a message's own font declarations still override. Size is `px`, matching
+    /// the `NSFont` point size the editor and the plain-text view use (macOS
+    /// points are pixels at scale 1, which is Stephen's display).
+    /// `-webkit-font-smoothing: none` is WebKit's antialiasing-off, the CSS
+    /// counterpart to the `NSTextView` draw override.
+    private static func wrap(_ body: String, fontName: String, fontSize: Double,
+                             antialias: Bool) -> String {
+        let family = cssFontFamily(fontName)
+        let size = cssNumber(fontSize)
+        let smoothing = antialias ? "auto" : "none"
+        return """
         <!doctype html>
         <html><head>
         <meta charset="utf-8">
         <meta http-equiv="Content-Security-Policy"
               content="default-src 'none'; img-src 'none'; style-src 'unsafe-inline'; font-src 'none';">
         <style>
-          body { font: -apple-system-body, -webkit-system-font, sans-serif;
+          body { font-family: \(family), -apple-system, sans-serif;
+                 font-size: \(size)px; -webkit-font-smoothing: \(smoothing);
                  margin: 12px; color: #222; word-wrap: break-word; }
           @media (prefers-color-scheme: dark) { body { color: #ddd; } }
           img { max-width: 100%; height: auto; }
@@ -142,6 +168,74 @@ struct HTMLMailView: NSViewRepresentable {
         \(body)
         </body></html>
         """
+    }
+
+    /// A font family, quoted, for a CSS declaration. Strips the characters that
+    /// could end the string or the rule — a real family name has none, but this
+    /// value is about to be dropped into a document, so it is not trusted blindly.
+    static func cssFontFamily(_ name: String) -> String {
+        let cleaned = String(name.filter { !"\"';{}<>\n\r".contains($0) })
+            .trimmingCharacters(in: .whitespaces)
+        return cleaned.isEmpty ? "sans-serif" : "\"\(cleaned)\""
+    }
+
+    /// A number without a pointless trailing `.0`.
+    static func cssNumber(_ value: Double) -> String {
+        value == value.rounded() ? String(Int(value)) : String(format: "%.1f", value)
+    }
+}
+
+/// A read-only, selectable plain-text mail body in the reading font.
+///
+/// An `NSTextView` rather than a SwiftUI `Text` for one reason: the
+/// antialiasing toggle. Smoothing is a graphics-context property, and only the
+/// `BodyTextView` draw override can turn it off — SwiftUI `Text` always
+/// antialiases. Sharing that view type also means plain mail and the composer
+/// render through exactly the same path, so "the same font" really is the same.
+struct PlainMailView: NSViewRepresentable {
+    let text: String
+    let fontName: String
+    let fontSize: Double
+    let antialias: Bool
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let textView = BodyTextView(frame: NSRect(x: 0, y: 0, width: 300, height: 200))
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = true
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                  height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize =
+            NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        apply(to: textView)
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = true
+        scroll.documentView = textView
+        return scroll
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? BodyTextView else { return }
+        apply(to: textView)
+    }
+
+    private func apply(to textView: BodyTextView) {
+        textView.antialias = antialias
+        if textView.string != text { textView.string = text }
+        let font = NSFont(name: fontName, size: CGFloat(fontSize))
+            ?? NSFont.systemFont(ofSize: CGFloat(fontSize))
+        let range = NSRange(location: 0, length: (textView.string as NSString).length)
+        textView.textStorage?.addAttribute(.font, value: font, range: range)
+        textView.textStorage?.addAttribute(.foregroundColor, value: NSColor.textColor, range: range)
     }
 }
 

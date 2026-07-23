@@ -64,8 +64,8 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
-            Section("Composing") {
-                Picker("Body font", selection: $composeSettings.bodyFontName) {
+            Section("Default font") {
+                Picker("Font", selection: $composeSettings.bodyFontName) {
                     // Keep the current face selectable even if it's not installed,
                     // so the picker never shows blank.
                     if !Self.families.contains(composeSettings.bodyFontName) {
@@ -79,9 +79,10 @@ struct SettingsView: View {
                             .tag(size)
                     }
                 }
-                Toggle("Antialias body text", isOn: $composeSettings.antialiasBody)
-                Text("Applies to the compose window on your screen. Sent mail always "
-                        + "declares Arial, so recipients see it in their own Arial.")
+                Toggle("Antialias", isOn: $composeSettings.antialiasBody)
+                Text("Used to compose messages and to read plain-text and unstyled "
+                        + "mail. On your screen only — sent mail carries no font "
+                        + "unless you style it.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {

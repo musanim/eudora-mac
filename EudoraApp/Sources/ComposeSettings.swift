@@ -2,16 +2,22 @@ import Foundation
 import SwiftUI
 import EudoraRichText
 
-/// The composer's display preferences: the face and size new messages are
-/// written in, and whether the body is antialiased.
+/// The app-wide default body font: the face, size and antialiasing used to
+/// *compose* a message and to *read* plain-text and unstyled mail. Surfaced in
+/// Settings as "Default font". (The name predates the widening from composing-
+/// only to all three body surfaces; kept to avoid churning the UserDefaults keys
+/// and every reference.)
 ///
-/// **These describe the *local* editing view, not the wire.** The face and size
-/// here are what Stephen sees while composing on his own non-Retina screen; a
-/// run left in this default face declares no face on the wire, so recipients see
-/// it in their own default rather than having Stephen's screen font imposed.
-/// Seeded with Arial 12 until he settles on a face — the size knob and the
-/// antialiasing toggle are both here so he can tune the on-screen look without a
-/// rebuild.
+/// **These describe the *local* view, not the wire.** The face and size are what
+/// Stephen sees on his own non-Retina screen; a run left in this default face
+/// declares no face on the wire, so recipients see it in their own default
+/// rather than having Stephen's screen font imposed. Seeded with Arial 12.
+///
+/// The three consumers all take these as plain values: the composer and the
+/// plain-text reader render an `NSTextView` in this font (and honour the
+/// antialiasing toggle via the `BodyTextView` draw override); the HTML reader
+/// bakes the face/size into its document's base CSS, with
+/// `-webkit-font-smoothing` for the toggle.
 ///
 /// Persisted in UserDefaults, like `AccountStore`. A separate store rather than a
 /// section of that one: these are view preferences, not mail-account identity,

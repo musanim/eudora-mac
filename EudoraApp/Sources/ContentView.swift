@@ -2112,6 +2112,7 @@ struct PaneDividerHandle: View {
 
 struct PreviewView: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var fontSettings: ComposeSettings
 
     /// Wrapped in a `GeometryReader` so the pane's height is decided by the
     /// split view and the user, never by the message being shown.
@@ -2164,20 +2165,25 @@ struct PreviewView: View {
                 if p.isHTML {
                     HTMLMailView(html: p.content, images: p.images,
                                  onCopyLink: { url in model.showBanner("Link copied: \(url)") },
-                                 onForward: { model.forward() })
+                                 onForward: { model.forward() },
+                                 fontName: fontSettings.bodyFontName,
+                                 fontSize: fontSettings.bodyFontSize,
+                                 antialias: fontSettings.antialiasBody)
+                } else if p.content.isEmpty {
+                    // An attachment-only message genuinely has no text, so say
+                    // that rather than implying something failed.
+                    Text(p.detached.isEmpty ? "(no text body)"
+                                            : "(no message text — attachment only)")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    ScrollView {
-                        // An attachment-only message genuinely has no text, so
-                        // say that rather than implying something failed.
-                        Text(p.content.isEmpty
-                             ? (p.detached.isEmpty ? "(no text body)"
-                                                   : "(no message text — attachment only)")
-                             : p.content)
-                            .textSelection(.enabled)
-                            .font(.system(.body, design: .monospaced))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(12)
-                    }
+                    // The default font, matching the composer and honouring the
+                    // antialiasing toggle — an NSTextView rather than SwiftUI
+                    // `Text`, because only the former can turn smoothing off.
+                    PlainMailView(text: p.content,
+                                  fontName: fontSettings.bodyFontName,
+                                  fontSize: fontSettings.bodyFontSize,
+                                  antialias: fontSettings.antialiasBody)
                 }
                 // After the body, where Eudora put them — but *pinned* below it
                 // rather than inline, and outside the web view. Native views keep
