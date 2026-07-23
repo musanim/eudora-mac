@@ -171,13 +171,41 @@ struct FindView: View {
 
     /// Identifiable wrapper — `SearchHit` isn't Identifiable and hits can repeat
     /// a mailbox, so the row's array position is the id.
+    ///
+    /// The sort keys are precomputed here rather than in the columns because the
+    /// table sorts by key paths: the mailbox's *display* name (not its raw id),
+    /// a real parsed `Date` (so Date sorts chronologically, not by the string's
+    /// spelling), and the subject. `dateText` is what the Date column shows.
     struct ResultRow: Identifiable {
         let id: String
         let hit: SearchHit
+        let mailbox: String
+        let dateSort: Date
+        let dateText: String
+        let subject: String
+        let snippet: String
     }
 
     private var resultRows: [ResultRow] {
-        model.searchResults.enumerated().map { ResultRow(id: "\($0.offset)", hit: $0.element) }
+        model.searchResults.enumerated().map { i, hit in
+            ResultRow(id: "\(i)",
+                      hit: hit,
+                      mailbox: model.mailboxDisplay(hit.mailbox),
+                      dateSort: EudoraDateFormat.parse(hit.date) ?? .distantPast,
+                      dateText: AppModel.eudoraDate(hit.date) ?? hit.date,
+                      subject: hit.subject.isEmpty ? "(no subject)" : hit.subject,
+                      snippet: hit.snippet)
+        }
+    }
+
+    /// Empty until the user clicks a header, so results first appear in the
+    /// engine's own order — relevance for a text search, newest-first for a date
+    /// search (see `SearchIndex`) — which is more useful than any fixed column
+    /// sort would be. A click then sorts by that column; clicking again reverses.
+    @State private var sortOrder: [KeyPathComparator<ResultRow>] = []
+
+    private var sortedRows: [ResultRow] {
+        sortOrder.isEmpty ? resultRows : resultRows.sorted(using: sortOrder)
     }
 
     @ViewBuilder
@@ -187,15 +215,19 @@ struct FindView: View {
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            Table(resultRows, selection: $resultSelection) {
-                TableColumn("Mailbox") { Text(model.mailboxDisplay($0.hit.mailbox)) }
+            Table(sortedRows, selection: $resultSelection, sortOrder: $sortOrder) {
+                TableColumn("Mailbox", value: \.mailbox) { Text($0.mailbox) }
                     .width(min: 90, ideal: 130)
-                TableColumn("Date") { Text(AppModel.eudoraDate($0.hit.date) ?? $0.hit.date) }
+                TableColumn("Date", value: \.dateSort) { Text($0.dateText) }
                     .width(min: 90, ideal: 130)
-                TableColumn("Subject") {
-                    Text($0.hit.subject.isEmpty ? "(no subject)" : $0.hit.subject)
+                TableColumn("Subject", value: \.subject) { Text($0.subject) }
+                // Given a `value:` like the rest so every column carries the same
+                // `KeyPathComparator<ResultRow>` — mixing a value-less column in
+                // makes the builder's comparator type ambiguous. Sorting by a
+                // snippet is rarely useful, but harmless, and keeps this uniform.
+                TableColumn("Snippet", value: \.snippet) {
+                    Text($0.snippet).foregroundStyle(.secondary)
                 }
-                TableColumn("Snippet") { Text($0.hit.snippet).foregroundStyle(.secondary) }
             }
             .onChange(of: resultSelection) { sel in
                 guard let sel, let rr = resultRows.first(where: { $0.id == sel }) else { return }
