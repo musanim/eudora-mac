@@ -1333,18 +1333,6 @@ struct TableScrollStateSyncer: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {
         let coordinator = context.coordinator
-        // A *freshly mounted* table starts at SwiftUI's 24 pt automatic height.
-        // Switching mailboxes tears the old table down (the list is replaced by
-        // "Listing messages…") and builds a new one, so its KVO pins are gone
-        // and the async `attach` below hasn't run yet — the new rows would paint
-        // tall for a frame. If the new table is already in the hierarchy this
-        // pass, pin it synchronously, before it paints. Guarded to a table this
-        // coordinator hasn't claimed: doing it for the *existing* table on a
-        // selection change double-applied and flickered (the KVO pins own that
-        // case). `attach` then installs the pins on this new table.
-        if coordinator.table == nil, let table = MessageTableFinder.table(near: nsView) {
-            Self.enforceRowHeight(table)
-        }
         DispatchQueue.main.async {
             attach(near: nsView, coordinator: coordinator, attemptsLeft: 5)
             // Backstop only. The row height is really held by the KVO pins set
