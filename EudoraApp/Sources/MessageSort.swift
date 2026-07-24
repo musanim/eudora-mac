@@ -99,7 +99,9 @@ struct MessageSort: Equatable, Codable, Sendable {
             return a.hasAttachment ? .orderedAscending : .orderedDescending
 
         case .who:
-            return compareText(a.who, b.who)
+            // Sort on the bare name, not the displayed "Bob +2": overflow counts
+            // shouldn't scatter a person, and it clusters their sent + received.
+            return compareText(a.whoSort, b.whoSort)
 
         case .subject:
             return compareText(a.subject, b.subject)

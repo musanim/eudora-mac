@@ -63,6 +63,7 @@ struct EudoraApp: App {
 
         Settings {
             SettingsView()
+                .environmentObject(model)
                 .environmentObject(accounts)
                 .environmentObject(composeSettings)
         }

@@ -19,9 +19,13 @@ import Foundation
 /// path's attachment verdict is byte-for-byte identical to the full parse's.
 public struct MessageDigest: Sendable {
     /// Raw header values, undecoded — the caller decodes and formats. Nil when
-    /// the header is absent.
+    /// the header is absent. `cc`/`bcc` join `to` when asking "am I a recipient?"
+    /// — I may sit only in the Cc — and feed the "me appears nowhere" scan that
+    /// surfaces addresses the identity set is still missing.
     public let from: String?
     public let to: String?
+    public let cc: String?
+    public let bcc: String?
     public let date: String?
     public let hasAttachment: Bool
 
@@ -48,6 +52,7 @@ public struct MessageDigest: Sendable {
                 || headerDeclaresAttachment(contentType: contentType, disposition: disposition)
         }
         return MessageDigest(from: header("From"), to: header("To"),
+                             cc: header("Cc"), bcc: header("Bcc"),
                              date: header("Date"), hasAttachment: hasAttachment)
     }
 

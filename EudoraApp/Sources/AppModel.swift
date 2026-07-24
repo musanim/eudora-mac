@@ -61,7 +61,14 @@ struct MessageRow: Identifiable, Hashable, Sendable {
     // Filled in by the background pass — see `RowEnrichment`. The rows appear
     // immediately from the TOC, which knows all of these approximately, and they
     // settle to the message's own values as the parse catches up.
-    var who: String         // From for incoming, To for outgoing (display name)
+    var who: String         // the other party's display name (may carry " +N")
+    /// The Who value for *sorting* — the correspondent name without the "+N"
+    /// overflow suffix, so "Bob" and "Bob +2" cluster together and a person's
+    /// sent and received mail sort as one. Equals `who` until enrichment lands.
+    var whoSort: String
+    /// Which way this message went relative to me, for the direction glyph.
+    /// `.neither` until the parse settles it — no glyph while provisional.
+    var direction: WhoDirection
     var date: String        // Eudora-style short date/time
     var hasAttachment: Bool
 
@@ -238,6 +245,8 @@ struct ComposeDraft: Identifiable {
 struct RowEnrichment: Sendable {
     let index: Int          // 1-based, matches MessageRow.id
     let who: String
+    let whoSort: String
+    let direction: WhoDirection
     let date: Date?         // nil when the Date header is missing or unparseable
     let hasAttachment: Bool
 }
@@ -1191,7 +1200,11 @@ final class AppModel: ObservableObject {
 
         let base = item.base
         let display = item.display
-        let outgoing = (item.type == .outbox)
+        // The identity set decides direction per message now — the old
+        // per-mailbox "outgoing = it's the Out mailbox" flag is gone (it showed
+        // my own name in every mixed archive folder). Captured by value here so
+        // the detached enrichment reads a stable snapshot.
+        let me = self.me
         // This mailbox's remembered sort, adopted *before* the listing lands so
         // `setRows` orders it on arrival rather than reordering it a frame later.
         // Assigned directly rather than through `setSort`, which would try to
@@ -1236,6 +1249,8 @@ final class AppModel: ObservableObject {
                     guard let old = carryOver[r.id] else { return r }
                     var carried = r        // status/subject/size stay the TOC's
                     carried.who = old.who
+                    carried.whoSort = old.whoSort
+                    carried.direction = old.direction
                     carried.date = old.date
                     carried.hasAttachment = old.hasAttachment
                     carried.sortDate = old.sortDate
@@ -1251,7 +1266,7 @@ final class AppModel: ObservableObject {
             completion?()
             if let built {
                 self.startEnrichment(store: store, base: base, records: built.records,
-                                     outgoing: outgoing, generation: generation)
+                                     me: me, generation: generation)
             }
         }
     }
@@ -1359,6 +1374,10 @@ final class AppModel: ObservableObject {
                               // from that cache, and far better than a blank
                               // column while the parse catches up.
                               who: r.who,
+                              // Sort on the same TOC name until the parse lands;
+                              // no direction is known yet, so no glyph shows.
+                              whoSort: r.who,
+                              direction: .neither,
                               // Formatted from the TOC's cached date so the
                               // column shows YYYYmmmDD immediately, in the same
                               // shape the parse will confirm — not the raw TOC
@@ -1385,7 +1404,7 @@ final class AppModel: ObservableObject {
     /// glyph, applying results in batches so the list settles progressively
     /// rather than in one jump at the end.
     private func startEnrichment(store: MailStore, base: URL, records: [MessageLocation],
-                                 outgoing: Bool, generation: Int) {
+                                 me: MeIdentity, generation: Int) {
         isEnriching = true
 
         // The listing already located every message; hand the offsets to the
@@ -1411,11 +1430,17 @@ final class AppModel: ObservableObject {
                     store.forEachMessageDigest(at: base, records: locations,
                                                isCancelled: { Task.isCancelled }) { index, digest in
                         if Task.isCancelled { return false }
-                        // Argument order follows RowEnrichment's declaration.
+                        // The other party and which way the message went, from
+                        // the identity set — one rule for every mailbox. See
+                        // CorrespondentResolver.
+                        let resolved = CorrespondentResolver.resolve(
+                            from: digest.from, to: digest.to,
+                            cc: digest.cc, bcc: digest.bcc, me: me)
                         batch.append(RowEnrichment(
                             index: index,
-                            who: AppModel.correspondent(from: digest.from, to: digest.to,
-                                                        outgoing: outgoing),
+                            who: resolved.name,
+                            whoSort: resolved.sortKey,
+                            direction: resolved.direction,
                             date: EudoraDateFormat.parse(digest.date),
                             hasAttachment: digest.hasAttachment))
                         if batch.count >= enrichBatchSize {
@@ -1471,6 +1496,8 @@ final class AppModel: ObservableObject {
             guard let pos = rowPositionByID[e.index], pos < rows.count else { continue }
             var row = rows[pos]
             row.who = e.who
+            row.whoSort = e.whoSort
+            row.direction = e.direction
             row.hasAttachment = e.hasAttachment
             // An unparseable Date header leaves the TOC's value in place — both
             // the displayed string and the sort key — which is what the
@@ -1485,40 +1512,53 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: identity (the "me" set behind the Who column)
+
+    /// The addresses (and whole-domain rules) that are *me*. Drives the Who
+    /// column's other-party + direction resolution. Loaded once at launch;
+    /// edited from Settings, which re-lists the open mailbox on each change.
+    @Published var me: MeIdentity = MeIdentityStore.load()
+
+    /// Add an exact address ("s@x.com") or a domain rule ("*@musanim.com").
+    /// Returns false if it wasn't a usable entry, or was already present.
+    @discardableResult
+    func addMyIdentity(_ raw: String) -> Bool {
+        guard me.insert(raw) else { return false }
+        persistAndReapplyIdentity()
+        return true
+    }
+
+    /// Remove an exact address, or a domain rule (pass "@musanim.com").
+    func removeMyIdentity(_ entry: String) {
+        guard me.remove(entry) else { return }
+        persistAndReapplyIdentity()
+    }
+
+    /// Seed from the Out mailbox, where every `From` is me. Returns how many new
+    /// addresses were added (0 if Out is missing or held nothing new).
+    @discardableResult
+    func rescanOutForMyIdentity() -> Int {
+        guard let store, let out = base(ofType: .outbox) else { return 0 }
+        let before = me.addresses.count
+        me.formUnion(store.senderAddresses(at: out))
+        let added = me.addresses.count - before
+        if added > 0 { persistAndReapplyIdentity() }
+        return added
+    }
+
+    /// Persist the set, then re-list the open mailbox so its Who column reflects
+    /// the change immediately (an in-flight enrichment is cancelled and redone).
+    private func persistAndReapplyIdentity() {
+        MeIdentityStore.save(me)
+        if selectedMailboxID != nil { loadListing(force: true) }
+    }
+
     // MARK: display helpers
 
-    /// From (incoming) or To (outgoing), reduced to a display name.
-    nonisolated static func correspondent(_ part: MIMEPart, outgoing: Bool) -> String {
-        correspondent(from: part.header("From"), to: part.header("To"), outgoing: outgoing)
-    }
-
-    /// The list's Who, from the raw From/To header values — outgoing mail shows
-    /// the recipient, incoming the sender, each falling back to the other. The
-    /// digest path feeds this directly; `correspondent(_:outgoing:)` routes a
-    /// parsed part through the same logic so the two can't drift.
-    nonisolated static func correspondent(from: String?, to: String?, outgoing: Bool) -> String {
-        let primary = outgoing ? to : from
-        let fallback = outgoing ? from : to
-        return displayName(HeaderDecoder.decode(primary ?? fallback ?? ""))
-    }
-
-    /// "Steve Dorner <d@x>" → "Steve Dorner"; "a@b (Name)" → "Name"; else the
-    /// address. Strips surrounding quotes.
-    nonisolated static func displayName(_ raw: String) -> String {
-        let s = raw.trimmingCharacters(in: .whitespaces)
-        if let lt = s.firstIndex(of: "<") {
-            let name = s[..<lt].trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
-            if !name.isEmpty { return name }
-            if let gt = s.firstIndex(of: ">"), s.index(after: lt) < gt {
-                return String(s[s.index(after: lt)..<gt])
-            }
-        }
-        if let op = s.firstIndex(of: "("), let cp = s.firstIndex(of: ")"), op < cp {
-            let name = s[s.index(after: op)..<cp].trimmingCharacters(in: .whitespaces)
-            if !name.isEmpty { return name }
-        }
-        return s
-    }
+    // Who + direction now come from `CorrespondentResolver` (EudoraStore), which
+    // replaced this class's old `correspondent`/`displayName` helpers — the
+    // per-mailbox "outgoing" guess became a per-message identity test. The
+    // resolver keeps the one copy of `displayName`.
 
     // The date formatters live in `EudoraDateFormat`, outside this class:
     // `AppModel` is `@MainActor`, so a static stored property here would be
@@ -2461,6 +2501,8 @@ final class AppModel: ObservableObject {
                                        size: r.size,
                                        subject: r.subject,
                                        who: r.who,
+                                       whoSort: r.whoSort,
+                                       direction: r.direction,
                                        date: r.date,
                                        hasAttachment: r.hasAttachment,
                                        sortDate: r.sortDate)

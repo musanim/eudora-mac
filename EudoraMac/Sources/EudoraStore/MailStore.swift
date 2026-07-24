@@ -293,6 +293,23 @@ public struct MailStore: Sendable {
         }
     }
 
+    /// Every distinct `From` address in a mailbox, normalized — the one-time
+    /// scan behind "seed my identity set from Out", where every sender is you.
+    /// Header-only (`MessageDigest`), so even a large Out reads fast; it walks
+    /// the whole mailbox on purpose, as the bootstrap is a deliberate action.
+    public func senderAddresses(at base: URL) -> Set<String> {
+        guard let data = try? Data(contentsOf: mbxURL(base), options: .mappedIfSafe) else {
+            return []
+        }
+        let bytes = [UInt8](data)
+        var out: Set<String> = []
+        for rec in Mbox.findRecords(bytes) {
+            let digest = MessageDigest.parse(Mbox.messageBytes(bytes, rec))
+            out.formUnion(EmailAddress.addresses(in: digest.from ?? ""))
+        }
+        return out
+    }
+
     public func loadMessages(at base: URL) -> [(index: Int, record: MboxRecord, part: MIMEPart)] {
         guard let data = try? Data(contentsOf: mbxURL(base)) else { return [] }
         let bytes = [UInt8](data)
