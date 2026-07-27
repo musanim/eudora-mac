@@ -1205,7 +1205,9 @@ final class AppModel: ObservableObject {
     /// unless a hit is being opened (pendingMessageID), in which case that
     /// message is selected once the rows exist.
     /// - Parameter force: rebuild even if this mailbox is already listed. Used by
-    ///   the in-place refreshes (mail sent, mail received); the default path is
+    ///   the in-place refreshes (mail sent, and the mailbox mutations); the
+    ///   received path no longer comes through here — see
+    ///   `refreshInPlaceAfterDelivery`. The default path is
     ///   idempotent so the explicit restore call and a subsequent `onChange` for
     ///   the same mailbox don't load twice — the second pass would find
     ///   `pendingMessageID` already consumed and clear the restored selection.
@@ -1263,16 +1265,7 @@ final class AppModel: ObservableObject {
             // to what this mailbox now holds.
             if let mailbox = self.selectedMailboxID,
                let top = self.viewState.scrollTopRowByMailbox[mailbox], !self.rows.isEmpty {
-                if top == ViewState.scrollToBottom {
-                    // "Open at the bottom" — reveal the last row rather than pin a
-                    // top row, so the viewport fills with the newest mail (see
-                    // `receiveMail`). The reveal is recorded, so the sentinel is
-                    // replaced by the real position once the list settles.
-                    self.pendingScrollTopRow = nil
-                    self.pendingRevealRow = self.rows.count - 1
-                } else {
-                    self.pendingScrollTopRow = min(top, self.rows.count - 1)
-                }
+                self.pendingScrollTopRow = min(top, self.rows.count - 1)
             } else {
                 self.pendingScrollTopRow = nil
             }
@@ -1282,6 +1275,109 @@ final class AppModel: ObservableObject {
                 self.splashHeldForRestore = false
                 SplashWindow.hide()
             }
+        }
+    }
+
+    /// Fold newly delivered mail into the In box *while the user is looking at
+    /// it*: no blank, no jump, and the messages already on screen stay under the
+    /// same pixels.
+    ///
+    /// `loadListing(force:)` is deliberately not reused. It clears the rows first
+    /// — "the old mailbox's rows must not linger under the new mailbox's name" —
+    /// which is right when switching mailboxes and wrong when refreshing the one
+    /// already shown. That clear is the blank; the two-phase TOC-then-enrichment
+    /// rebuild behind it is the draw-down-the-list and the reshuffle that
+    /// followed.
+    ///
+    /// Here the current rows stay up, accurate but one delivery out of date,
+    /// while the fresh listing is built underneath them. Each hands its parsed
+    /// Who/date/attachment values to its replacement, so the arriving messages
+    /// are the only rows with anything to settle. Same trick as `afterRemoval`,
+    /// minus the veil: nothing on screen is a lie in the meantime, so there is
+    /// nothing to cover.
+    private func refreshInPlaceAfterDelivery() {
+        // The message at the top of the viewport, remembered by id rather than
+        // by position. Delivery appends, but where the new rows *land* depends
+        // on the sort — newest-first puts them above everything and pushes the
+        // list down — so a position restored numerically would show different
+        // messages than it did a moment earlier. Restoring by id puts the same
+        // message back under the same pixel, which is what "the scrolling
+        // position shouldn't change" has to mean for it to look like nothing
+        // happened.
+        //
+        // `pendingScrollTopRow` first: a restore in flight is the position the
+        // list is *going* to be at, and it reaches `scrollTopRowByMailbox` only
+        // once the AppKit bridge has applied and confirmed it (retries at 0.2s,
+        // a 0.15s verification). A second delivery inside that window would
+        // otherwise read the previous top — an index into the *old* rows — and
+        // anchor to the wrong message.
+        //
+        // Falling back to 0 rather than to "no anchor" keeps the two cases from
+        // behaving oppositely: a list sitting at the top with nothing recorded
+        // used to leave the offset alone (new mail appearing above the
+        // viewport), while the same list with a recorded 0 anchored (new mail
+        // pushed out of sight). Same screen, opposite results, decided by
+        // whether a scroll had ever been recorded. Now both anchor.
+        let top = pendingScrollTopRow
+            ?? selectedMailboxID.flatMap { viewState.scrollTopRowByMailbox[$0] }
+            ?? 0
+        let anchorID: Int? = rows.indices.contains(top) ? rows[top].id : nil
+
+        // Every listed row's enrichment, keyed by the index it will still have.
+        // Delivery appends to the .mbx and the .toc, so nothing already listed
+        // is renumbered — unlike a removal, which is why `afterRemoval` has to
+        // shift its keys and this does not. The arriving messages are absent
+        // from the map and are therefore exactly the rows enrichment fills in.
+        var carryOver: [Int: MessageRow] = [:]
+        carryOver.reserveCapacity(rows.count)
+        for row in rows { carryOver[row.id] = row }
+
+        // The mailbox this refresh belongs to, so a scroll offset computed for
+        // In can't be applied to something else. `beginMailboxSwitch` cancels
+        // the listing and bumps the generation on a normal sidebar switch, so
+        // the completion would already stand down — but `openHit` assigns
+        // `selectedMailboxID` directly and its cancelling `loadListing` only
+        // arrives a runloop hop later, leaving a gap.
+        //
+        // Note this guards the *offset* only. `rebuildRows` publishes its rows
+        // before calling here, so a read landing in that gap still installs In's
+        // rows over the newly selected mailbox — a pre-existing hazard of that
+        // path, not one this refresh introduces, and self-correcting once the
+        // cancelling `loadListing` arrives.
+        let mailbox = selectedMailboxID
+
+        rebuildRows(carryingEnrichment: carryOver) { [weak self] in
+            guard let self else { return }
+            if self.selectedMailboxID == mailbox {
+                // This runs in the same main-actor turn as the `setRows` inside
+                // `rebuildRows`, so the new rows and their corrected offset reach
+                // the table together — the uncorrected position is never drawn.
+                if let anchorID, let pos = self.rowPositionByID[anchorID], !self.rows.isEmpty {
+                    self.pendingScrollTopRow = min(pos, self.rows.count - 1)
+                } else {
+                    // No usable anchor: In was empty before this delivery, or
+                    // the remembered top is past the end, or the anchored
+                    // message is gone. Leave the offset alone rather than
+                    // invent one.
+                    self.pendingScrollTopRow = nil
+                }
+            }
+            // Outside the mailbox guard above: mail arrived, so In's unread
+            // state has to reach the sidebar whatever is on screen now.
+            //
+            // After the rows, not alongside them. Publishing a new tree
+            // re-renders the sidebar on the main actor, and a listing finishing
+            // alongside it queues behind that render — measured at 4,017 ms in
+            // the removal path, which is why `afterRemoval` sequences it the
+            // same way.
+            //
+            // KNOWN GAP: `rebuildRows` returns without calling its completion if
+            // its listing task is cancelled (a sidebar switch during the settle
+            // delay), so a delivery in that window never reaches this line and
+            // In's bold-unread name stays stale until the next tree reload. The
+            // new-mail glyph is set unconditionally in `receiveMail`, so the
+            // arrival is still announced.
+            self.reloadTree()
         }
     }
 
@@ -1600,8 +1696,25 @@ final class AppModel: ObservableObject {
             // end, rather than per batch, which would shuffle the list under the
             // pointer every 2,000 messages and cost a full table diff each time.
             if self.sort?.column.dependsOnEnrichment == true {
+                let before = self.rows.map(\.id)
                 self.setRows(self.rows)
-                self.keepSelectionVisible()
+                // Only chase the selection when the re-sort actually moved
+                // something. The reveal exists so a selected row displaced by
+                // the new order is still findable; if the order is unchanged
+                // there is nothing to find, and scrolling to the selection is an
+                // unasked-for jump.
+                //
+                // Conditional because of `refreshInPlaceAfterDelivery`, which
+                // rebuilds while *keeping* the selection and the scroll
+                // position. Unconditional, this fired seconds after every
+                // delivery — once In's enrichment finished — and scrolled the
+                // list back to the selected message, undoing the anchored
+                // position the refresh had just restored.
+                //
+                // Costs two id arrays on a mailbox that may hold 22,515 rows;
+                // negligible beside the sort and the 22,515 dictionary inserts
+                // `setRows` does on the line above.
+                if self.rows.map(\.id) != before { self.keepSelectionVisible() }
             }
         }
     }
@@ -3498,22 +3611,33 @@ final class AppModel: ObservableObject {
                                             uids: Set(delivered))
             }
 
-            reloadTree()
-            if let id = selectedMailboxID, itemsByID[id]?.type == .inbox {
-                // In is on screen: re-list it so the new mail shows now.
-                loadListing(force: true)
-            } else if !fetched.isEmpty, let inboxItem = item(ofType: .inbox) {
-                // In isn't on screen: arrange for it to open in date order,
-                // scrolled to the newest, so the arriving mail is in view the
-                // next time In is selected. Only its stored state changes now;
-                // nothing is visible until then.
-                viewState.sortByMailbox[inboxItem.id] = MessageSort(column: .date, ascending: true)
-                viewState.scrollTopRowByMailbox[inboxItem.id] = ViewState.scrollToBottom
-                if let root = rootURL?.path { ViewStateStore.save(viewState, forRoot: root) }
+            // Nothing arrived, so nothing changes: no tree walk, no re-list, no
+            // glyph. This guard *is* the fix for "the In box repaints on every
+            // check" — the reload and the re-list below used to run
+            // unconditionally, so a check that found nothing still blanked the
+            // list and drew it again. A quiet automatic check must be invisible.
+            if !fetched.isEmpty {
+                if let id = selectedMailboxID, itemsByID[id]?.type == .inbox {
+                    // In is on screen: fold the new mail into the list already
+                    // showing, without blanking it or moving it. (Reloads the
+                    // tree itself, once the rows are back.)
+                    refreshInPlaceAfterDelivery()
+                } else {
+                    // In isn't on screen. Nothing is arranged for the next time
+                    // it is selected — no forced sort, no scroll — because
+                    // arriving mail is not entitled to move a list the user
+                    // positioned. The tree walk is what lights In's unread
+                    // indicator.
+                    reloadTree()
+                }
+                // Light the sidebar's new-mail glyph on In (dismissed when the
+                // user next engages with In — see `clearInboxNewMailBadge`).
+                // This is deliberately *not* the same signal as the bold
+                // unread name: bold means "In holds unread mail" and stays lit
+                // as long as that is true, while the glyph means "mail arrived
+                // since you last looked" and clears on engagement.
+                inboxHasNewMail = true
             }
-            // Light the sidebar's new-mail badge on In (dismissed when the user
-            // next engages with In — see `clearInboxNewMailBadge`).
-            if !fetched.isEmpty { inboxHasNewMail = true }
             // A silent automatic check says nothing when nothing arrived; it
             // still confirms a real delivery. A manual check reports either way.
             if !(automatic && fetched.isEmpty) {
