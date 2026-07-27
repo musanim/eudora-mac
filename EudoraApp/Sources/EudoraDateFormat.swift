@@ -27,6 +27,24 @@ enum EudoraDateFormat {
         return f
     }()
 
+    // The same two shapes with an *alphabetic* zone ("GMT", "EDT") instead of a
+    // numeric offset. Older mail — and much of what a header scan surfaces when
+    // the `.toc` is stale — writes the zone this way; `zzz` matches the common
+    // ones (a rare unknown like "UT" still falls through to nil, as before).
+    private static let rfc822NamedZone: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "EEE, d MMM yyyy HH:mm:ss zzz"
+        return f
+    }()
+
+    private static let rfc822NamedZoneNoDay: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "d MMM yyyy HH:mm:ss zzz"
+        return f
+    }()
+
     private static let eudoraOut: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -86,8 +104,34 @@ enum EudoraDateFormat {
     /// Parse an RFC-822 Date header. Nil when the header is missing or
     /// unparseable, so callers can fall back to what the TOC cached.
     static func parse(_ header: String?) -> Date? {
-        guard let h = header?.trimmingCharacters(in: .whitespaces), !h.isEmpty else { return nil }
-        return rfc822In.date(from: h) ?? rfc822InNoDay.date(from: h)
+        guard let raw = header?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
+        // The clean, common case: a numeric-offset date, taken as written.
+        if let d = rfc822In.date(from: raw) ?? rfc822InNoDay.date(from: raw) { return d }
+        // The awkward-but-common variants, normalised and retried. These matter
+        // most when a mailbox falls back to the header scan (a stale or missing
+        // `.toc`, as the AMAZON mailbox does): the Date column then formats from
+        // the raw `Date:` header, and real mail is full of a trailing zone
+        // comment ("… -0800 (PST)"), a single-digit day padded with an extra
+        // space, and an alphabetic zone ("… GMT") in place of a numeric offset.
+        // Without this the column shows the raw header verbatim on those rows.
+        let cleaned = normalizeRFC822(raw)
+        return rfc822In.date(from: cleaned)
+            ?? rfc822InNoDay.date(from: cleaned)
+            ?? rfc822NamedZone.date(from: cleaned)
+            ?? rfc822NamedZoneNoDay.date(from: cleaned)
+    }
+
+    /// Drop a trailing parenthetical zone comment ("… -0800 (PST)" → "… -0800")
+    /// and collapse runs of whitespace to single spaces (some senders pad a
+    /// single-digit day), so the RFC-822 formatters can match. Only a trailing
+    /// `(…)` is stripped, and RFC-822 dates never legitimately end in one, so
+    /// this can't truncate a real date.
+    private static func normalizeRFC822(_ s: String) -> String {
+        var t = s
+        if t.hasSuffix(")"), let open = t.lastIndex(of: "(") {
+            t = String(t[..<open]).trimmingCharacters(in: .whitespaces)
+        }
+        return t.split(whereSeparator: { $0 == " " || $0 == "\t" }).joined(separator: " ")
     }
 
     /// Render a date as `YYYYmmmDD HH:mm:ss`, lowercase month, 24-hour clock
@@ -105,7 +149,14 @@ enum EudoraDateFormat {
     /// TOC's raw "10:02 PM 12/5/2025" to the formatted value as enrichment
     /// caught up, which on a big mailbox was visible for seconds.
     static func displayCached(_ cached: String) -> String {
-        tocDate(cached).map(display) ?? cached
+        if let date = tocDate(cached) { return display(date) }
+        // A stale or missing `.toc` sends the raw RFC-822 `Date:` header here
+        // (see `MailStore.list`'s scan path), which `tocDate` can't read. Format
+        // it the same as every other row rather than showing the raw header —
+        // this is what settles the AMAZON mailbox's Date column at first paint,
+        // ahead of (and independent of) the background enrichment.
+        if let date = parse(cached) { return display(date) }
+        return cached
     }
 
     /// Parse the date string Eudora cached in the `.toc`, for sorting.

@@ -254,6 +254,155 @@ public enum MailboxTreeMutator {
         return parts.count >= 2 ? parts[1] : nil
     }
 
+    // MARK: moving into a group
+
+    public enum MoveIntoError: LocalizedError, Equatable {
+        /// No source descmap.pce, or no line names this file.
+        case notFound
+        /// A system mailbox (In/Out/Junk/Trash) — pinned, never moved.
+        case notMovable
+        /// A `.lck` file sits next to the mailbox: Eudora may have it open.
+        case locked
+        /// A folder can't be moved into itself or one of its own descendants.
+        case intoDescendant
+        /// The destination already holds an item of this name (display or
+        /// filename, case-insensitive). Carries the clashing name.
+        case duplicate(String)
+        case ioError(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .notFound:         return "that item isn't in the folder's index"
+            case .notMovable:       return "the standard mailboxes stay put"
+            case .locked:           return "the mailbox is locked (a .lck file is next to it)"
+            case .intoDescendant:   return "a folder can't be moved inside itself"
+            case .duplicate(let d): return "\u{201C}\(d)\u{201D} already exists there"
+            case .ioError(let m):   return m
+            }
+        }
+    }
+
+    /// Move the mailbox or folder `sourceDir`'s descmap lists under `filename`
+    /// into `destDir` — another folder's directory, or the tree root. Moves the
+    /// files (a `.mbx` with its `.toc`/`.mbx.bak`; a folder's whole `.fol`
+    /// directory) and edits both `descmap.pce` files, keeping the moved line's
+    /// bytes exactly (display name, filename, type, unread flag).
+    ///
+    /// **Ordering: never a dangling index line.** The source line is removed
+    /// *before* the files move, and the destination line is added only *after*
+    /// they arrive — so at no instant does a descmap line point at a file that
+    /// isn't there. The one transient state a crash could leave is orphaned
+    /// files no line references (invisible, recoverable), the failure mode this
+    /// codebase prefers everywhere. A file-move or destination-write failure is
+    /// rolled back so nothing is lost visibly.
+    /// - Returns: `true` if it moved, `false` if the item was already in `destDir`
+    ///   (a no-op, so the caller can skip a "Moved" banner).
+    @discardableResult
+    public static func moveInto(filename: String, from sourceDir: URL, to destDir: URL) throws -> Bool {
+        // Already there: a no-op, not an error.
+        if sourceDir.standardizedFileURL == destDir.standardizedFileURL { return false }
+
+        let srcDescURL = sourceDir.appendingPathComponent("descmap.pce")
+        guard let srcData = try? Data(contentsOf: srcDescURL) else { throw MoveIntoError.notFound }
+        let srcLines = descLines(in: srcData)
+        guard let line = srcLines.first(where: { lineFilename($0, in: srcData) == filename }) else {
+            throw MoveIntoError.notFound
+        }
+        guard line.group != .system else { throw MoveIntoError.notMovable }
+        let isFolder = line.group == .folder
+
+        // The exact line bytes, re-inserted verbatim at the destination.
+        let lineTextBytes = srcData.subdata(in: line.text)
+        let lineText = String(data: lineTextBytes, encoding: .isoLatin1) ?? ""
+        let display = lineText.components(separatedBy: ",").first ?? ""
+        let stem = (filename as NSString).deletingPathExtension
+
+        let fm = FileManager.default
+
+        // A locked mailbox stays put (folders have no lock file).
+        if !isFolder,
+           fm.fileExists(atPath: sourceDir.appendingPathComponent("\(stem).lck").path) {
+            throw MoveIntoError.locked
+        }
+
+        // A folder can't land inside its own subtree.
+        if isFolder {
+            let folderDir = sourceDir.appendingPathComponent(filename, isDirectory: true)
+                .standardizedFileURL
+            let dest = destDir.standardizedFileURL
+            if dest == folderDir || dest.path.hasPrefix(folderDir.path + "/") {
+                throw MoveIntoError.intoDescendant
+            }
+        }
+
+        // Name clash at the destination — on the display name (visual) or the
+        // filename stem (physical: two same-named files in one directory would
+        // collide), plus the filesystem for an orphan the index forgot.
+        let displayLower = display.trimmingCharacters(in: .whitespaces).lowercased()
+        let stemLower = stem.lowercased()
+        for e in DescMap.read(directory: destDir) {
+            let eStem = (e.filename as NSString).deletingPathExtension.lowercased()
+            if e.display.lowercased() == displayLower || eStem == stemLower {
+                throw MoveIntoError.duplicate(e.display)
+            }
+        }
+        for ext in ["mbx", "toc", "fol", "mbx.bak", "lck"] {
+            if fm.fileExists(atPath: destDir.appendingPathComponent("\(stem).\(ext)").path) {
+                throw MoveIntoError.duplicate(display.isEmpty ? stem : display)
+            }
+        }
+
+        // 1) Remove the source line (backup + atomic).
+        var newSrc = srcData
+        newSrc.removeSubrange(line.full)
+        do {
+            try MailboxIO.backupOnce(srcDescURL)
+            try MailboxIO.atomicWrite(newSrc, to: srcDescURL)
+        } catch { throw MoveIntoError.ioError(error.localizedDescription) }
+
+        // 2) Move the files. On failure, restore the source line.
+        let moves: [(from: URL, to: URL)]
+        if isFolder {
+            moves = [(sourceDir.appendingPathComponent(filename, isDirectory: true),
+                      destDir.appendingPathComponent(filename, isDirectory: true))]
+        } else {
+            moves = ["mbx", "toc", "mbx.bak"].map {
+                (sourceDir.appendingPathComponent("\(stem).\($0)"),
+                 destDir.appendingPathComponent("\(stem).\($0)"))
+            }
+        }
+        var done: [(from: URL, to: URL)] = []
+        do {
+            for m in moves where fm.fileExists(atPath: m.from.path) {
+                try fm.moveItem(at: m.from, to: m.to)
+                done.append(m)
+            }
+        } catch {
+            for m in done { try? fm.moveItem(at: m.to, to: m.from) }   // undo partial move
+            try? MailboxIO.atomicWrite(srcData, to: srcDescURL)        // restore the line
+            throw MoveIntoError.ioError(error.localizedDescription)
+        }
+
+        // 3) Append the line to the destination descmap (backup + atomic). On
+        //    failure, move the files home and restore the source line.
+        let destDescURL = destDir.appendingPathComponent("descmap.pce")
+        let destExisting = (try? Data(contentsOf: destDescURL)) ?? Data()
+        let term = lineTerminator(of: destExisting)
+        var newDest = destExisting
+        if let last = destExisting.last, last != 0x0A { newDest.append(contentsOf: term) }
+        newDest.append(lineTextBytes)
+        newDest.append(contentsOf: term)
+        do {
+            try MailboxIO.backupOnce(destDescURL)
+            try MailboxIO.atomicWrite(newDest, to: destDescURL)
+        } catch {
+            for m in done { try? fm.moveItem(at: m.to, to: m.from) }
+            try? MailboxIO.atomicWrite(srcData, to: srcDescURL)
+            throw MoveIntoError.ioError(error.localizedDescription)
+        }
+        return true
+    }
+
     // MARK: renaming
 
     public enum RenameError: LocalizedError, Equatable {

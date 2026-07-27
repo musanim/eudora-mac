@@ -529,6 +529,41 @@ final class EudoraStoreTests: XCTestCase {
         try Data(descmap.utf8).write(to: root.appendingPathComponent("descmap.pce"))
     }
 
+    // MARK: separator recovery (non-newline-terminated records)
+
+    /// A message whose body isn't newline-terminated glues the next envelope to
+    /// its last line. `findRecords` must still split there — the following
+    /// asctime date proves it's a real envelope — or the two messages merge and
+    /// their `.toc` offsets stop matching.
+    func testFindRecordsRecoversGluedSeparator() {
+        let env = "From ???@??? Thu Nov 19 17:23:56 2009\r\n"
+        // First record ends WITHOUT a trailing newline, so the second envelope
+        // is preceded by '>' rather than a line break.
+        let first  = env + "Subject: one\r\n\r\nbody ending no newline>"
+        let second = env + "Subject: two\r\n\r\nbody two\r\n"
+        let bytes = Array((first + second).utf8)
+        let recs = Mbox.findRecords(bytes)
+        XCTAssertEqual(recs.count, 2, "the glued second envelope should be its own record")
+        XCTAssertEqual(recs[1].offset, Array(first.utf8).count)
+    }
+
+    /// The gate is the asctime date, not the preceding byte: the separator
+    /// string with non-date text after it (as could appear in a body) is not a
+    /// boundary.
+    func testFindRecordsIgnoresSeparatorWithoutEnvelopeDate() {
+        let env = "From ???@??? Thu Nov 19 17:23:56 2009\r\n"
+        let body = env + "Subject: one\r\n\r\nquoting >From ???@??? not a date here\r\n"
+        let recs = Mbox.findRecords(Array(body.utf8))
+        XCTAssertEqual(recs.count, 1, "a mid-body separator without an asctime date is not a record")
+    }
+
+    func testLooksLikeEnvelopeDate() {
+        XCTAssertTrue(Mbox.looksLikeEnvelopeDate(Array("Thu Nov 19 17:23:56 2009".utf8), at: 0))
+        XCTAssertTrue(Mbox.looksLikeEnvelopeDate(Array("Mon Jan  1 00:00:00 1970".utf8), at: 0))
+        XCTAssertFalse(Mbox.looksLikeEnvelopeDate(Array("not a date at all here!!".utf8), at: 0))
+        XCTAssertFalse(Mbox.looksLikeEnvelopeDate(Array("Thu Nov 19".utf8), at: 0))  // too short
+    }
+
     // MARK: fixture helpers
 
     private func mbx(_ base: String) -> URL { root.appendingPathComponent("\(base).mbx") }

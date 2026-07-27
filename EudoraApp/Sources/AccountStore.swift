@@ -54,6 +54,15 @@ final class AccountStore: ObservableObject {
         }
     }
 
+    /// Persist just the incoming (POP3) settings to UserDefaults — no Keychain —
+    /// so a live change like the auto-check toggle or interval sticks right away,
+    /// without waiting for the Save button.
+    func persistIncomingSettings() {
+        if let data = try? JSONEncoder().encode(pop) {
+            UserDefaults.standard.set(data, forKey: Self.popKey)
+        }
+    }
+
     // MARK: downloaded-UID tracking (per POP account)
 
     func knownUIDs() -> Set<String> {

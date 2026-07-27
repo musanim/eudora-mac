@@ -38,8 +38,19 @@ struct SettingsView: View {
     @State private var newIdentity = ""
     @State private var rescanNote: String?
 
+    /// The corrections list's in-progress new rule.
+    @State private var newCorrectionTrigger = ""
+    @State private var newCorrectionReplacement = ""
+
     /// Installed font families, resolved once for the composing-face picker.
     private static let families: [String] = NSFontManager.shared.availableFontFamilies
+
+    /// The auto-check interval field, clamped to at least 1 minute on entry so
+    /// the number field can never hold a zero or negative interval.
+    private var autoCheckMinutes: Binding<Int> {
+        Binding(get: { accounts.pop.autoCheckMinutes },
+                set: { accounts.pop.autoCheckMinutes = max(1, $0) })
+    }
 
     var body: some View {
         Form {
@@ -69,6 +80,16 @@ struct SettingsView: View {
                     Text("Messages are deleted only after they're written to your local archive.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                HStack(spacing: 6) {
+                    Toggle("", isOn: $accounts.pop.autoCheckEnabled)
+                        .labelsHidden()
+                    Text("Automatically check for new mail every")
+                    TextField("", value: autoCheckMinutes, format: .number)
+                        .frame(width: 56)
+                        .multilineTextAlignment(.trailing)
+                        .disabled(!accounts.pop.autoCheckEnabled)
+                    Text("minutes")
+                }
             }
             Section("Default font") {
                 Picker("Font", selection: $composeSettings.bodyFontName) {
@@ -85,7 +106,18 @@ struct SettingsView: View {
                             .tag(size)
                     }
                 }
-                Toggle("Antialias", isOn: $composeSettings.antialiasBody)
+                Picker("Antialiasing", selection: $composeSettings.bodyAntialiasing) {
+                    ForEach(BodyAntialiasing.allCases) { Text($0.label).tag($0) }
+                }
+                if composeSettings.bodyAntialiasing == .eudora {
+                    HStack {
+                        Text("Halo lightness")
+                        Slider(value: $composeSettings.eudoraHaloWhiteness, in: 0.4...0.95)
+                    }
+                    Text("Eudora-style keeps a crisp black core and adds a light gray "
+                            + "edge, the way Eudora 7 did. Slide right for a lighter halo.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Text("Used to compose messages and to read plain-text and unstyled "
                         + "mail. On your screen only — sent mail carries no font "
                         + "unless you style it.")
@@ -128,6 +160,47 @@ struct SettingsView: View {
                 Text("A domain rule like *@musanim.com counts every address at "
                         + "that domain as you. Changes take effect on the mailbox "
                         + "you're viewing right away.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Mailboxes") {
+                Toggle("Show Junk mailbox", isOn: $model.showJunkMailbox)
+                Text("Off hides the Junk mailbox from the sidebar and the move/search "
+                        + "pickers. Nothing on disk changes — turning it back on just "
+                        + "reveals it again.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Corrections — your auto-correct list") {
+                // Your own set only; nothing from macOS's system dictionary or
+                // text-replacement list. Same static-row + delete shape as "Me".
+                ForEach(model.correctionRules) { rule in
+                    HStack {
+                        Text(rule.trigger)
+                        Image(systemName: "arrow.right").foregroundStyle(.secondary)
+                        Text(rule.replacement)
+                        Spacer()
+                        Button {
+                            model.removeCorrection(trigger: rule.trigger)
+                        } label: {
+                            Image(systemName: "minus.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Remove \u{201C}\(rule.trigger)\u{201D}")
+                    }
+                }
+                HStack {
+                    TextField("Word", text: $newCorrectionTrigger)
+                        .textFieldStyle(.roundedBorder)
+                    Image(systemName: "arrow.right").foregroundStyle(.secondary)
+                    TextField("Replacement", text: $newCorrectionReplacement)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(addCorrection)
+                    Button("Add", action: addCorrection)
+                        .disabled(newCorrectionTrigger.trimmingCharacters(in: .whitespaces).isEmpty
+                                  || newCorrectionReplacement.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                Text("Type the word on the left and it becomes the text on the right — "
+                        + "case-sensitive. Adding a word that's already listed updates it. "
+                        + "You can also right-click a word while writing a message to add it.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -173,6 +246,12 @@ struct SettingsView: View {
         model.addMyIdentity(raw)
         newIdentity = ""
         rescanNote = nil
+    }
+
+    private func addCorrection() {
+        model.addCorrection(trigger: newCorrectionTrigger, replacement: newCorrectionReplacement)
+        newCorrectionTrigger = ""
+        newCorrectionReplacement = ""
     }
 }
 

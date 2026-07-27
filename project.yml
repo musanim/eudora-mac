@@ -92,6 +92,15 @@ schemes:
         EudoraApp: all
     run:
       config: Debug
+      # Silence the unified-logging chatter Xcode echoes from Apple frameworks —
+      # the tcp_input RST lines from Network.framework, the WKWebView WebContent
+      # sandbox-denial flood, the SwiftUI ProgressView min/max assertion, etc.
+      # None of it is Eudora's; all of it is expected. This mutes os_log/NSLog
+      # from the frameworks while leaving our own `print()` diagnostics (PerfLog)
+      # intact, since those go to stdout. Remove it if you ever need to see a
+      # framework's own os_log output while debugging.
+      environmentVariables:
+        OS_ACTIVITY_MODE: disable
     profile:
       config: Release
     analyze:

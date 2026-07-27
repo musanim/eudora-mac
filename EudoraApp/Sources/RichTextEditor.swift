@@ -18,27 +18,215 @@ import EudoraRichText
 
 // MARK: - the text view
 
-/// An `NSTextView` that can draw without antialiasing.
+/// An `NSTextView` that renders body text one of three ways: normal macOS
+/// smoothing, crisp (no antialiasing), or Eudora-7 style — a crisp solid core
+/// with a flat-gray halo on the pixels orthogonally adjacent to ink.
 ///
-/// AppKit antialiases text through the graphics context, not a view property, so
-/// turning it off means overriding `draw` to clear `shouldAntialias` first. This
-/// is what serves Stephen's non-Retina, crisp-stem preference (see
-/// `ComposeSettings.antialiasBody`); it affects only how the body looks locally
-/// and nothing that is sent.
+/// AppKit smooths text through the graphics context, not a view property, so
+/// crisp mode overrides `draw` to clear `shouldAntialias`. The Eudora style goes
+/// further: it caches a crisp bitmap of the view, grays the white pixels
+/// orthogonally (never diagonally) touching a black one — the exact, gradient-
+/// free thing Windows Eudora 7 did — and blits it back, giving a distinct solid
+/// core with a mild, adjustable halo. All three affect only how the body looks
+/// locally (see `ComposeSettings.bodyAntialiasing`); nothing about what is sent.
 final class BodyTextView: NSTextView {
-    var antialias: Bool = true {
-        didSet { if antialias != oldValue { needsDisplay = true } }
+    var renderingMode: BodyAntialiasing = .system {
+        didSet { if renderingMode != oldValue { needsDisplay = true } }
+    }
+    /// The Eudora halo's lightness, 0…1 (1 = white/none, lower = a darker gray).
+    var haloWhiteness: Double = 0.72 {
+        didSet { if haloWhiteness != oldValue, renderingMode == .eudora { needsDisplay = true } }
     }
 
+    /// Set while `cacheDisplay` re-enters `draw` for the offscreen crisp render,
+    /// so that pass draws plainly instead of recursing into the halo.
+    private var isCachingCrisp = false
+
     override func draw(_ dirtyRect: NSRect) {
-        guard !antialias, let ctx = NSGraphicsContext.current else {
+        if isCachingCrisp {
+            NSGraphicsContext.current?.shouldAntialias = false
             super.draw(dirtyRect)
             return
         }
+        switch renderingMode {
+        case .system: super.draw(dirtyRect)
+        case .off:    drawCrisp(dirtyRect)
+        case .eudora: drawEudoraStyle(dirtyRect)
+        }
+    }
+
+    private func drawCrisp(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current else { super.draw(dirtyRect); return }
         ctx.saveGraphicsState()
         ctx.shouldAntialias = false
         super.draw(dirtyRect)
         ctx.restoreGraphicsState()
+    }
+
+    /// Eudora-7 anti-aliasing: cache a crisp bitmap, halo it, blit it back.
+    private func drawEudoraStyle(_ dirtyRect: NSRect) {
+        let rect = dirtyRect.intersection(bounds)
+        guard !rect.isEmpty, let rep = bitmapImageRepForCachingDisplay(in: rect) else {
+            drawCrisp(dirtyRect)
+            return
+        }
+        isCachingCrisp = true
+        cacheDisplay(in: rect, to: rep)
+        isCachingCrisp = false
+        Self.applyHalo(rep, whiteness: haloWhiteness)
+        _ = rep.draw(in: rect, from: NSRect(origin: .zero, size: rect.size),
+                     operation: .copy, fraction: 1, respectFlipped: true, hints: nil)
+    }
+
+    /// Gray the background pixels that orthogonally touch an ink pixel. Ink =
+    /// luminance below mid; the halo is a flat gray at `whiteness`, and never
+    /// lightens a pixel that's already darker than it. Works in place on the
+    /// cached bitmap's 8-bit samples; only the alpha *position* matters (skipped
+    /// via `c`), so RGBA/BGRA channel order is irrelevant to gray + luminance.
+    static func applyHalo(_ rep: NSBitmapImageRep, whiteness: Double) {
+        guard rep.bitsPerSample == 8, rep.samplesPerPixel >= 3, !rep.isPlanar,
+              let data = rep.bitmapData else { return }
+        let w = rep.pixelsWide, h = rep.pixelsHigh
+        let bpr = rep.bytesPerRow, spp = rep.samplesPerPixel
+        guard w > 0, h > 0 else { return }
+        // Where the three colour bytes start, so the alpha byte is never read as
+        // colour nor overwritten with gray (which would make the halo translucent).
+        // The cache bitmap is usually little-endian ARGB — bytes B,G,R,A, alpha
+        // *last* — even though its format reports `.alphaFirst`; the alpha byte is
+        // at index 0 only when exactly one of {alphaFirst, littleEndian} holds.
+        let c: Int
+        if spp >= 4 {
+            let alphaFirst = rep.bitmapFormat.contains(.alphaFirst)
+            let little = rep.bitmapFormat.contains(.thirtyTwoBitLittleEndian)
+            c = (alphaFirst != little) ? 1 : 0     // alpha at byte 0 → colours 1,2,3
+        } else {
+            c = 0                                   // no alpha byte (spp == 3)
+        }
+        let gray = Int(max(0, min(255, Int((whiteness * 255).rounded()))))
+        let threshold = 128
+
+        func lum(_ p: UnsafeMutablePointer<UInt8>) -> Int {
+            (Int(p[c]) + Int(p[c + 1]) + Int(p[c + 2])) / 3
+        }
+
+        var ink = [Bool](repeating: false, count: w * h)
+        for y in 0..<h {
+            let row = data + y * bpr
+            for x in 0..<w where lum(row + x * spp) < threshold {
+                ink[y * w + x] = true
+            }
+        }
+        for y in 0..<h {
+            let row = data + y * bpr
+            for x in 0..<w {
+                let i = y * w + x
+                if ink[i] { continue }
+                let touches = (y > 0 && ink[i - w]) || (y < h - 1 && ink[i + w])
+                    || (x > 0 && ink[i - 1]) || (x < w - 1 && ink[i + 1])
+                guard touches else { continue }
+                let p = row + x * spp
+                if gray < lum(p) {          // only ever darken toward the halo gray
+                    p[c] = UInt8(gray); p[c + 1] = UInt8(gray); p[c + 2] = UInt8(gray)
+                }
+            }
+        }
+    }
+
+    // MARK: origin-aware paste
+    //
+    // Paste keeps the clipboard's formatting only when the copy happened inside
+    // *this* draft's editor. Anything from elsewhere — another app, or even a
+    // different compose window — comes in as plain text in the caret's own
+    // format, exactly as if it had been typed there. Text pasted from within the
+    // draft still behaves as it always has.
+    //
+    // How the origin is known: every copy/cut from this view tags the general
+    // pasteboard with a private type carrying a token unique to this editor,
+    // added *alongside* the rich types AppKit writes (`addTypes`, not
+    // `declareTypes`, so its data survives). On paste we keep formatting only
+    // when that token is present and matches — any other app writing the
+    // pasteboard clears the tag, and a different compose window carries a
+    // different token. `pasteAsPlainText` is AppKit's "paste and match style":
+    // it inserts the pasteboard's plain string using the typing attributes at
+    // the insertion point.
+
+    private static let internalPasteType =
+        NSPasteboard.PasteboardType("com.musanim.eudora.compose.internal")
+    private let editorToken = UUID().uuidString
+
+    override func copy(_ sender: Any?) {
+        super.copy(sender)
+        tagPasteboardAsInternal()
+    }
+
+    override func cut(_ sender: Any?) {
+        super.cut(sender)
+        tagPasteboardAsInternal()
+    }
+
+    private func tagPasteboardAsInternal() {
+        let pb = NSPasteboard.general
+        pb.addTypes([Self.internalPasteType], owner: nil)
+        pb.setString(editorToken, forType: Self.internalPasteType)
+    }
+
+    override func paste(_ sender: Any?) {
+        if NSPasteboard.general.string(forType: Self.internalPasteType) == editorToken {
+            super.paste(sender)          // copied here — keep its formatting
+        } else {
+            pasteAsPlainText(sender)     // from elsewhere — plain, matching the caret
+        }
+    }
+
+    // MARK: quick-add correction
+    //
+    // Extends — never replaces — AppKit's default editing menu, so the built-in
+    // spell-check items (Learn / Ignore / suggestions) stay put; we just add a
+    // "Correct 'word' to…" entry at the top for the word under the click (or the
+    // current selection). The rule itself is saved by the controller.
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = super.menu(for: event)
+        guard let menu, let word = correctionTarget(for: event) else { return menu }
+        let item = NSMenuItem(title: "Correct “\(word)” to…",
+                              action: #selector(addCorrection(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = word
+        menu.insertItem(NSMenuItem.separator(), at: 0)
+        menu.insertItem(item, at: 0)
+        return menu
+    }
+
+    /// The word to offer a correction for: the selection if there is one, else
+    /// the word under the click. Nil when neither yields a non-empty word.
+    private func correctionTarget(for event: NSEvent) -> String? {
+        let ns = string as NSString
+        let range: NSRange
+        let selected = selectedRange()
+        if selected.length > 0 {
+            range = selected
+        } else {
+            let point = convert(event.locationInWindow, from: nil)
+            guard let layoutManager, let textContainer,
+                  layoutManager.numberOfGlyphs > 0 else { return nil }
+            var fraction: CGFloat = 0
+            let glyph = layoutManager.glyphIndex(for: point, in: textContainer,
+                                                 fractionOfDistanceThroughGlyph: &fraction)
+            // `glyphIndex(for:)` clamps to numberOfGlyphs on an empty/short line;
+            // don't ask for a glyph that isn't there.
+            guard glyph < layoutManager.numberOfGlyphs else { return nil }
+            let index = layoutManager.characterIndexForGlyph(at: glyph)
+            guard index < ns.length else { return nil }
+            range = selectionRange(forProposedRange: NSRange(location: index, length: 0),
+                                   granularity: .selectByWord)
+        }
+        let word = ns.substring(with: range).trimmingCharacters(in: .whitespacesAndNewlines)
+        return word.isEmpty ? nil : word
+    }
+
+    @objc private func addCorrection(_ sender: NSMenuItem) {
+        guard let word = sender.representedObject as? String else { return }
+        (delegate as? RichTextEditorController)?.promptAddCorrection(for: word)
     }
 }
 
@@ -126,6 +314,19 @@ final class RichTextEditorController: NSObject, ObservableObject, NSTextViewDele
     /// a mutation it already knows the outcome of.
     private var isMutating = false
 
+    // MARK: auto-correction (the user's own list)
+
+    /// The replacement for a just-completed word, or nil. Set by `ComposeView`
+    /// from `AppModel`; defaults to no-op so the editor works uninjected.
+    var lookupCorrection: (String) -> String? = { _ in nil }
+    /// Persist a new correction (the right-click quick-add). Set by `ComposeView`.
+    var saveCorrection: (_ trigger: String, _ replacement: String) -> Void = { _, _ in }
+
+    /// When the last change was a typed word-terminator: where the word before it
+    /// ends, and the terminator's own length (usually 1, but 2 for an astral-plane
+    /// character). Consumed in `textDidChange`.
+    private var pendingCorrection: (end: Int, terminatorLength: Int)?
+
     /// The default font, resolved once per `defaults` value.
     private var defaultFont: NSFont {
         NSFont(name: defaults.family, size: CGFloat(defaults.size))
@@ -160,9 +361,95 @@ final class RichTextEditorController: NSObject, ObservableObject, NSTextViewDele
 
     // MARK: delegate
 
+    /// Note a typed word-terminator so `textDidChange` can correct the word that
+    /// just closed. Only a single non-alphanumeric character inserted at a caret
+    /// counts — not a paste, a deletion, or a multi-character change — so a
+    /// correction never fires from anything but finishing a word by typing.
+    func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange,
+                  replacementString: String?) -> Bool {
+        // Not while an IME is mid-composition: those intermediate insertions
+        // aren't finished words.
+        if affectedCharRange.length == 0, !textView.hasMarkedText(),
+           let s = replacementString, Self.isTypedBoundary(s) {
+            pendingCorrection = (affectedCharRange.location, (s as NSString).length)
+        } else {
+            pendingCorrection = nil
+        }
+        return true
+    }
+
     func textDidChange(_ notification: Notification) {
         guard !isMutating else { return }
+        if let p = pendingCorrection {
+            pendingCorrection = nil
+            applyCorrection(endingBefore: p.end, terminatorLength: p.terminatorLength)
+        }
         readBack()
+    }
+
+    /// Replace the word ending just before `end` (where the terminator was typed)
+    /// with its correction, if any. A single undo step, keeping the word's own
+    /// formatting; leaves the terminator and the caret where they were.
+    private func applyCorrection(endingBefore end: Int, terminatorLength: Int) {
+        guard let textView, let storage = textView.textStorage else { return }
+        let ns = storage.string as NSString
+        guard end > 0, end <= ns.length else { return }
+        // Walk back over the word characters to the word's start.
+        var start = end
+        while start > 0, Self.isWordCharacter(ns.character(at: start - 1)) { start -= 1 }
+        guard start < end else { return }
+
+        let word = ns.substring(with: NSRange(location: start, length: end - start))
+        guard let replacement = lookupCorrection(word) else { return }
+
+        let range = NSRange(location: start, length: end - start)
+        let attrs = storage.attributes(at: start, effectiveRange: nil)
+        let attributed = NSAttributedString(string: replacement, attributes: attrs)
+        // A distinct undo step from the surrounding typing, so one ⌘Z undoes just
+        // the correction.
+        textView.breakUndoCoalescing()
+        guard textView.shouldChangeText(in: range, replacementString: replacement) else { return }
+        isMutating = true
+        storage.replaceCharacters(in: range, with: attributed)
+        textView.didChangeText()
+        isMutating = false
+
+        // The caret sat just after the terminator; shift it by the length change.
+        let delta = (replacement as NSString).length - (end - start)
+        let caret = min(end + terminatorLength + delta, (storage.string as NSString).length)
+        textView.setSelectedRange(NSRange(location: max(0, caret), length: 0))
+    }
+
+    /// Show the quick-add prompt for `word` (the editor's right-click item), and
+    /// save the rule the user confirms.
+    func promptAddCorrection(for word: String) {
+        let alert = NSAlert()
+        alert.messageText = "Correct “\(word)” to:"
+        alert.informativeText =
+            "Whenever you type “\(word)” as a whole word, it will be replaced with what you enter here."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = word
+        field.selectText(nil)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        saveCorrection(word, field.stringValue)
+    }
+
+    /// A character that is part of a word (letters, digits) — what we walk back
+    /// over to find the word before a terminator.
+    static func isWordCharacter(_ c: unichar) -> Bool {
+        guard let scalar = UnicodeScalar(c) else { return false }
+        return CharacterSet.alphanumerics.contains(scalar)
+    }
+
+    /// A single typed character that ends a word: anything that isn't a word
+    /// character — a space, return, or punctuation.
+    static func isTypedBoundary(_ s: String) -> Bool {
+        guard s.count == 1, let scalar = s.unicodeScalars.first else { return false }
+        return !CharacterSet.alphanumerics.contains(scalar)
     }
 
     func textViewDidChangeSelection(_ notification: Notification) {
@@ -363,7 +650,8 @@ struct RichTextEditor: NSViewRepresentable {
     @ObservedObject var controller: RichTextEditorController
     let seed: RichText
     let defaults: RichTextDefaults
-    let antialias: Bool
+    let antialiasing: BodyAntialiasing
+    let haloWhiteness: Double
 
     func makeNSView(context: Context) -> NSScrollView {
         // A non-zero starting frame so the width-tracking text container isn't
@@ -377,7 +665,15 @@ struct RichTextEditor: NSViewRepresentable {
         textView.allowsUndo = true
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
-        textView.antialias = antialias
+        // Spell check: red-underline misspellings as you type, with right-click
+        // suggestions / Learn / Ignore from AppKit's built-in menu. Grammar and
+        // auto-correction stay off — the same conservative stance as the quote and
+        // dash substitutions above, so nothing silently rewrites the text.
+        textView.isContinuousSpellCheckingEnabled = true
+        textView.isGrammarCheckingEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.renderingMode = antialiasing
+        textView.haloWhiteness = haloWhiteness
 
         // Grow vertically with the text; the scroll view supplies the clip.
         textView.isVerticallyResizable = true
@@ -402,9 +698,12 @@ struct RichTextEditor: NSViewRepresentable {
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        // Antialiasing can be toggled from Settings while a window is open; apply
+        // Antialiasing can be changed from Settings while a window is open; apply
         // it live. Content and defaults are loaded once in `attach` — re-running
         // them here would clobber edits.
-        (scrollView.documentView as? BodyTextView)?.antialias = antialias
+        if let textView = scrollView.documentView as? BodyTextView {
+            textView.renderingMode = antialiasing
+            textView.haloWhiteness = haloWhiteness
+        }
     }
 }

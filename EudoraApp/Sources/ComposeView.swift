@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import EudoraStore
 import EudoraNet
 
@@ -29,12 +30,19 @@ struct ComposeView: View {
     /// Escape take the same route as the title-bar button and can't bypass the
     /// Save prompt.
     @State private var windowHandle = WindowCloseGuard.WindowHandle()
+    @State private var from: String
     @State private var to: String
     @State private var cc: String
     @State private var bcc: String
     @State private var subject: String
+    /// Files attached to this message, shown in the Attachments row.
+    @State private var attachments: [OutgoingMessage.Attachment]
     @State private var sending = false
     @State private var error: String?
+    /// Whether a file drag is currently over the Attachments row.
+    @State private var dropTargeted = false
+    /// Recipient fields the server refused (highlighted red until edited).
+    @State private var invalidFields: Set<Field> = []
 
     /// The draft as it stands, including where its record lives in Out and
     /// whether the user's content has ever been written there. Seeded from
@@ -48,8 +56,12 @@ struct ComposeView: View {
     /// reports clean — and so Close doesn't nag about a message you opened and
     /// didn't touch.
     private var isDirty: Bool {
-        to != draft.to || cc != draft.cc || bcc != draft.bcc
+        from != draft.from || to != draft.to || cc != draft.cc || bcc != draft.bcc
             || subject != draft.subject || editor.content != draft.content
+            // Compare by identity, not bytes: attachments are only added or
+            // removed whole, never edited in place, so the id list captures every
+            // change without comparing (possibly large) `Data` on each render.
+            || attachments.map(\.id) != draft.attachments.map(\.id)
     }
 
     /// True for a message that has never been saved and never edited — ⌘N
@@ -72,10 +84,12 @@ struct ComposeView: View {
         self.seed = seed
         self.seedContent = seed.content
         _draft = State(initialValue: seed)
+        _from = State(initialValue: seed.from)
         _to = State(initialValue: seed.to)
         _cc = State(initialValue: seed.cc)
         _bcc = State(initialValue: seed.bcc)
         _subject = State(initialValue: seed.subject)
+        _attachments = State(initialValue: seed.attachments)
         // A failure to pre-save shows here rather than as a banner: this window
         // goes up on top of the main one immediately, so a banner would be
         // hidden before it could be read.
@@ -91,12 +105,20 @@ struct ComposeView: View {
             RichTextEditor(controller: editor,
                            seed: seedContent,
                            defaults: composeSettings.richTextDefaults,
-                           antialias: composeSettings.antialiasBody)
-                .frame(minHeight: 220)
+                           antialiasing: composeSettings.bodyAntialiasing,
+                           haloWhiteness: composeSettings.eudoraHaloWhiteness)
+                // A floor, not a demand: it fills the slack below the header but
+                // doesn't insist on maximum height (which inflated the whole stack
+                // past the window, clipping To under the title bar and the buttons
+                // off the bottom).
+                .frame(minHeight: 200)
             Divider()
             footer
         }
-        .frame(minWidth: 580, minHeight: 460)
+        // Tall enough for the six header rows + Attach line, the format strip, a
+        // usable body, and the footer — the Attach row pushed the old 460 minimum
+        // past the content, so the window clipped its own top and bottom.
+        .frame(minWidth: 580, minHeight: 540)
         .background(BackTabCatcher { focus = Self.field(before: focus) })
         // Catches the window's own close button and ⌘W, not just the Close
         // button in the footer — the prompt has to appear however the window is
@@ -113,7 +135,12 @@ struct ComposeView: View {
         // save prompt itself lives in this SwiftUI view. One snapshot covers
         // every field the review cares about; `reviewSnapshot` folds them so a
         // single `onChange` fires for any of them. See `AppModel.reviewComposeBeforeQuit`.
-        .onAppear { pushReview() }
+        .onAppear {
+            pushReview()
+            // Wire the editor's auto-correction to the user's own list.
+            editor.lookupCorrection = { model.correctionReplacement(for: $0) }
+            editor.saveCorrection = { model.addCorrection(trigger: $0, replacement: $1) }
+        }
         .onChange(of: reviewSnapshot) { _ in pushReview() }
         .onDisappear { model.closeDraft(draftID) }
         .confirmationDialog("Save changes to this message?",
@@ -141,25 +168,164 @@ struct ComposeView: View {
 
     private var headerFields: some View {
         Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 8, verticalSpacing: 6) {
-            field("To", $to, .to)
-            field("Cc", $cc, .cc)
-            field("Bcc", $bcc, .bcc)
+            recipientField("To", $to, .to)
+            GridRow {
+                Text("From").foregroundStyle(.secondary).gridColumnAlignment(.trailing)
+                // Click-only: rarely edited, so it's out of the Tab order (see
+                // `ClickOnlyField`) and not one of the tracked focus fields.
+                ClickOnlyField(text: $from).frame(height: 22)
+            }
+            recipientField("Cc", $cc, .cc)
+            recipientField("Bcc", $bcc, .bcc)
             GridRow {
                 Text("Subject").foregroundStyle(.secondary).gridColumnAlignment(.trailing)
                 TextField("", text: $subject)
                     .focused($focus, equals: .subject)
             }
+            GridRow {
+                Text("Attach").foregroundStyle(.secondary).gridColumnAlignment(.trailing)
+                attachmentsField
+            }
         }
         .padding(12)
     }
 
-    private func field(_ label: String, _ text: Binding<String>, _ id: Field) -> some View {
+    /// The Attachments line: chips for what's attached (each removable), a drop
+    /// target for dragging files in, and a paperclip button to pick them.
+    private var attachmentsField: some View {
+        HStack(spacing: 6) {
+            if attachments.isEmpty {
+                Text("Drag files here")
+                    .foregroundStyle(.tertiary)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(attachments) { attachmentChip($0) }
+                    }
+                }
+                // A horizontal ScrollView is vertically greedy by default; pin its
+                // height so it can't inflate the whole header block.
+                .frame(height: 24)
+            }
+            Spacer(minLength: 6)
+            Button { addAttachmentsViaPanel() } label: {
+                Image(systemName: "paperclip")
+            }
+            .buttonStyle(.borderless)
+            .help("Attach a file…")
+        }
+        .frame(maxWidth: .infinity, minHeight: 26, maxHeight: 26, alignment: .leading)
+        .contentShape(Rectangle())
+        .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { addAttachments(from: $0) }
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 4).strokeBorder(Color.accentColor, lineWidth: 2)
+            }
+        }
+    }
+
+    private func attachmentChip(_ att: OutgoingMessage.Attachment) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: "doc")
+            Text(att.filename).lineLimit(1)
+            Button {
+                attachments.removeAll { $0.id == att.id }
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.borderless)
+            .help("Remove \(att.filename)")
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Color.secondary.opacity(0.15), in: Capsule())
+    }
+
+    // MARK: attaching files
+
+    /// Read a dropped/picked file into an in-memory attachment. Reading now (not
+    /// at send) is what lets the attachment survive the file being moved or the
+    /// draft being saved and reopened.
+    private func attachFile(at url: URL) {
+        guard let data = try? Data(contentsOf: url) else {
+            error = "Couldn't read \(url.lastPathComponent)."
+            return
+        }
+        let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
+            ?? "application/octet-stream"
+        attachments.append(.init(filename: url.lastPathComponent, mimeType: mime, data: data))
+    }
+
+    private func addAttachments(from providers: [NSItemProvider]) -> Bool {
+        var handled = false
+        for provider in providers
+        where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            handled = true
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
+                // The system usually hands a `public.file-url` back as Data, but
+                // sometimes as an NSURL/URL — accept either rather than silently
+                // dropping the file.
+                let url: URL?
+                switch item {
+                case let data as Data: url = URL(dataRepresentation: data, relativeTo: nil)
+                case let u as URL:      url = u
+                case let ns as NSURL:   url = ns as URL
+                default:                url = nil
+                }
+                guard let url else { return }
+                DispatchQueue.main.async { attachFile(at: url) }
+            }
+        }
+        return handled
+    }
+
+    private func addAttachmentsViaPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls { attachFile(at: url) }
+    }
+
+    /// A recipient field (To/Cc/Bcc) with recently-used auto-fill. It manages its
+    /// own first responder against the shared `$focus`. It also carries a
+    /// `.focused` modifier — not to *drive* the field (the representable does that
+    /// from the same binding), but so SwiftUI knows a view claims this focus value
+    /// and doesn't reset `$focus` to nil the instant `BackTabCatcher` sets it
+    /// during a Shift-Tab, which would strand reverse focus with nowhere to land.
+    private func recipientField(_ label: String, _ text: Binding<String>, _ id: Field) -> some View {
         GridRow {
             Text(label).foregroundStyle(.secondary).gridColumnAlignment(.trailing)
-            TextField("", text: text)
-                .textFieldStyle(.roundedBorder)
+            RecipientField(text: text,
+                           focus: $focus,
+                           id: id,
+                           completions: { model.recipientCompletions(prefix: $0) },
+                           remove: { model.removeRecentRecipient($0) })
+                .frame(height: 22)
                 .focused($focus, equals: id)
+                // A red ring on the field the server refused; cleared the moment
+                // the user edits it, so it never lingers past a fix.
+                .overlay {
+                    if invalidFields.contains(id) {
+                        RoundedRectangle(cornerRadius: 6).stroke(Color.red, lineWidth: 2)
+                    }
+                }
+                .onChange(of: text.wrappedValue) { _ in invalidFields.remove(id) }
         }
+    }
+
+    /// Which recipient fields contain `address` — the one(s) to flag when the
+    /// server refuses it. A substring match on the raw text, so it finds the
+    /// address whether it was typed bare or inside a "Name <addr>".
+    private func fieldsContaining(_ address: String) -> Set<Field> {
+        let needle = address.lowercased()
+        guard !needle.isEmpty else { return [] }
+        var result: Set<Field> = []
+        if to.lowercased().contains(needle) { result.insert(.to) }
+        if cc.lowercased().contains(needle) { result.insert(.cc) }
+        if bcc.lowercased().contains(needle) { result.insert(.bcc) }
+        return result
     }
 
     // MARK: focus order
@@ -169,6 +335,7 @@ struct ComposeView: View {
     /// SwiftUI `@FocusState` neither tracks nor moves it. Shift-Tab from the
     /// first header field wraps to the last header field, not into the body.
     private enum Field: Hashable, CaseIterable {
+        // From is deliberately absent — it's click-only, out of the Tab order.
         case to, cc, bcc, subject
     }
 
@@ -295,6 +462,7 @@ struct ComposeView: View {
     private func currentDraft() -> ComposeDraft {
         var current = draft
         if let live = model.openDrafts[draftID] { current.outOffset = live.outOffset }
+        current.from = from
         current.to = to
         current.cc = cc
         current.bcc = bcc
@@ -305,6 +473,7 @@ struct ComposeView: View {
         let content = editor.content
         current.body = content.plainText
         current.styledBody = content.isStyled ? content : nil
+        current.attachments = attachments
         return current
     }
 
@@ -312,14 +481,18 @@ struct ComposeView: View {
     /// one `Equatable` value so a single `onChange` catches any change — a field
     /// edit, a body edit, or `isDirty` flipping after a save.
     private struct ReviewSnapshot: Equatable {
-        var to: String, cc: String, bcc: String, subject: String
+        var from: String, to: String, cc: String, bcc: String, subject: String
         var content: RichText
+        // The attachment id list, not the attachments themselves — cheap to
+        // compare and enough to notice one added or removed.
+        var attachmentIDs: [String]
         var isDirty: Bool
     }
 
     private var reviewSnapshot: ReviewSnapshot {
-        ReviewSnapshot(to: to, cc: cc, bcc: bcc, subject: subject,
-                       content: editor.content, isDirty: isDirty)
+        ReviewSnapshot(from: from, to: to, cc: cc, bcc: bcc, subject: subject,
+                       content: editor.content, attachmentIDs: attachments.map(\.id),
+                       isDirty: isDirty)
     }
 
     /// Push this window's live content and dirty state into the model, so a Quit
@@ -405,6 +578,47 @@ struct ComposeView: View {
         }
     }
 
+    /// A single-line field that takes focus on a click but is skipped by Tab, for
+    /// the rarely-edited From line. `canBecomeKeyView` false removes it from the
+    /// key-view (Tab) loop; a mouse click still makes it first responder.
+    private struct ClickOnlyField: NSViewRepresentable {
+        @Binding var text: String
+
+        func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+
+        func makeNSView(context: Context) -> NSTextField {
+            let field = TabSkippingTextField()
+            field.delegate = context.coordinator
+            field.isBordered = true
+            field.isBezeled = true
+            field.bezelStyle = .roundedBezel
+            field.drawsBackground = true
+            field.usesSingleLineMode = true
+            field.cell?.wraps = false
+            field.cell?.isScrollable = true
+            field.lineBreakMode = .byClipping
+            field.stringValue = text
+            return field
+        }
+
+        func updateNSView(_ field: NSTextField, context: Context) {
+            if field.stringValue != text { field.stringValue = text }
+        }
+
+        final class Coordinator: NSObject, NSTextFieldDelegate {
+            private let text: Binding<String>
+            init(text: Binding<String>) { self.text = text }
+            func controlTextDidChange(_ notification: Notification) {
+                guard let field = notification.object as? NSTextField else { return }
+                text.wrappedValue = field.stringValue
+            }
+        }
+
+        final class TabSkippingTextField: NSTextField {
+            override var canBecomeKeyView: Bool { false }
+        }
+    }
+
     private func send() {
         // Belt as well as the disabled button: ⌘D goes through the same action,
         // and delivering twice is not recoverable.
@@ -425,14 +639,21 @@ struct ComposeView: View {
         // today's text/plain bytes.
         let content = editor.content
         let html = content.isStyled ? RichTextHTML.html(from: content) : nil
+        // The From the user set in the window (defaulted from the account), split
+        // into name + address for assembly; the address is also the SMTP envelope
+        // sender. Falls back to the account address only if somehow blank.
+        let (fromName, fromAddress) =
+            OutgoingMessage.splitFrom(from.isEmpty ? account.fromAddress : from)
         let message = OutgoingMessage(
-            fromName: account.fromName, fromAddress: account.fromAddress,
+            fromName: fromName, fromAddress: fromAddress,
             to: toList, cc: model.splitAddresses(cc), bcc: model.splitAddresses(bcc),
             subject: subject, body: content.plainText, htmlBody: html,
+            attachments: attachments,
             inReplyTo: seed.inReplyTo, references: seed.references)
 
         sending = true
         error = nil
+        invalidFields = []
         Task {
             do {
                 let sent = try await SMTPClient.send(message, account: account, password: password)
@@ -445,6 +666,8 @@ struct ComposeView: View {
                 // next to it forever.
                 try model.recordSent(currentDraft(), raw: sent.raw,
                                      who: toList.first ?? "", subject: subject)
+                // Feed the To addresses into the auto-fill history (To only).
+                model.recordSentRecipients(toList)
                 model.showBanner("Message sent.")
                 sending = false
                 // Not `requestClose()`: `wasSent` was set moments ago and the
@@ -455,6 +678,11 @@ struct ComposeView: View {
             } catch {
                 sending = false
                 self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                // If the server named the address it refused, mark the field(s)
+                // that address came from so the eye lands on what to fix.
+                if let rejected = (error as? SMTPError)?.rejectedRecipient {
+                    invalidFields = fieldsContaining(rejected)
+                }
                 // Mark the message in Out as having failed to send, and save
                 // what's in the window while we're at it. Two reasons: the list
                 // should show *why* this message is still sitting there, and a

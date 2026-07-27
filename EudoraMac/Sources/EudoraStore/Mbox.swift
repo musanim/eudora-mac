@@ -17,7 +17,20 @@ public enum Mbox {
         var i = 0
         while let idx = Bytes.find(separator, in: bytes, from: i) {
             let atLineStart = (idx == 0) || bytes[idx - 1] == 0x0a || bytes[idx - 1] == 0x0d
-            if atLineStart { starts.append(idx) }
+            // A separator not at a line start is still a real record when a
+            // genuine envelope date follows it. Some archived messages weren't
+            // newline-terminated, so the next message's `From ???@???` is glued
+            // to the previous line — preceded by a NUL left by compaction, a
+            // '>', a quote mark — and the `.toc` records those as message
+            // starts. Without recovering them the messages merge into their
+            // predecessor and their `.toc` offsets stop matching, which throws
+            // the whole index onto the status-less scan path. Gating on the
+            // asctime date is safe: across the entire real tree every
+            // non-line-start occurrence of this separator is a true envelope and
+            // none is body text, so this never invents a boundary.
+            if atLineStart || looksLikeEnvelopeDate(bytes, at: idx + separator.count) {
+                starts.append(idx)
+            }
             i = idx + 1
         }
         var recs: [MboxRecord] = []
@@ -26,6 +39,27 @@ public enum Mbox {
             recs.append(MboxRecord(offset: start, length: end - start))
         }
         return recs
+    }
+
+    /// True when `bytes[i...]` begins with an asctime date like
+    /// "Thu Nov 19 17:23:56 2009" — the shape Eudora writes immediately after the
+    /// `From ???@??? ` separator. Used by `findRecords` to accept a separator
+    /// that isn't at a line start without ever mistaking body text for a
+    /// boundary. Byte-level and allocation-free; the day may be space-padded.
+    static func looksLikeEnvelopeDate(_ bytes: [UInt8], at i: Int) -> Bool {
+        // "AAA AAA D HH:MM:SS YYYY" — 24 bytes.
+        guard i >= 0, i + 24 <= bytes.count else { return false }
+        func alpha(_ b: UInt8) -> Bool { let l = b | 0x20; return l >= 0x61 && l <= 0x7a }
+        func digit(_ b: UInt8) -> Bool { b >= 0x30 && b <= 0x39 }
+        func sp(_ b: UInt8) -> Bool { b == 0x20 }
+        func colon(_ b: UInt8) -> Bool { b == 0x3a }
+        return alpha(bytes[i]) && alpha(bytes[i+1]) && alpha(bytes[i+2]) && sp(bytes[i+3])
+            && alpha(bytes[i+4]) && alpha(bytes[i+5]) && alpha(bytes[i+6]) && sp(bytes[i+7])
+            && (sp(bytes[i+8]) || digit(bytes[i+8])) && digit(bytes[i+9]) && sp(bytes[i+10])
+            && digit(bytes[i+11]) && digit(bytes[i+12]) && colon(bytes[i+13])
+            && digit(bytes[i+14]) && digit(bytes[i+15]) && colon(bytes[i+16])
+            && digit(bytes[i+17]) && digit(bytes[i+18]) && sp(bytes[i+19])
+            && digit(bytes[i+20]) && digit(bytes[i+21]) && digit(bytes[i+22]) && digit(bytes[i+23])
     }
 
     /// The RFC-822 message bytes for one record, with the leading

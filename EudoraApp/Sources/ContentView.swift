@@ -185,7 +185,22 @@ struct ContentView: View {
             SplashWindow.show()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 model.openDefaultIfAvailable()
+                // After the folder is open (so a launch-time check can find the
+                // In box). Starts the timer and, if auto-check is on, fetches once
+                // right away. Reconfigured below when the settings change.
+                model.configureAutoCheck()
             }
+        }
+        // Auto-check is a live preference: persist it the moment it changes (the
+        // Save button isn't required for it), and reconfigure — which restarts
+        // the timer and does an immediate check when it's on.
+        .onChange(of: accounts.pop.autoCheckEnabled) { _ in
+            accounts.persistIncomingSettings()
+            model.configureAutoCheck()
+        }
+        .onChange(of: accounts.pop.autoCheckMinutes) { _ in
+            accounts.persistIncomingSettings()
+            model.configureAutoCheck()
         }
         // React to selection *after* the view-update pass, so the follow-on
         // @Published mutations don't fire during it.
@@ -264,9 +279,10 @@ struct SidebarView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                MailboxTree(tree: model.tree,
+                MailboxTree(tree: model.visibleTree,
                             treeVersion: model.treeVersion,
                             selected: model.selectedMailboxID,
+                            inboxHasNewMail: model.inboxHasNewMail,
                             selection: model.mailboxSelection,
                             mailboxIsDeletablyEmpty: { model.mailboxIsDeletablyEmpty($0) },
                             onDeleteMailbox: { model.deleteMailbox($0) },
@@ -274,7 +290,8 @@ struct SidebarView: View {
                             onDeleteFolder: { model.deleteFolder($0) },
                             canMove: { model.canMove($0, up: $1) },
                             onMove: { model.moveTreeItem($0, up: $1) },
-                            onRename: { model.renameTreeItem($0) })
+                            onRename: { model.renameTreeItem($0) },
+                            onMoveToGroup: { model.moveIntoGroup($0, into: $1) })
                     .equatable()
             }
         }
@@ -303,6 +320,9 @@ struct MailboxTree: View, Equatable {
     let tree: [MailboxItem]
     let treeVersion: Int
     let selected: MailboxItem.ID?
+    /// Whether In is carrying unlooked-at new mail — drives the unread glyph on
+    /// the In row. In `==` so the badge appearing/clearing re-renders the tree.
+    let inboxHasNewMail: Bool
     let selection: Binding<MailboxItem.ID?>
 
     /// Live checks and actions, queried only when a row's context menu is
@@ -316,28 +336,53 @@ struct MailboxTree: View, Equatable {
     let canMove: (MailboxItem.ID, _ up: Bool) -> Bool
     let onMove: (MailboxItem.ID, _ up: Bool) -> Void
     let onRename: (MailboxItem.ID) -> Void
+    /// Move a mailbox/folder into a destination folder (`nil` = the tree root /
+    /// Top Level). See `AppModel.moveIntoGroup`.
+    let onMoveToGroup: (_ item: MailboxItem.ID, _ destination: MailboxItem.ID?) -> Void
 
     static func == (a: MailboxTree, b: MailboxTree) -> Bool {
         a.treeVersion == b.treeVersion && a.selected == b.selected
+            && a.inboxHasNewMail == b.inboxHasNewMail
     }
 
     var body: some View {
         List(selection: selection) {
-            OutlineGroup(tree, children: \.children) { item in
-                MailboxRow(item: item)
-                    .tag(item.id)
-                    // A SwiftUI `.contextMenu`, and deliberately so despite the
-                    // "menus over the mailbox tree must be AppKit" rule. That
-                    // rule exists because SwiftUI builds *nested* menu content
-                    // eagerly — a Move submenu materialised all 2,657 mailboxes
-                    // per right-click. This menu is one flat item, built only
-                    // when the row is actually right-clicked; there is nothing
-                    // for the eager builder to be eager about. If this menu
-                    // ever grows a submenu that walks the tree, it must move to
-                    // AppKit (see MessageContextMenu for the pattern).
-                    .contextMenu { contextMenu(for: item) }
+            // System mailboxes (In/Out/Junk/Trash) are pinned at the top and have
+            // no children, so they're a flat ForEach; a divider then sets them off
+            // from the user's own mailboxes and folders below.
+            ForEach(systemMailboxes) { item in row(for: item) }
+            if !systemMailboxes.isEmpty && !otherMailboxes.isEmpty {
+                Divider()
             }
+            OutlineGroup(otherMailboxes, children: \.children) { item in row(for: item) }
         }
+    }
+
+    /// The pinned system boxes and everything else, split off `tree` (already
+    /// Junk-filtered by the caller via `visibleTree`).
+    private var systemMailboxes: [MailboxItem] { tree.filter { Self.isSystem($0.type) } }
+    private var otherMailboxes: [MailboxItem] { tree.filter { !Self.isSystem($0.type) } }
+
+    private static func isSystem(_ type: MailboxType) -> Bool {
+        switch type {
+        case .inbox, .outbox, .trash, .junk: return true
+        case .folder, .mailbox: return false
+        }
+    }
+
+    @ViewBuilder
+    private func row(for item: MailboxItem) -> some View {
+        MailboxRow(item: item, newMail: inboxHasNewMail && item.type == .inbox)
+            .tag(item.id)
+            // A SwiftUI `.contextMenu`, and deliberately so despite the
+            // "menus over the mailbox tree must be AppKit" rule. That rule exists
+            // because SwiftUI builds *nested* menu content eagerly — a Move submenu
+            // materialised all 2,657 mailboxes per right-click. This menu is one
+            // flat item, built only when the row is actually right-clicked; there
+            // is nothing for the eager builder to be eager about. If this menu ever
+            // grows a submenu that walks the tree, it must move to AppKit (see
+            // MessageContextMenu for the pattern).
+            .contextMenu { contextMenu(for: item) }
     }
 
     /// A regular mailbox or a folder gets Move Up / Move Down (within its group)
@@ -354,6 +399,7 @@ struct MailboxTree: View, Equatable {
             Button("Rename…") { onRename(item.id) }
             Divider()
             moveItems(for: item)
+            moveToGroupMenu(for: item)
             Divider()
             if folderIsDeletablyEmpty(item.id) {
                 Button("Delete") { onDeleteFolder(item.id) }
@@ -364,6 +410,7 @@ struct MailboxTree: View, Equatable {
             Button("Rename…") { onRename(item.id) }
             Divider()
             moveItems(for: item)
+            moveToGroupMenu(for: item)
             Divider()
             if mailboxIsDeletablyEmpty(item.id) {
                 Button("Delete") { onDeleteMailbox(item.id) }
@@ -380,10 +427,68 @@ struct MailboxTree: View, Equatable {
         Button("Move Down") { onMove(item.id, false) }
             .disabled(!canMove(item.id, false))
     }
+
+    /// "Move to group ▸ …", hierarchical: Top Level, then each top-level group as
+    /// a nested submenu. The destinations are *folders only*, and the whole menu
+    /// is built eagerly on right-click (SwiftUI doesn't build submenus lazily) —
+    /// fine for a modest number of groups; if a tree ever grows a large, deep
+    /// group hierarchy and this drags, it's the thing to move to an AppKit lazy
+    /// menu (see MessageContextMenu / MailboxMenuBuilder).
+    @ViewBuilder
+    private func moveToGroupMenu(for item: MailboxItem) -> some View {
+        Menu("Move to group") {
+            Button("Top Level") { onMoveToGroup(item.id, nil) }
+            let groups = Self.subGroups(of: tree, excluding: item.id)
+            if !groups.isEmpty {
+                Divider()
+                ForEach(groups) { group in
+                    GroupSubmenu(folder: group, moving: item.id,
+                                 onMove: { onMoveToGroup(item.id, $0) })
+                }
+            }
+        }
+    }
+
+    /// The folders directly inside `items`, minus the item being moved and its
+    /// own subtree — you can't file a folder inside itself.
+    private static func subGroups(of items: [MailboxItem]?,
+                                  excluding moving: MailboxItem.ID) -> [MailboxItem] {
+        (items ?? []).filter {
+            $0.isFolder && $0.id != moving && !$0.id.hasPrefix(moving + "/")
+        }
+    }
+
+    /// One group in the hierarchical Move-to-group menu. A leaf group is a plain
+    /// button (click to move into it); a group with sub-groups is a submenu whose
+    /// *own label* moves into it (`primaryAction`) while the chevron opens its
+    /// sub-groups — so every group is a direct destination, no "Move here" needed.
+    /// It's a `View` struct because a `some View` function can't call itself,
+    /// which SwiftUI recursion needs.
+    private struct GroupSubmenu: View {
+        let folder: MailboxItem
+        let moving: MailboxItem.ID
+        let onMove: (MailboxItem.ID) -> Void
+
+        var body: some View {
+            let subgroups = MailboxTree.subGroups(of: folder.children, excluding: moving)
+            if subgroups.isEmpty {
+                Button(folder.display) { onMove(folder.id) }
+            } else {
+                Menu(folder.display) {
+                    ForEach(subgroups) { GroupSubmenu(folder: $0, moving: moving, onMove: onMove) }
+                } primaryAction: {
+                    onMove(folder.id)
+                }
+            }
+        }
+    }
 }
 
 struct MailboxRow: View {
     let item: MailboxItem
+    /// Whether to draw the new-mail glyph. Only ever true for the In row — the
+    /// caller gates it on `item.type == .inbox` (see `AppModel.inboxHasNewMail`).
+    let newMail: Bool
 
     var body: some View {
         HStack(spacing: 6) {
@@ -401,6 +506,15 @@ struct MailboxRow: View {
                 Image(RowIcon.unsent)
                     .interpolation(.none)
                     .help("Unsent mail waiting to be sent")
+            }
+            // The unread glyph next to In when Check Mail has brought in new
+            // messages the user hasn't looked at yet — the In counterpart of the
+            // unsent glyph above. Cleared on engaging with In (see
+            // `AppModel.clearInboxNewMailBadge`).
+            if newMail {
+                Image(RowIcon.unread)
+                    .interpolation(.none)
+                    .help("New unread mail")
             }
             Spacer()
             if !item.isFolder && item.messageCount > 0 {
@@ -498,15 +612,33 @@ enum MessageTableMetrics {
 /// recover that last gap would be to shrink the glyph column below its 45 pt of
 /// artwork. Retune freely: unlike the metrics, these are taste, not measurement.
 enum MessageColumnWidths {
-    static let who: CGFloat = 247
-    // Widened from 123 to fit "2026jul22 16:26:35" — the YYYYmmmDD HH:mm:ss
-    // date runs ~111 pt at Arial 13, which the old width left no margin for.
-    static let date: CGFloat = 145
+    /// The starting widths, used until the user drags a header divider. Who and
+    /// Date are then user-adjustable and remembered globally (see `AppModel`);
+    /// Subject is the trailing flexible column and takes the remainder.
+    static let whoDefault: CGFloat = 247
+    // Date was widened from 123 to fit "2026jul22 16:26:35" — the YYYYmmmDD
+    // HH:mm:ss date runs ~111 pt at Arial 13, which the old width left no room for.
+    static let dateDefault: CGFloat = 145
 
-    /// Per column, in `TableColumn` order; `nil` means "let it flex".
-    /// Only the trailing column may be `nil`.
-    static var pinned: [CGFloat?] {
-        [HeaderIcon.leadingColumnWidth, who, date, nil]
+    /// The narrowest each column may be dragged. Kept a little above each header
+    /// label so it can never be hidden. Taste, not measurement — retune freely.
+    static let whoMin: CGFloat = 55
+    static let dateMin: CGFloat = 55
+    /// Subject is flexible; this floor keeps a very wide Date from squeezing it
+    /// out of sight.
+    static let subjectMin: CGFloat = 80
+
+    /// The widest Who or Date may be dragged.
+    static let maxWidth: CGFloat = 1000
+
+    static let whoWidthKey = "messageColumn.who.width"
+    static let dateWidthKey = "messageColumn.date.width"
+
+    /// A persisted column width, clamped to its minimum, or the default when none
+    /// is stored.
+    static func loaded(key: String, default def: CGFloat, min minimum: CGFloat) -> CGFloat {
+        let stored = (UserDefaults.standard.object(forKey: key) as? Double).map { CGFloat($0) }
+        return Swift.max(minimum, stored ?? def)
     }
 }
 
@@ -646,6 +778,50 @@ enum RowIcon {
             }
         }
         .frame(width: width, height: height)
+    }
+}
+
+/// The Who column's direction marker — a small "S ▶"/"▶ S" glyph saying which
+/// way a message went relative to me. A message I sent (`.fromMe`) shows the
+/// *leading* `Sto` mark ("S ▶") hugging the name's left; one I received
+/// (`.toMe`) shows the *trailing* `toS` mark ("▶ S") pinned to the right, next
+/// to the Date column. `.selfToSelf` and `.neither` show nothing. Each slot
+/// reserves its width whether or not a mark is drawn — that fixed leading slot
+/// is what makes the names line up in one column whichever way a message went,
+/// and the trailing mark keeps a constant position on the right.
+///
+/// The art is Stephen's own PNGs (`Sto`/`toS` imagesets), knocked out to a
+/// transparent background and scaled to a 17×11 pt box so it sits on the text
+/// line with a little air above and below. To restyle, swap the imagesets or
+/// the box size here — this enum is the only place the marks are drawn.
+enum WhoGlyph {
+    /// Width reserved for each mark's slot — the 17 pt art plus a hair of margin.
+    static let slotWidth: CGFloat = 18
+
+    /// Leading slot — the "S ▶" mark when the message is one I sent, else space.
+    static func leading(_ direction: WhoDirection) -> some View {
+        mark("Sto", shown: direction == .fromMe)
+    }
+
+    /// Trailing slot — the "▶ S" mark when the message is one I received, else space.
+    static func trailing(_ direction: WhoDirection) -> some View {
+        mark("toS", shown: direction == .toMe)
+    }
+
+    private static func mark(_ name: String, shown: Bool) -> some View {
+        // `Color.clear`, not an empty branch: a bare `if` with no content
+        // collapses to nothing and the `.frame(width:)` around it reserves no
+        // space, so a blank slot would let the name slide left. Drawing a clear
+        // fill of the same size holds the slot open, so the "or blank" is
+        // exactly as wide as the mark — names line up whichever way mail went.
+        Group {
+            if shown {
+                Image(name)   // asset catalog picks @1x/@2x; native 17×11 pt box
+            } else {
+                Color.clear
+            }
+        }
+        .frame(width: slotWidth, height: RowIcon.height)
     }
 }
 
@@ -850,6 +1026,14 @@ enum MessageTableFinder {
 /// find the enclosing window's `NSTableView` and replace the header cells. It is
 /// cosmetic and defensive throughout — if the hierarchy ever changes shape and
 /// the table isn't found, the headers simply stay blank rather than breaking.
+/// One column's width rule for `TableHeaderIconStyler.enforce`: hold it fixed at
+/// `target` (min == max) when set, or — for the trailing flexible column — give
+/// it only a `minWidth` floor and let it autoresize to fill (`target` nil).
+struct ColumnPin {
+    let target: CGFloat?
+    let minWidth: CGFloat
+}
+
 struct TableHeaderIconStyler: NSViewRepresentable {
     let icons: [HeaderIcon]
 
@@ -863,6 +1047,9 @@ struct TableHeaderIconStyler: NSViewRepresentable {
         /// The resolved header art, kept so the frame-change block can re-assert
         /// the geometry without reaching back into the (non-`Sendable`) struct.
         var art: [NSImage] = []
+        /// The per-column geometry to enforce, refreshed each `apply` so the
+        /// frame-change re-enforce uses the current widths.
+        var pins: [ColumnPin?] = []
 
         deinit {
             if let observer = observer { NotificationCenter.default.removeObserver(observer) }
@@ -936,10 +1123,25 @@ struct TableHeaderIconStyler: NSViewRepresentable {
         let art = icons.compactMap(\.nsImage)
         guard !art.isEmpty else { return }
 
+        // Only the glyph column is pinned here. Who and Date are resizable
+        // SwiftUI columns (`.width(min:ideal:max:)`) whose width is driven by
+        // `MessageColumnResizeController` setting the NSTableColumn directly —
+        // SwiftUI keeps its content in step for a *resizable* column, which it
+        // won't do for a fixed one. Pinning Who/Date here (min == max) would lock
+        // them non-resizable again, so `enforce` must leave them alone. `nil` =
+        // don't touch. Stored on the coordinator so the frame-change re-enforce
+        // uses the same list.
+        let pins: [ColumnPin?] = [
+            ColumnPin(target: HeaderIcon.leadingColumnWidth,
+                      minWidth: HeaderIcon.leadingColumnWidth),
+            nil, nil, nil,
+        ]
+
         let previousTable = coordinator.table
         coordinator.table = table
         coordinator.art = art
-        Self.enforce(table: table, art: art)
+        coordinator.pins = pins
+        Self.enforce(table: table, art: art, pins: pins)
         // The listing takes 6-7 s to build behind the splash, so a dump taken now
         // would measure an empty table; this one lands after the rows exist.
         // Costs nothing when `diagnoseGeometry` is off.
@@ -966,6 +1168,7 @@ struct TableHeaderIconStyler: NSViewRepresentable {
             NotificationCenter.default.removeObserver(observer)
             coordinator.observer = nil
         }
+
         guard coordinator.observer == nil else { return }
 
         // The enclosing scroll view rather than the table itself: its frame
@@ -986,14 +1189,14 @@ struct TableHeaderIconStyler: NSViewRepresentable {
         ) { [weak coordinator] _ in
             guard let coordinator = coordinator, let table = coordinator.table else { return }
             Self.dump(table: table, stage: "frame change")
-            Self.enforce(table: table, art: coordinator.art)
+            Self.enforce(table: table, art: coordinator.art, pins: coordinator.pins)
             // Again on the next runloop turn, in case SwiftUI resets the column
             // widths *after* this notification within the same layout pass — we
             // can't order ourselves against its internal relayout. `enforce`
             // no-ops when nothing has drifted, so the second pass is almost free.
             DispatchQueue.main.async {
                 guard let table = coordinator.table else { return }
-                Self.enforce(table: table, art: coordinator.art)
+                Self.enforce(table: table, art: coordinator.art, pins: coordinator.pins)
                 Self.dump(table: table, stage: "after resize, settled")
             }
         }
@@ -1014,6 +1217,14 @@ struct TableHeaderIconStyler: NSViewRepresentable {
     /// and after a resize, the remaining error is a constant to be dialled out. If
     /// it differs, something is still moving and no constant can fix both states.
     static let diagnoseGeometry = false
+
+    /// Finding (kept per the diagnostics convention): while hovering a divider,
+    /// this printed *nothing* — `enforce` does not run and does not re-tile. So
+    /// the resize-cursor flicker is not our re-tiling; it's SwiftUI's own Table
+    /// header failing to show the cursor. The drag works regardless. Both the
+    /// cursor and the drag are now owned by `MessageColumnResizeController`, with
+    /// the columns pinned fixed. Left switched off.
+    static let diagnoseResize = false
 
     private static func dump(table: NSTableView, stage: String) {
         guard diagnoseGeometry else { return }
@@ -1084,7 +1295,7 @@ struct TableHeaderIconStyler: NSViewRepresentable {
     /// so it neither thrashes layout nor retriggers its own notification. Reading
     /// the table itself also means a rebuilt `Table`, or anything that resets
     /// these behind our back, is picked up rather than latched off forever.
-    private static func enforce(table: NSTableView, art: [NSImage]) {
+    private static func enforce(table: NSTableView, art: [NSImage], pins: [ColumnPin?]) {
         // AppKit rounds and clamps these, so exact equality can read "changed"
         // forever — which would tile on every notification, post another frame
         // change, and loop at low grade for as long as the app is open. Half a
@@ -1114,15 +1325,31 @@ struct TableHeaderIconStyler: NSViewRepresentable {
             geometryChanged = true
         }
 
-        // Pin every fixed column to the same width SwiftUI was given, so the two
-        // grids can't negotiate different answers and drift apart. Each column's
-        // origin depends only on the widths before it, so pinning all but the
-        // trailing one is enough to fix every origin. A `nil` entry is a column
-        // deliberately left flexible; extra columns beyond the table are ignored,
-        // so the two can be edited independently without crashing.
-        for (index, target) in MessageColumnWidths.pinned.enumerated() {
-            guard let target = target, index < table.tableColumns.count else { continue }
+        // Hold every column to the same width SwiftUI was given, so the two grids
+        // can't negotiate different answers and drift apart. Each column's origin
+        // depends only on the widths before it, so holding all but the trailing
+        // one is enough to fix every origin. Extra columns beyond the table are
+        // ignored, so the two lists can be edited independently without crashing.
+        //
+        //   • Fixed (glyph): min = max = width, no user resize.
+        //   • Flexible (`target` nil): a floor only; it autoresizes to fill.
+        // (Who and Date carry no pin — they are resizable SwiftUI columns driven
+        // by `MessageColumnResizeController`, so `enforce` leaves them alone.)
+        for (index, pin) in pins.enumerated() {
+            guard let pin, index < table.tableColumns.count else { continue }
             let column = table.tableColumns[index]
+
+            guard let target = pin.target else {
+                // Flexible column: keep a floor so a neighbour can't squeeze it
+                // away; leave its width and autoresizing alone.
+                if differs(column.minWidth, pin.minWidth) {
+                    column.minWidth = pin.minWidth
+                    geometryChanged = true
+                }
+                continue
+            }
+
+            // Fixed: min == max == width, no user resize.
             if differs(column.minWidth, target) || differs(column.maxWidth, target)
                 || differs(column.width, target) {
                 // Raise the ceiling before the floor, so `minWidth` never briefly
@@ -1149,10 +1376,252 @@ struct TableHeaderIconStyler: NSViewRepresentable {
         // One re-tile, after every input is final, or none at all. `tile()`
         // recomputes the column origins *and* the header view's frame and marks
         // both for display, so no separate header invalidation is needed.
+        if diagnoseResize {
+            let whoTarget = pins.count > 1 ? (pins[1]?.target.map { Int($0) } ?? -1) : -1
+            let whoActual = table.tableColumns.count > 1 ? Int(table.tableColumns[1].width) : -1
+            print("[resize] enforce tiled=\(geometryChanged) whoTarget=\(whoTarget) "
+                + "whoActualColumnWidth=\(whoActual)")
+        }
         if geometryChanged {
             table.tile()
             table.headerView?.needsDisplay = true
         }
+    }
+}
+
+/// Owns the message list's column-divider interaction end to end: the resize
+/// cursor on hover, and the drag that changes a column's width.
+///
+/// **Why we do it ourselves.** SwiftUI's `Table` on macOS 13 shows the resize
+/// cursor unreliably (it keeps clearing it) and its native drag zone is only a
+/// few points wide and hard to hit. Both were confirmed the hard way. So the
+/// columns are pinned fixed (header and content share one width — see
+/// `MessageColumnWidths` / `TableHeaderIconStyler`), SwiftUI resizes nothing,
+/// and this controller does the whole job with a comfortable catch zone. It
+/// updates `AppModel`'s widths, which re-render the Table and re-pin the header
+/// to match — the same number on both sides, so nothing drifts.
+///
+/// A local event monitor, like the header-sort and scroll monitors, because the
+/// `NSTableView` backing a SwiftUI `Table` can't be subclassed or given a
+/// delegate of ours. Mouse-moved events are turned on for the window so the
+/// cursor can track a hover.
+@MainActor
+final class MessageColumnResizeController: NSObject {
+    var model: AppModel
+    private weak var table: NSTableView?
+    private var monitor: Any?
+
+    /// Columns whose right edge is a draggable divider: Who (1) → the Who|Date
+    /// divider, Date (2) → the Date|Subject divider.
+    private static let resizableColumns = [1, 2]
+    /// Half-width of the catch zone around a divider, in points — generous so the
+    /// divider is easy to grab. The sort monitor skips the same band so a click
+    /// here resizes rather than sorts (see `MessageHeaderSortController`).
+    static let slop: CGFloat = 6
+
+    /// Trace the divider drag (install, header mouse-downs with the geometry
+    /// tested, and the drag). Off; flip on if the drag ever misbehaves again.
+    static let diagnose = false
+
+    /// The drag in progress: which column's right edge, the pointer x where it
+    /// began, and that column's width then.
+    private var dragColumn: Int?
+    private var dragStartX: CGFloat = 0
+    private var dragStartWidth: CGFloat = 0
+
+    init(model: AppModel, table: NSTableView) {
+        self.model = model
+        self.table = table
+        super.init()
+        table.window?.acceptsMouseMovedEvents = true
+        installEventMonitor()
+        if Self.diagnose {
+            print("[resize] controller installed; window=\(table.window != nil), "
+                + "columns=\(table.numberOfColumns)")
+        }
+    }
+
+    deinit {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+    }
+
+    private func installEventMonitor() {
+        monitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.mouseMoved, .leftMouseDown, .leftMouseDragged, .leftMouseUp]
+        ) { [weak self] event in
+            guard let self else { return event }
+            return self.handle(event)
+        }
+    }
+
+    /// Show the resize cursor, deferred to the end of the runloop turn.
+    ///
+    /// A local event monitor runs *before* the event is dispatched to the header,
+    /// so anything the header's own cursor management does afterwards (it keeps
+    /// resetting to the arrow as SwiftUI redraws the header, wiping its resize
+    /// cursor rect) would overwrite an immediate `set()`. Setting it last, on the
+    /// next turn, is what makes it hold — otherwise it flickers on every move.
+    private func showResizeCursor() {
+        DispatchQueue.main.async { NSCursor.resizeLeftRight.set() }
+    }
+
+    /// The column whose right edge is within the catch zone of header point `x`,
+    /// or nil. Only the resizable columns count.
+    private func dividerColumn(atHeaderX x: CGFloat, header: NSTableHeaderView) -> Int? {
+        guard let table else { return nil }
+        for col in Self.resizableColumns where col < table.numberOfColumns {
+            if abs(x - header.headerRect(ofColumn: col).maxX) <= Self.slop { return col }
+        }
+        return nil
+    }
+
+    private func handle(_ event: NSEvent) -> NSEvent? {
+        // A live drag: while the button is held, only dragged/up events arrive,
+        // so route just those to it. ANY other event type means the drag already
+        // ended without us seeing the up — released while the app was hung, or
+        // outside our window — so end it and handle the event normally. This is
+        // what keeps a stuck drag from swallowing later clicks (which had
+        // frozen mailbox switching until the next mouse-up cleared it).
+        if dragColumn != nil {
+            switch event.type {
+            case .leftMouseDragged, .leftMouseUp:
+                return serviceActiveDrag(event)
+            default:
+                dragColumn = nil
+            }
+        }
+
+        guard let table, let header = table.headerView, let window = table.window,
+              event.window === window else { return event }
+
+        let overHeader = window.contentView?.hitTest(event.locationInWindow)
+            .map { $0 === header || $0.isDescendant(of: header) } ?? false
+
+        switch event.type {
+        case .mouseMoved:
+            guard overHeader else { return event }
+            let x = header.convert(event.locationInWindow, from: nil).x
+            if dividerColumn(atHeaderX: x, header: header) != nil {
+                showResizeCursor()
+            }
+            return event
+
+        case .leftMouseDown:
+            let x = header.convert(event.locationInWindow, from: nil).x
+            let col = dividerColumn(atHeaderX: x, header: header)
+            if Self.diagnose {
+                let m1 = 1 < table.numberOfColumns ? header.headerRect(ofColumn: 1).maxX : -1
+                let m2 = 2 < table.numberOfColumns ? header.headerRect(ofColumn: 2).maxX : -1
+                print("[resize] DOWN overHeader=\(overHeader) x=\(Int(x)) "
+                    + "whoMaxX=\(Int(m1)) dateMaxX=\(Int(m2)) matched=\(col.map(String.init) ?? "nil")")
+            }
+            guard overHeader, let col else { return event }
+            dragColumn = col
+            dragStartX = x
+            // The column's *actual* current width, not the model's — they can
+            // differ (SwiftUI lays the resizable column out itself), and starting
+            // from the model value snaps the column on the first drag frame.
+            dragStartWidth = table.tableColumns[col].width
+            showResizeCursor()
+            return nil          // consumed: don't sort, don't let AppKit resize
+
+        default:
+            return event
+        }
+    }
+
+    /// Handle events once a drag has begun, wherever the pointer goes.
+    private func serviceActiveDrag(_ event: NSEvent) -> NSEvent? {
+        guard let table, let header = table.headerView, let col = dragColumn else {
+            dragColumn = nil
+            return event
+        }
+        let x = header.convert(event.locationInWindow, from: nil).x
+        let width = dragStartWidth + (x - dragStartX)
+
+        switch event.type {
+        case .leftMouseDragged:
+            apply(width: width, toColumn: col, table: table)
+            showResizeCursor()
+            return nil
+        case .leftMouseUp:
+            apply(width: width, toColumn: col, table: table)   // also persists via the model
+            dragColumn = nil
+            return nil
+        default:
+            return nil          // swallow stray events during a drag
+        }
+    }
+
+    /// Set the dragged column's width directly on the NSTableColumn, clamped to
+    /// its minimum and so Subject keeps at least its floor (a column can't be
+    /// dragged so wide it hides the last one). SwiftUI mirrors this into its
+    /// content because the column is resizable.
+    @discardableResult
+    private func apply(width: CGFloat, toColumn col: Int, table: NSTableView) -> CGFloat {
+        let minW = (col == 1) ? MessageColumnWidths.whoMin : MessageColumnWidths.dateMin
+        // The most this column may take: what's left after the others and
+        // Subject's floor.
+        let others = table.tableColumns.enumerated().reduce(CGFloat.zero) { sum, pair in
+            (pair.offset == col || pair.offset == 3) ? sum : sum + pair.element.width
+        }
+        let spacing = table.intercellSpacing.width * CGFloat(max(0, table.numberOfColumns - 1))
+        let ceiling = max(minW,
+                          table.bounds.width - others - spacing - MessageColumnWidths.subjectMin)
+        let clamped = min(max(minW, width), ceiling)
+        table.tableColumns[col].width = clamped
+        // Keep the model (the column's `ideal`) in step, so a re-render — which a
+        // big mailbox fires constantly while still enriching — re-applies the
+        // *same* width instead of snapping the column back to its launch value.
+        // This is what makes the drag hold on a large mailbox, and it persists
+        // the width for next launch as a side effect.
+        if col == 1 { model.setWhoColumnWidth(clamped) } else { model.setDateColumnWidth(clamped) }
+        return clamped
+    }
+}
+
+/// Installs `MessageColumnResizeController` on the message table, rebuilding it
+/// when the `Table` (and its `NSTableView`) is remade.
+struct MessageColumnResizeInstaller: NSViewRepresentable {
+    @ObservedObject var model: AppModel
+
+    final class Coordinator {
+        weak var table: NSTableView?
+        var controller: MessageColumnResizeController?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        let coordinator = context.coordinator
+        let model = self.model
+        DispatchQueue.main.async {
+            install(near: nsView, coordinator: coordinator, model: model, attemptsLeft: 20)
+        }
+    }
+
+    @MainActor
+    private func install(near view: NSView, coordinator: Coordinator,
+                         model: AppModel, attemptsLeft: Int) {
+        if let known = coordinator.table, known.window != nil, coordinator.controller != nil {
+            coordinator.controller?.model = model
+            return
+        }
+        guard let table = MessageTableFinder.table(near: view) else {
+            if attemptsLeft > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    install(near: view, coordinator: coordinator, model: model,
+                            attemptsLeft: attemptsLeft - 1)
+                }
+            }
+            return
+        }
+        if coordinator.table !== table || coordinator.controller == nil {
+            coordinator.table = table
+            coordinator.controller = MessageColumnResizeController(model: model, table: table)
+        }
+        coordinator.controller?.model = model
     }
 }
 
@@ -1535,6 +2004,10 @@ struct TableScrollStateSyncer: NSViewRepresentable {
                 // A restore that hasn't been applied yet is still authoritative;
                 // the snap-to-top that follows a reload must not clobber it.
                 guard model.pendingScrollTopRow == nil else { return }
+                // A user scroll in In dismisses its new-mail badge. This is the
+                // user-scroll path (guarded above); the restore write-back calls
+                // `rememberScroll` directly, so delivery's re-list won't clear it.
+                model.clearInboxNewMailBadge()
                 model.rememberScroll(topRow: top)
             }
         }
@@ -1958,12 +2431,15 @@ struct MessageListView: View {
                         .font(.caption).foregroundStyle(.secondary)
                     // The rows are usable while this runs — Who, Date and the
                     // attachment mark are still settling — so this is a quiet
-                    // note rather than a blocking indicator. It also explains
-                    // why those columns change under you a few seconds in.
+                    // note rather than a blocking indicator. It also explains why
+                    // those columns change under you a few seconds in, and why a
+                    // very large mailbox (Trash) feels sluggish — resizing,
+                    // scrolling — until it finishes. Hence "settling", in
+                    // secondary rather than tertiary so it's easy to spot.
                     if model.isEnriching {
                         ProgressView().controlSize(.small).scaleEffect(0.6)
-                        Text("reading messages…")
-                            .font(.caption2).foregroundStyle(.tertiary)
+                        Text("settling — reading messages…")
+                            .font(.caption2).foregroundStyle(.secondary)
                     }
                     Spacer()
                     if !model.listingSource.isEmpty {
@@ -2066,11 +2542,30 @@ struct MessageListView: View {
                 // Subject alone is left to flex, and nothing's origin depends on
                 // its width because it is last.
                 TableColumn("Who") { r in
-                    Text(r.who).font(EudoraFont.list).tableCell(column: 1)
-                }.width(MessageColumnWidths.who)
+                    // One column, filled as three regions so the names line up:
+                    // a fixed leading slot (the "S ▶" sent mark, or blank space
+                    // of the same width), then the name, then the "▶ S" received
+                    // mark pinned to the right by the Spacer — hard against the
+                    // Date column. The fixed leading slot is what keeps every
+                    // name starting at the same x whichever way the message went
+                    // (see WhoGlyph). `.tableCell(column: 1)` still carries the
+                    // whole cell back under the "Who" header, exactly as the
+                    // bare Text did — none of the column geometry changes.
+                    HStack(spacing: 3) {
+                        WhoGlyph.leading(r.direction)
+                        Text(r.who).font(EudoraFont.list).lineLimit(1)
+                        Spacer(minLength: 0)
+                        WhoGlyph.trailing(r.direction)
+                    }
+                    .tableCell(column: 1)
+                }.width(min: MessageColumnWidths.whoMin,
+                        ideal: model.whoColumnWidth,
+                        max: MessageColumnWidths.maxWidth)
                 TableColumn("Date") { r in
                     Text(r.date).font(EudoraFont.list).tableCell(column: 2)
-                }.width(MessageColumnWidths.date)
+                }.width(min: MessageColumnWidths.dateMin,
+                        ideal: model.dateColumnWidth,
+                        max: MessageColumnWidths.maxWidth)
                 TableColumn("Subject") { r in
                     Text(r.subject).font(EudoraFont.list).tableCell(column: 3)
                 }
@@ -2081,6 +2576,7 @@ struct MessageListView: View {
             .background(MessageContextMenuInstaller(model: model))
             .background(MessageHeaderSortInstaller(model: model))
             .background(TableHeaderIconStyler(icons: HeaderIcon.leadingColumns))
+            .background(MessageColumnResizeInstaller(model: model))
             .background(TableScrollStateSyncer(model: model))
             // The removal veil: during a delete/move the stale rows stay up as
             // a picture — washed halfway to white, label on top — instead of
@@ -2326,7 +2822,7 @@ struct PreviewView: View {
                                  onForward: { model.forward() },
                                  fontName: fontSettings.bodyFontName,
                                  fontSize: fontSettings.bodyFontSize,
-                                 antialias: fontSettings.antialiasBody)
+                                 antialias: fontSettings.bodyAntialiasing.htmlSmoothingOn)
                 } else if p.content.isEmpty {
                     // An attachment-only message genuinely has no text, so say
                     // that rather than implying something failed.
@@ -2341,7 +2837,8 @@ struct PreviewView: View {
                     PlainMailView(text: p.content,
                                   fontName: fontSettings.bodyFontName,
                                   fontSize: fontSettings.bodyFontSize,
-                                  antialias: fontSettings.antialiasBody)
+                                  antialiasing: fontSettings.bodyAntialiasing,
+                                  haloWhiteness: fontSettings.eudoraHaloWhiteness)
                 }
                 // After the body, where Eudora put them — but *pinned* below it
                 // rather than inline, and outside the web view. Native views keep

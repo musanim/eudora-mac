@@ -180,25 +180,37 @@ public struct MailStore: Sendable {
 
         let toc = Toc.read(tocURL(base))
 
-        // Trust the .toc when every entry points at a real message (by offset).
-        // That covers an exact match *and* the common "deleted but not
-        // compacted" case, where the .mbx keeps message bodies the .toc no
-        // longer lists — we then show exactly what Eudora showed, with status,
-        // and hide the deleted ghosts. Only a .toc that genuinely disagrees
-        // (offsets not found in the .mbx) falls back to a status-less scan.
-        if let t = toc, !t.isEmpty, t.allSatisfy({ indexByOffset[$0.offset] != nil }) {
-            let source: IndexSource = (t.count == recs.count) ? .toc : .tocCompacted
-            let rows = t.map { e -> ListingRow in
-                let idx = indexByOffset[e.offset]!
-                return ListingRow(index: idx,
-                                  statusGlyph: Self.statusGlyphs[e.status] ?? "?",
-                                  status: e.status,
-                                  priority: String(e.priority),
-                                  date: e.date, size: recs[idx - 1].length,
-                                  offset: recs[idx - 1].offset,
-                                  who: e.to, subject: e.subject)
+        // Trust the .toc when the overwhelming majority of its entries point at
+        // a real message (by offset). That covers an exact match, the common
+        // "deleted but not compacted" case (the .mbx keeps bodies the .toc no
+        // longer lists — we show what Eudora showed, with status, and hide the
+        // deleted ghosts), and a valid-but-slightly-stale .toc carrying a
+        // handful of dead entries that point into compaction padding rather than
+        // at a message. Those dead entries are dropped, not treated as a reason
+        // to throw the whole index — and its status and cached dates — away and
+        // fall back to a status-less scan.
+        //
+        // The threshold is a simple majority. A genuinely wrong .toc (belonging
+        // to a different .mbx) shares almost no offsets and sits near zero; a
+        // real one clears this easily — the worst stale mailbox in the real tree
+        // still matches ~71%.
+        if let t = toc, !t.isEmpty {
+            let matched = t.filter { indexByOffset[$0.offset] != nil }
+            if matched.count * 2 > t.count {
+                let source: IndexSource =
+                    (matched.count == t.count && t.count == recs.count) ? .toc : .tocCompacted
+                let rows = matched.map { e -> ListingRow in
+                    let idx = indexByOffset[e.offset]!
+                    return ListingRow(index: idx,
+                                      statusGlyph: Self.statusGlyphs[e.status] ?? "?",
+                                      status: e.status,
+                                      priority: String(e.priority),
+                                      date: e.date, size: recs[idx - 1].length,
+                                      offset: recs[idx - 1].offset,
+                                      who: e.to, subject: e.subject)
+                }
+                return Listing(name: label, source: source, rows: rows)
             }
-            return Listing(name: label, source: source, rows: rows)
         }
 
         // No .toc, or one that disagrees with the .mbx → scan the mailbox

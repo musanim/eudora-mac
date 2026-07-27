@@ -196,7 +196,8 @@ struct PlainMailView: NSViewRepresentable {
     let text: String
     let fontName: String
     let fontSize: Double
-    let antialias: Bool
+    let antialiasing: BodyAntialiasing
+    let haloWhiteness: Double
 
     func makeNSView(context: Context) -> NSScrollView {
         FontDiagnostics.logResolution(of: fontName, size: fontSize, context: "plain-text reader")
@@ -230,7 +231,8 @@ struct PlainMailView: NSViewRepresentable {
     }
 
     private func apply(to textView: BodyTextView) {
-        textView.antialias = antialias
+        textView.renderingMode = antialiasing
+        textView.haloWhiteness = haloWhiteness
         if textView.string != text { textView.string = text }
         let font = NSFont(name: fontName, size: CGFloat(fontSize))
             ?? NSFont.systemFont(ofSize: CGFloat(fontSize))

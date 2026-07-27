@@ -63,6 +63,62 @@ final class MessageBuilderTests: XCTestCase {
         XCTAssertTrue(text.contains("Content-Type: text/plain; charset=us-ascii"), text)
     }
 
+    // MARK: - Bcc: the local copy keeps it, the wire copy doesn't
+
+    func testBccOmittedByDefaultButEmittedWhenRequested() {
+        var message = plainMessage(body: "Hi there")
+        message.cc = ["cc@example.com"]
+        message.bcc = ["blind@example.com"]
+
+        // Wire copy (default): no Bcc header, so a blind copy stays blind.
+        let wire = String(decoding: message.rfc822(date: date, messageID: messageID).data,
+                          as: UTF8.self)
+        XCTAssertFalse(wire.contains("Bcc:"), wire)
+        XCTAssertFalse(wire.contains("blind@example.com"), wire)
+
+        // Local archive copy: Bcc header present, right after Cc.
+        let archive = String(decoding: message.rfc822(date: date, messageID: messageID,
+                                                      includeBcc: true).data, as: UTF8.self)
+        XCTAssertTrue(archive.contains("Cc: cc@example.com\r\nBcc: blind@example.com\r\n"), archive)
+    }
+
+    func testBccHeaderSkippedWhenEmptyEvenWhenIncluded() {
+        // No blind recipients → no Bcc header even with includeBcc, so a message
+        // without a Bcc is byte-identical whichever way it's built.
+        let plain = plainMessage(body: "Hi there")
+        let a = plain.rfc822(date: date, messageID: messageID).data
+        let b = plain.rfc822(date: date, messageID: messageID, includeBcc: true).data
+        XCTAssertEqual(a, b)
+    }
+
+    // MARK: - From parsing (editable From field)
+
+    func testSplitFromParsesNameAndAddress() {
+        let a = OutgoingMessage.splitFrom("Stephen Malinowski <stephen@musanim.com>")
+        XCTAssertEqual(a.name, "Stephen Malinowski")
+        XCTAssertEqual(a.address, "stephen@musanim.com")
+
+        let b = OutgoingMessage.splitFrom("bare@example.com")
+        XCTAssertEqual(b.name, "")
+        XCTAssertEqual(b.address, "bare@example.com")
+
+        let c = OutgoingMessage.splitFrom("  \"Quoted Name\" <q@example.com> ")
+        XCTAssertEqual(c.name, "Quoted Name")
+        XCTAssertEqual(c.address, "q@example.com")
+    }
+
+    /// A From typed into the composer round-trips through `splitFrom` →
+    /// `OutgoingMessage` → the `From:` header.
+    func testEditedFromAppearsInHeader() {
+        let (name, address) = OutgoingMessage.splitFrom("Alter Ego <alter@example.com>")
+        var message = plainMessage(body: "Hi")
+        message.fromName = name
+        message.fromAddress = address
+        let text = String(decoding: message.rfc822(date: date, messageID: messageID).data,
+                          as: UTF8.self)
+        XCTAssertTrue(text.contains("From: Alter Ego <alter@example.com>"), text)
+    }
+
     // MARK: - the styled path
 
     func testStyledMessageIsMultipartAlternative() {
@@ -162,5 +218,78 @@ final class MessageBuilderTests: XCTestCase {
         let b = OutgoingMessage.generatedBoundary()
         XCTAssertNotEqual(a, b)
         XCTAssertTrue(a.hasPrefix("=_Eudora_"))
+    }
+
+    // MARK: - attachments
+
+    private let sampleBytes = Data([0x00, 0x01, 0x02, 0xFF, 0xFE, 0x41, 0x42])
+
+    func testAttachmentWrapsInMultipartMixedWithBodyFirst() {
+        var message = plainMessage(body: "See attached.")
+        message.attachments = [.init(filename: "hi.dat",
+                                     mimeType: "application/octet-stream", data: sampleBytes)]
+        let text = String(decoding: message.rfc822(date: date, messageID: messageID,
+                                                   boundary: "MIX").data, as: UTF8.self)
+        XCTAssertTrue(text.contains("Content-Type: multipart/mixed; boundary=\"MIX\""), text)
+        XCTAssertTrue(text.contains("Content-Transfer-Encoding: base64"), text)
+        XCTAssertTrue(text.contains("Content-Disposition: attachment; filename=\"hi.dat\""), text)
+        // Body part precedes the attachment part.
+        let bodyAt = text.range(of: "See attached.")!.lowerBound
+        let attAt = text.range(of: "Content-Disposition: attachment")!.lowerBound
+        XCTAssertLessThan(bodyAt, attAt)
+        XCTAssertTrue(text.hasSuffix("--MIX--\r\n"), text)
+    }
+
+    /// Round-trips through this project's own parser — the one that reopens a
+    /// draft from Out — and the bytes come back intact.
+    func testAttachmentRoundTripsThroughTheParser() {
+        var message = plainMessage(body: "See attached.")
+        message.attachments = [.init(filename: "hi.dat",
+                                     mimeType: "application/octet-stream", data: sampleBytes)]
+        let part = MIMEParser.parse(Array(message.rfc822(date: date, messageID: messageID).data))
+        XCTAssertEqual(part.contentType, "multipart/mixed")
+        XCTAssertEqual(part.children.count, 2)
+        XCTAssertEqual(part.children[0].contentType, "text/plain")
+        XCTAssertEqual(Data(part.children[1].decodedPayload()), sampleBytes)
+        XCTAssertEqual(part.children[1].filename, "hi.dat")
+    }
+
+    /// Styled body + an attachment: the alternative nests inside the mixed.
+    func testStyledMessageWithAttachmentNestsAlternativeInsideMixed() {
+        var message = plainMessage(body: "plain")
+        message.htmlBody = "<html><body>plain</body></html>"
+        message.attachments = [.init(filename: "note.txt", mimeType: "text/plain",
+                                     data: Data("x".utf8))]
+        let part = MIMEParser.parse(Array(message.rfc822(date: date, messageID: messageID).data))
+        XCTAssertEqual(part.contentType, "multipart/mixed")
+        XCTAssertEqual(part.children.count, 2)
+        XCTAssertEqual(part.children[0].contentType, "multipart/alternative")
+        XCTAssertEqual(part.children[0].children.count, 2)
+        XCTAssertEqual(part.children[1].contentType, "text/plain")   // the attachment
+    }
+
+    /// A payload past one base64 line (>57 raw bytes → >76 base64 chars) must
+    /// wrap at 76 columns and still round-trip byte-for-byte.
+    func testLargerAttachmentWrapsAndRoundTrips() {
+        let big = Data((0..<200).map { UInt8($0 & 0xFF) })
+        var message = plainMessage(body: "See attached.")
+        message.attachments = [.init(filename: "big.bin",
+                                     mimeType: "application/octet-stream", data: big)]
+        let (data, _, _) = message.rfc822(date: date, messageID: messageID, boundary: "MIX")
+        // The base64 block has at least one full 76-char line.
+        let lines = String(decoding: data, as: UTF8.self).components(separatedBy: "\r\n")
+        XCTAssertTrue(lines.contains { $0.count == 76 }, "expected a wrapped 76-column base64 line")
+        // And it comes back intact.
+        let part = MIMEParser.parse(Array(data))
+        XCTAssertEqual(Data(part.children[1].decodedPayload()), big)
+    }
+
+    func testEmptyAttachmentsStaysOnThePlainPath() {
+        // Belt: an empty attachments array must not trigger multipart/mixed, so a
+        // message without attachments is byte-identical to before this feature.
+        var message = plainMessage(body: "Hi there")
+        message.attachments = []
+        XCTAssertFalse(String(decoding: message.rfc822(date: date, messageID: messageID).data,
+                              as: UTF8.self).contains("multipart"))
     }
 }

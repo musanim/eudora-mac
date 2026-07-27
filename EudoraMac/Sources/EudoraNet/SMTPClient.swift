@@ -7,6 +7,9 @@ public enum SMTPError: LocalizedError {
     case badPort
     case connectionFailed(String)
     case unexpected(code: Int, message: String, during: String)
+    /// A specific recipient the server refused at RCPT TO — carried separately
+    /// so the composer can point at the field that address came from.
+    case recipientRejected(recipient: String, code: Int, message: String)
     case closed(String)
 
     public var errorDescription: String? {
@@ -18,9 +21,17 @@ public enum SMTPError: LocalizedError {
         case .connectionFailed(let m): return "Connection failed: \(m)"
         case .unexpected(let c, let m, let during):
             return "Server rejected \(during): \(c) \(m)"
+        case .recipientRejected(let r, let c, let m):
+            return "Server rejected the address \(r): \(c) \(m)"
         case .closed(let during):
             return "Connection closed during \(during)."
         }
+    }
+
+    /// The address the server refused, if this is a recipient rejection.
+    public var rejectedRecipient: String? {
+        if case .recipientRejected(let r, _, _) = self { return r }
+        return nil
     }
 }
 
@@ -44,16 +55,27 @@ public final class SMTPClient: @unchecked Sendable {
     }
 
     /// Assemble-and-send convenience: build the message, send it, and hand back
-    /// the raw RFC-822 bytes + Message-ID so the caller can write it to Out.
+    /// the RFC-822 bytes to archive + the Message-ID so the caller can write it
+    /// to Out.
+    ///
+    /// Two serializations come from one Date and Message-ID: the **wire** copy
+    /// that goes to the server carries no `Bcc:` header — a blind copy must stay
+    /// blind, and the Bcc'd addresses still receive it through the SMTP envelope
+    /// (`envelopeRecipients`) — while the copy returned for the Out **archive**
+    /// keeps the `Bcc:` header, so the sender's own record shows who was
+    /// blind-copied (what "Send Again" reads back). The two differ only by that
+    /// header.
     public static func send(_ message: OutgoingMessage,
                             account: SMTPAccount,
                             password: String)
         async throws -> (raw: Data, messageID: String) {
-        let assembled = message.rfc822()
+        let now = Date()
+        let wire = message.rfc822(date: now)
+        let archive = message.rfc822(date: now, messageID: wire.messageID, includeBcc: true)
         let client = try SMTPClient(account: account)
-        try await client.run(raw: assembled.data, message: message,
+        try await client.run(raw: wire.data, message: message,
                              account: account, password: password)
-        return (assembled.data, assembled.messageID)
+        return (archive.data, wire.messageID)
     }
 
     private func run(raw: Data, message: OutgoingMessage,
@@ -68,7 +90,13 @@ public final class SMTPClient: @unchecked Sendable {
         try await authenticate(username: account.username, password: password, caps: ehlo.lines)
         _ = try await command("MAIL FROM:<\(message.envelopeSender)>", 250, during: "MAIL FROM")
         for rcpt in message.envelopeRecipients {
-            _ = try await command("RCPT TO:<\(rcpt)>", 250, alt: 251, during: "RCPT TO")
+            do {
+                _ = try await command("RCPT TO:<\(rcpt)>", 250, alt: 251, during: "RCPT TO")
+            } catch let SMTPError.unexpected(code, message, _) {
+                // Re-throw with the offending address attached, so the composer
+                // can highlight the field it came from.
+                throw SMTPError.recipientRejected(recipient: rcpt, code: code, message: message)
+            }
         }
         _ = try await command("DATA", 354, during: "DATA")
         try await write(Self.dotStuff(raw))

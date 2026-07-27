@@ -1,0 +1,7 @@
+{
+  "images" : [
+    { "filename" : "Sto.png", "idiom" : "universal", "scale" : "1x" },
+    { "filename" : "Sto@2x.png", "idiom" : "universal", "scale" : "2x" }
+  ],
+  "info" : { "author" : "xcode", "version" : 1 }
+}

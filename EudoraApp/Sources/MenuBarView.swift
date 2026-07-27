@@ -81,8 +81,8 @@ struct MenuBarView: View {
 
     private var mailboxMenu: some View {
         Menu("Mailbox") {
-            Button("New…") {}.disabled(true)
-            Button("New Folder…") {}.disabled(true)
+            Button("New…") { model.createTopLevel(asFolder: false) }
+            Button("New Group…") { model.createTopLevel(asFolder: true) }
             Divider()
             sortMenu
             Divider()
@@ -162,7 +162,7 @@ struct MenuBarView: View {
     /// "No other mailboxes" placeholder. Greying it matches the toolbar's Move
     /// button, and there is nothing behind it worth opening to read.
     private var transferMenu: some View {
-        MoveToMenuButton(tree: { model.tree },
+        MoveToMenuButton(tree: { model.visibleTree },
                          onPick: { model.moveSelected(to: $0) },
                          onNew: { model.createMailboxAndMoveSelection(under: $0) }) {
             Text("Transfer")

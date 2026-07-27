@@ -298,7 +298,7 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         let submenu = NSMenu(title: "Move to")
         submenu.autoenablesItems = false
         let builder = MailboxMenuBuilder(
-            items: model.tree,
+            items: model.visibleTree,
             onPick: { [weak self] destination in
                 guard let self else { return }
                 self.actOnClickedRows { self.model.moveSelected(to: destination) }
@@ -322,8 +322,31 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         // what is set here is what shows.
         add("Reply", #selector(reply), enabled: n == 1)
         add("Forward", #selector(forward), enabled: n == 1)
+        // "Send Again" only for a single, successfully-sent message: it opens a
+        // fresh editable copy (see `AppModel.sendAgain`). Shown only when it
+        // applies rather than greyed out, since it's meaningless on received or
+        // draft mail.
+        if n == 1, let id = clickedPrimary, model.isSentMessage(id) {
+            add("Send Again", #selector(sendAgain))
+        }
 
         menu.addItem(.separator())
+        // Blacklist a sender — a single *received* message (never one you sent,
+        // which would blacklist yourself). Auto-sends and can't be undone, so the
+        // action itself also gates hard behind a confirmation.
+        if n == 1, let id = clickedPrimary, !model.isSentMessage(id) {
+            let item = NSMenuItem(title: "Add to BLACKLIST", action: #selector(blacklist),
+                                  keyEquivalent: "")
+            item.target = self
+            // "BLACKLIST" in bold, the rest in the normal menu font. The plain
+            // `title` stays set as the accessibility label.
+            let menuFont = NSFont.menuFont(ofSize: 0)
+            let bold = NSFontManager.shared.convert(menuFont, toHaveTrait: .boldFontMask)
+            let title = NSMutableAttributedString(string: "Add to ", attributes: [.font: menuFont])
+            title.append(NSAttributedString(string: "BLACKLIST", attributes: [.font: bold]))
+            item.attributedTitle = title
+            menu.addItem(item)
+        }
         add("Delete", #selector(deleteMessage))
     }
 
@@ -349,7 +372,34 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
 
     @objc private func reply() { actOnClickedRows { model.reply(all: false) } }
     @objc private func forward() { actOnClickedRows { model.forward() } }
+    // Reads the clicked message by index and opens a copy; no need to move the
+    // selection first, since it doesn't act on `selectedMessageID`.
+    @objc private func sendAgain() {
+        guard let id = clickedPrimary else { return }
+        model.sendAgain(messageIndex: id)
+    }
     @objc private func deleteMessage() { actOnClickedRows { model.deleteSelected() } }
+
+    /// Blacklist the clicked message's sender, behind a deliberate confirmation.
+    /// The dangerous button is *not* the default, so a stray Return cancels — the
+    /// "in case I clicked by accident" guard.
+    @objc private func blacklist() {
+        actOnClickedRows {
+            guard let address = model.selectedSenderAddress() else { NSSound.beep(); return }
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "Add \(address) to your blacklist?"
+            alert.informativeText =
+                "This can't be undone. It will reply to this message telling the sender "
+                + "they've been blacklisted, add \(address) to ~/email_blacklist.txt, and open that file."
+            let yes = alert.addButton(withTitle: "Yes, I'm totally sure")
+            let cancel = alert.addButton(withTitle: "Cancel")
+            yes.keyEquivalent = ""          // Return must not fire the destructive action
+            cancel.keyEquivalent = "\r"     // Return / Esc both cancel
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            model.blacklistSelectedSender()
+        }
+    }
 }
 
 // `MailboxMenuBuilder`, which fills the Move submenu one level at a time, was

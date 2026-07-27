@@ -246,7 +246,7 @@ struct FindView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             List {
-                OutlineGroup(model.tree, children: \.children) { item in
+                OutlineGroup(model.visibleTree, children: \.children) { item in
                     Toggle(isOn: scopeBinding(for: item)) {
                         HStack(spacing: 6) {
                             Image(systemName: item.systemImage)

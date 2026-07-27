@@ -102,6 +102,11 @@ struct MessageRow: Identifiable, Hashable, Sendable {
     /// edited and saved again, which puts it back to unsent.
     var isSendError: Bool { status == MailboxMutator.statusSendError }
 
+    /// A message that was successfully sent — the gate for "Send Again" in the
+    /// message context menu. Needs the `.toc` status byte, so it's false on the
+    /// scan fallback (no index, no status).
+    var isSent: Bool { status == MailboxMutator.statusSent }
+
     /// Anything still editable in the composer — an unsent draft or one whose
     /// send failed. The distinction matters for the icon and nowhere else, so
     /// every behaviour (reopen on double-click, refusing to mark read) keys off
@@ -173,6 +178,10 @@ struct MessageAttachment: Identifiable, Hashable, Sendable {
 /// show what you are working on.
 struct ComposeDraft: Identifiable {
     let id = UUID()
+    /// The From line the message is sent under, editable in the composer. Empty
+    /// on a freshly built draft; `beginCompose` fills it with the account's own
+    /// identity, and a reopened or resent message carries the stored `From:` in.
+    var from: String = ""
     var to: String = ""
     var cc: String = ""
     var bcc: String = ""
@@ -192,6 +201,11 @@ struct ComposeDraft: Identifiable {
     /// The body as a single value, whichever way it is held. The editor binds to
     /// this; the plain and styled fields are derived from it on save.
     var content: RichText { styledBody ?? RichText(plain: body) }
+
+    /// Files attached to this message. Their bytes travel with the draft (read
+    /// when dropped in), so they survive a save/close/reopen and can't go missing
+    /// between attaching and sending. Assembled into multipart/mixed on send.
+    var attachments: [OutgoingMessage.Attachment] = []
 
     var inReplyTo: String? = nil
     var references: [String] = []
@@ -347,6 +361,28 @@ final class AppModel: ObservableObject {
     @Published var rootURL: URL?
     @Published var tree: [MailboxItem] = []
 
+    /// Whether the Junk mailbox is shown. Off by default — Stephen doesn't use
+    /// junk filtering — but restorable in Settings for a future user who wants it.
+    /// Display-only: `tree` stays complete (Junk is still on disk, still indexed,
+    /// still resolved by `item(ofType:)`); this only hides it from the sidebar and
+    /// the mailbox pickers, via `visibleTree`.
+    @Published var showJunkMailbox: Bool = UserDefaults.standard.bool(forKey: AppModel.showJunkKey) {
+        didSet {
+            guard showJunkMailbox != oldValue else { return }
+            UserDefaults.standard.set(showJunkMailbox, forKey: Self.showJunkKey)
+            // The tree itself didn't change, but what's *visible* did — nudge the
+            // version the sidebar and menus diff on so they re-read `visibleTree`.
+            treeVersion &+= 1
+        }
+    }
+    private static let showJunkKey = "showJunkMailbox"
+
+    /// The tree as shown to the user: the full `tree`, minus the Junk mailbox when
+    /// it's hidden. The one source every mailbox picker should draw from.
+    var visibleTree: [MailboxItem] {
+        showJunkMailbox ? tree : tree.filter { $0.type != .junk }
+    }
+
     /// Bumped whenever `tree` is replaced. The sidebar compares this instead of
     /// the tree itself — see `MailboxTree` — because a structural comparison of
     /// 2,723 nested items on every render would cost as much as it saves.
@@ -420,7 +456,15 @@ final class AppModel: ObservableObject {
                         // freshly replaced tree (see `rememberSelection`), and
                         // treating that as a switch would blank the list and
                         // cancel live work for no reason.
-                        if let new, new != self.selectedMailboxID { self.beginMailboxSwitch() }
+                        if let new, new != self.selectedMailboxID {
+                            self.beginMailboxSwitch()
+                            // Selecting In dismisses its new-mail badge. Guarded on
+                            // a real switch, so the List writing the current
+                            // selection back during reconciliation doesn't clear it.
+                            if self.inboxHasNewMail, new == self.inboxID {
+                                self.inboxHasNewMail = false
+                            }
+                        }
                         self.selectedMailboxID = new
                     }
                 })
@@ -445,7 +489,14 @@ final class AppModel: ObservableObject {
     var messageSelection: Binding<Set<MessageRow.ID>> {
         Binding(get: { [weak self] in self?.selectedMessageIDs ?? [] },
                 set: { [weak self] new in
-                    DispatchQueue.main.async { self?.applyMessageSelection(new) }
+                    DispatchQueue.main.async {
+                        // A user selection in In counts as engaging with it, so it
+                        // dismisses the new-mail badge. Programmatic selection goes
+                        // through `applyMessageSelection` directly, not this
+                        // binding, so a delivery re-list can't trip this.
+                        self?.clearInboxNewMailBadge()
+                        self?.applyMessageSelection(new)
+                    }
                 })
     }
 
@@ -517,6 +568,56 @@ final class AppModel: ObservableObject {
     /// How `rows` is ordered, or nil for mailbox order. Per mailbox, and
     /// remembered across launches (see `ViewState.sortByMailbox`).
     @Published private(set) var sort: MessageSort?
+
+    /// Lit when Check Mail has delivered new messages to In that the user hasn't
+    /// looked at yet — the sidebar then draws the unread glyph next to "In", the
+    /// way it draws the unsent glyph next to Out. Set on delivery (`receiveMail`)
+    /// and cleared the moment the user engages with In: selecting it, or — if In
+    /// was already selected when the mail arrived — the next message selection or
+    /// scroll. The clears live on the user-input paths (the SwiftUI bindings and
+    /// the guarded user-scroll site), not the shared model methods, so the
+    /// programmatic re-list that delivery triggers can't dismiss it. See
+    /// `clearInboxNewMailBadge`.
+    @Published private(set) var inboxHasNewMail = false
+
+    /// The message list's Who and Date column widths, adjustable by dragging the
+    /// header dividers (see `MessageColumnResizeController`) and remembered
+    /// globally across launches. The Table reads these for its columns' `ideal`
+    /// width.
+    ///
+    /// **Deliberately not `@Published`.** The drag updates these every frame, and
+    /// on a huge mailbox re-rendering the whole message list per frame beachballs.
+    /// The drag's live feedback comes from setting the `NSTableColumn` width
+    /// directly; these just need to hold the value the Table will read at its next
+    /// natural re-render, so a re-render mid-enrichment re-applies the current
+    /// width rather than the launch one. No observer needs to fire when they
+    /// change.
+    private(set) var whoColumnWidth: CGFloat =
+        MessageColumnWidths.loaded(key: MessageColumnWidths.whoWidthKey,
+                                   default: MessageColumnWidths.whoDefault,
+                                   min: MessageColumnWidths.whoMin)
+    private(set) var dateColumnWidth: CGFloat =
+        MessageColumnWidths.loaded(key: MessageColumnWidths.dateWidthKey,
+                                   default: MessageColumnWidths.dateDefault,
+                                   min: MessageColumnWidths.dateMin)
+
+    /// Set the Who column width (live, during a drag), clamped to its minimum and
+    /// remembered. A no-op when unchanged. Does not trigger a re-render — see the
+    /// note on `whoColumnWidth`.
+    func setWhoColumnWidth(_ width: CGFloat) {
+        let clamped = max(MessageColumnWidths.whoMin, width)
+        guard abs(clamped - whoColumnWidth) > 0.5 else { return }
+        whoColumnWidth = clamped
+        UserDefaults.standard.set(Double(clamped), forKey: MessageColumnWidths.whoWidthKey)
+    }
+
+    /// Set the Date column width. See `setWhoColumnWidth`.
+    func setDateColumnWidth(_ width: CGFloat) {
+        let clamped = max(MessageColumnWidths.dateMin, width)
+        guard abs(clamped - dateColumnWidth) > 0.5 else { return }
+        dateColumnWidth = clamped
+        UserDefaults.standard.set(Double(clamped), forKey: MessageColumnWidths.dateWidthKey)
+    }
 
     @Published var listingSource: String = ""
     @Published var mailboxSummary: String = ""
@@ -1005,7 +1106,12 @@ final class AppModel: ObservableObject {
     ///
     /// Depth-first pre-order, matching what `flatten` returned, so "first of
     /// this type" still means the same mailbox.
-    func base(ofType type: MailboxType) -> URL? {
+    func base(ofType type: MailboxType) -> URL? { item(ofType: type)?.base }
+
+    /// The first mailbox of a role in the tree, or nil — the item itself, when
+    /// the caller needs more than its `base` (e.g. its `id` to key view state).
+    /// Depth-first pre-order, like `base(ofType:)`.
+    func item(ofType type: MailboxType) -> MailboxItem? {
         func find(_ items: [MailboxItem]) -> MailboxItem? {
             for item in items {
                 if !item.isFolder, item.type == type { return item }
@@ -1013,7 +1119,19 @@ final class AppModel: ObservableObject {
             }
             return nil
         }
-        return find(tree)?.base
+        return find(tree)
+    }
+
+    /// The In box's tree id, or nil when the tree has none. Cheap enough to walk
+    /// on demand at the (user-paced) points that need it.
+    var inboxID: MailboxItem.ID? { item(ofType: .inbox)?.id }
+
+    /// Dismiss the In box's new-mail badge when the user engages with In on
+    /// screen. A no-op unless the badge is lit and In is the selected mailbox, so
+    /// it's safe to call from the message-selection and scroll input paths.
+    func clearInboxNewMailBadge() {
+        guard inboxHasNewMail, selectedMailboxID == inboxID else { return }
+        inboxHasNewMail = false
     }
 
     /// Where sent and unsent mail lives, from the in-memory tree.
@@ -1145,7 +1263,16 @@ final class AppModel: ObservableObject {
             // to what this mailbox now holds.
             if let mailbox = self.selectedMailboxID,
                let top = self.viewState.scrollTopRowByMailbox[mailbox], !self.rows.isEmpty {
-                self.pendingScrollTopRow = min(top, self.rows.count - 1)
+                if top == ViewState.scrollToBottom {
+                    // "Open at the bottom" — reveal the last row rather than pin a
+                    // top row, so the viewport fills with the newest mail (see
+                    // `receiveMail`). The reveal is recorded, so the sentinel is
+                    // replaced by the real position once the list settles.
+                    self.pendingScrollTopRow = nil
+                    self.pendingRevealRow = self.rows.count - 1
+                } else {
+                    self.pendingScrollTopRow = min(top, self.rows.count - 1)
+                }
             } else {
                 self.pendingScrollTopRow = nil
             }
@@ -1303,16 +1430,20 @@ final class AppModel: ObservableObject {
 
     // MARK: sorting
 
-    /// Sort by a column, reversing if it is already the sorted one — the whole
-    /// behaviour of a header click.
+    /// The whole behaviour of a header click: walk the clicked column through
+    /// NotSorted → Forward → Reverse → Forward → …
+    ///
+    /// A column that isn't the sorted one starts ascending (Forward) — including
+    /// Date, which no longer has a descending-by-default exception, so every
+    /// column behaves the same way. Clicking the already-sorted column flips its
+    /// direction. It never cycles back to NotSorted; Mailbox ▸ Sort ▸ Mailbox
+    /// Order is the way there. Because `sort` names a single column, sorting one
+    /// column leaves every other NotSorted by construction.
     func toggleSort(_ column: MessageSortColumn) {
         if sort?.column == column {
             setSort(MessageSort(column: column, ascending: !(sort?.ascending ?? true)))
         } else {
-            // A new column starts ascending, except Date, which starts newest
-            // first: that is the order anyone clicking a date column is asking
-            // for, and it's what Eudora's own descending-by-default date sort did.
-            setSort(MessageSort(column: column, ascending: column != .date))
+            setSort(MessageSort(column: column, ascending: true))
         }
     }
 
@@ -1720,6 +1851,16 @@ final class AppModel: ObservableObject {
     /// appending instead.
     private func beginCompose(_ draft: ComposeDraft) {
         var draft = draft
+        // Default the From line to the account's own identity, unless the caller
+        // already set one (a resend keeps the original's). Set before the record
+        // is written so the pre-saved draft carries it too. Built raw, not through
+        // `formatAddress`, so the editable field shows a human-readable name
+        // rather than an RFC-2047-encoded one; assembly re-encodes as needed.
+        if draft.from.isEmpty {
+            let name = accounts?.account.fromName ?? ""
+            let addr = accounts?.account.fromAddress ?? ""
+            draft.from = name.isEmpty ? addr : "\(name) <\(addr)>"
+        }
         // Fixed now and never regenerated — this is the draft's identity for the
         // rest of its life. `OutgoingMessage.generatedMessageID` builds one from
         // the From domain, so it needs the account, but falls back sensibly.
@@ -1913,15 +2054,21 @@ final class AppModel: ObservableObject {
         // original single-part path — the message is byte-for-byte what it was
         // before rich text existed. See `OutgoingMessage.htmlBody`.
         let html = draft.styledBody.map { RichTextHTML.html(from: $0) }
+        // The From line the user set (defaulted from the account in
+        // `beginCompose`); split back into name + address for assembly. Falls
+        // back to the account address only if somehow empty.
+        let fromLine = draft.from.isEmpty ? (accounts?.account.fromAddress ?? "") : draft.from
+        let (fromName, fromAddress) = OutgoingMessage.splitFrom(fromLine)
         let message = OutgoingMessage(
-            fromName: accounts?.account.fromName ?? "",
-            fromAddress: accounts?.account.fromAddress ?? "",
+            fromName: fromName,
+            fromAddress: fromAddress,
             to: splitAddresses(draft.to),
             cc: splitAddresses(draft.cc),
             bcc: splitAddresses(draft.bcc),
             subject: draft.subject,
             body: draft.body,
             htmlBody: html,
+            attachments: draft.attachments,
             inReplyTo: draft.inReplyTo,
             references: draft.references)
         // The draft's own ID, every time — that's what makes the record
@@ -1930,8 +2077,13 @@ final class AppModel: ObservableObject {
         // Empty maps to nil, not to an empty header: `rfc822` writes whatever
         // non-nil value it is handed, and a literal `Message-ID: ` would parse
         // back as "" and defeat the identity check for good.
+        //
+        // `includeBcc: true` — this is a *local* Out record (an unsent or
+        // send-failed draft), so it keeps the Bcc the way a sent message does;
+        // only the copy transmitted to recipients omits it. See `SMTPClient.send`.
         return message.rfc822(messageID: draft.messageID.isEmpty ? nil
-                                                                 : draft.messageID).data
+                                                                 : draft.messageID,
+                              includeBcc: true).data
     }
 
     /// Where this draft's record is right now, or nil if it can't be trusted.
@@ -2101,11 +2253,11 @@ final class AppModel: ObservableObject {
     /// takes over the existing record's offset and Message-ID, and comes back
     /// already saved, so closing without edits asks nothing and discards nothing.
     ///
-    /// **Bcc is lost.** `OutgoingMessage.rfc822` deliberately omits Bcc from the
-    /// headers, as it must — so once a draft has been written to Out there is
-    /// nowhere for those addresses to have survived. Reopening therefore silently
-    /// drops them. Keeping them would mean storing them outside the message, and
-    /// a blind-copy list sitting in a side file is a worse idea than losing it.
+    /// **Bcc survives.** The local Out record keeps its `Bcc:` header — only the
+    /// copy sent to recipients omits it (see `SMTPClient.send` and
+    /// `draftBytes(_:)`, which passes `includeBcc: true`) — so reopening reads the
+    /// blind recipients back into the composer. A draft written by an older build,
+    /// before that fix, has no stored `Bcc:` and reopens without one.
     func reopenDraft(messageIndex: Int) {
         // Only from Out. `isUnsent` is a status test, not a location one, and a
         // status-9 record can sit in any mailbox — dragged out of Out, or left
@@ -2138,8 +2290,10 @@ final class AppModel: ObservableObject {
         let styled = Self.styledBody(of: part)
 
         var draft = ComposeDraft(
+            from: HeaderDecoder.decode(part.header("From") ?? ""),
             to: HeaderDecoder.decode(part.header("To") ?? ""),
             cc: HeaderDecoder.decode(part.header("Cc") ?? ""),
+            bcc: HeaderDecoder.decode(part.header("Bcc") ?? ""),
             subject: HeaderDecoder.decode(part.header("Subject") ?? ""),
             body: styled?.plainText ?? Self.plainText(of: part),
             styledBody: styled,
@@ -2148,6 +2302,9 @@ final class AppModel: ObservableObject {
                 .split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init))
         draft.outOffset = msg.record.offset
         draft.hasBeenSaved = true
+        // Pull any attachment parts back into the composer — set before the
+        // Message-ID stamping below, so the record it may rewrite keeps them.
+        draft.attachments = Self.draftAttachments(from: part)
 
         let existingID = part.header("Message-ID")?.trimmingCharacters(in: .whitespaces) ?? ""
         if existingID.isEmpty {
@@ -2186,6 +2343,63 @@ final class AppModel: ObservableObject {
         }
         openDrafts[draft.id] = draft
         presentDraftWindow?(draft.id)
+    }
+
+    /// Whether a listed message (by row id) was successfully sent — the gate the
+    /// context menu uses to offer "Send Again".
+    func isSentMessage(_ id: MessageRow.ID) -> Bool {
+        guard let pos = rowPositionByID[id], pos < rows.count else { return false }
+        return rows[pos].isSent
+    }
+
+    /// Open a fresh copy of an already-sent message in the composer — same
+    /// recipients, subject and body (styling included), ready to send again.
+    ///
+    /// Unlike `reopenDraft`, this does *not* touch the original record: it goes
+    /// through `beginCompose`, which writes a brand-new draft into Out, so the
+    /// sent message is left exactly as it was. Works from whatever mailbox the
+    /// sent message is filed in — it only reads it. Threading headers
+    /// (In-Reply-To / References) are carried across so the resend sits in the
+    /// same conversation the original did.
+    ///
+    /// Bcc comes back too: the local Out copy keeps its `Bcc:` header (only the
+    /// copy sent to recipients omits it — see `SMTPClient.send`), so a message
+    /// sent with the current build carries its blind recipients into the resend.
+    /// A message sent by an older build predating that fix has no stored `Bcc:`,
+    /// so for those the `bcc:` line simply resolves to empty.
+    func sendAgain(messageIndex: Int) {
+        guard let store,
+              let mid = selectedMailboxID, let item = itemsByID[mid], !item.isFolder,
+              let msg = store.message(at: item.base, index: messageIndex) else { return }
+        let part = msg.part
+        let styled = Self.styledBody(of: part)
+        beginCompose(ComposeDraft(
+            from: HeaderDecoder.decode(part.header("From") ?? ""),
+            to: HeaderDecoder.decode(part.header("To") ?? ""),
+            cc: HeaderDecoder.decode(part.header("Cc") ?? ""),
+            bcc: HeaderDecoder.decode(part.header("Bcc") ?? ""),
+            subject: HeaderDecoder.decode(part.header("Subject") ?? ""),
+            body: styled?.plainText ?? Self.plainText(of: part),
+            styledBody: styled,
+            attachments: Self.draftAttachments(from: part),
+            inReplyTo: part.header("In-Reply-To")?.trimmingCharacters(in: .whitespaces),
+            references: (part.header("References") ?? "")
+                .split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)))
+    }
+
+    /// The attachment parts of a parsed message, as composer attachments with
+    /// decoded bytes — the reopen/Send-Again inverse of `rfc822`'s multipart/mixed
+    /// assembly.
+    nonisolated static func draftAttachments(from part: MIMEPart) -> [OutgoingMessage.Attachment] {
+        var result: [OutgoingMessage.Attachment] = []
+        var i = 0
+        for p in part.walk() where !p.isMultipart && p.isAttachment {
+            i += 1
+            let name = sanitizedFilename(p.filename) ?? "attachment-\(i)"
+            result.append(.init(filename: name, mimeType: p.contentType,
+                                data: Data(p.decodedPayload())))
+        }
+        return result
     }
 
     /// Build a reply (or reply-all) from the selected message.
@@ -2251,6 +2465,126 @@ final class AppModel: ObservableObject {
         return msg.part
     }
 
+    // MARK: blacklist a sender
+
+    /// The bare From address of the selected message, for the blacklist prompt.
+    func selectedSenderAddress() -> String? {
+        guard let part = selectedPart() else { return nil }
+        let (_, address) = OutgoingMessage.splitFrom(part.header("From") ?? "")
+        let trimmed = address.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Blacklist the selected message's sender. The caller has already confirmed
+    /// (this is the point of no return): send the notice reply, append the address
+    /// to `~/email_blacklist.txt`, and open that file in TextEdit. The ISP-side
+    /// blacklisting Stephen does by hand.
+    func blacklistSelectedSender() {
+        guard let part = selectedPart() else { return }
+        let origFrom = part.header("From") ?? ""
+        let (_, address) = OutgoingMessage.splitFrom(origFrom)
+        let addr = address.trimmingCharacters(in: .whitespaces)
+        guard !addr.isEmpty else { return }
+
+        sendBlacklistNotice(to: origFrom, address: addr, about: part)
+        appendToBlacklistFileAndOpen(addr)
+    }
+
+    /// Auto-send the "you've been blacklisted" reply to the sender.
+    private func sendBlacklistNotice(to origFrom: String, address: String, about part: MIMEPart) {
+        guard let accounts, accounts.account.isConfigured, !accounts.password.isEmpty else {
+            showError("Couldn't send the blacklist notice — set up your SMTP account in Settings first. "
+                      + "The address was still added to your blacklist file.")
+            return
+        }
+        let subject = HeaderDecoder.decode(part.header("Subject") ?? "")
+        let msgID = part.header("Message-ID")?.trimmingCharacters(in: .whitespaces)
+        var refs = (part.header("References") ?? "")
+            .split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        if let m = msgID { refs.append(m) }
+
+        // Stephen's line on top, two blank lines, then the sender's own message
+        // left in place below it.
+        let body = "I've added \(address) to my email blacklist.\r\n\r\n" + Self.plainText(of: part)
+
+        let account = accounts.account
+        let password = accounts.password
+        let message = OutgoingMessage(
+            fromName: account.fromName, fromAddress: account.fromAddress,
+            to: [origFrom], cc: [], bcc: [],
+            subject: subject.lowercased().hasPrefix("re:") ? subject : "Re: \(subject)",
+            body: body, htmlBody: nil,
+            inReplyTo: msgID, references: refs)
+
+        Task {
+            do {
+                let sent = try await SMTPClient.send(message, account: account, password: password)
+                // File a copy in Trash (not Out — a blacklist notice is disposable
+                // by nature), addressed to whoever it went to.
+                fileBlacklistCopyInTrash(raw: sent.raw, who: origFrom, subject: message.subject)
+                showBanner("Blacklist notice sent to \(address).")
+            } catch {
+                showError("The blacklist notice to \(address) didn't send: " + describe(error)
+                          + " (The address was still added to your blacklist file.)")
+            }
+        }
+    }
+
+    /// File a copy of the just-sent blacklist notice in Trash, marked sent.
+    private func fileBlacklistCopyInTrash(raw: Data, who: String, subject: String) {
+        guard let trash = base(ofType: .trash) else {
+            showError("Sent the blacklist notice, but this folder has no Trash to file a copy in.")
+            return
+        }
+        do {
+            _ = try Outbox.append(messageData: raw, to: trash,
+                                  status: MailboxMutator.statusSent, who: who, subject: subject)
+            refreshTrashIfShowing()
+        } catch {
+            showError("Sent the blacklist notice, but couldn't file a copy in Trash: " + describe(error))
+        }
+    }
+
+    /// Re-list Trash if it's the mailbox on screen (mirrors `refreshOutIfShowing`).
+    private func refreshTrashIfShowing() {
+        reloadTree()
+        if let id = selectedMailboxID, itemsByID[id]?.type == .trash {
+            loadListing(force: true)
+        }
+    }
+
+    /// Append the address (one per line) to `~/email_blacklist.txt`, creating it
+    /// if need be, then open it in TextEdit.
+    private func appendToBlacklistFileAndOpen(_ address: String) {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("email_blacklist.txt")
+        let line = Data((address + "\n").utf8)
+        do {
+            if let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: line)
+            } else {
+                try line.write(to: url)   // didn't exist — create it
+            }
+        } catch {
+            // Surface it rather than the notice's "was still added" reassurance
+            // quietly becoming a lie.
+            showError("Couldn't write \(address) to ~/email_blacklist.txt: " + describe(error))
+            return
+        }
+
+        // TextEdit specifically, per Stephen; fall back to the default handler if
+        // it isn't found.
+        if let textEdit = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.TextEdit") {
+            NSWorkspace.shared.open([url], withApplicationAt: textEdit,
+                                    configuration: NSWorkspace.OpenConfiguration(),
+                                    completionHandler: nil)
+        } else {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     /// Best-effort plain text of a message for quoting (prefers text/plain,
     /// falls back to tag-stripped HTML).
     static func plainText(of part: MIMEPart) -> String {
@@ -2285,6 +2619,13 @@ final class AppModel: ObservableObject {
     /// arbitrary markup is not something the composer should try to round-trip —
     /// `plainText(of:)` handles that the way it always has.
     static func styledBody(of part: MIMEPart) -> RichText? {
+        // A styled draft that also carries attachments is multipart/mixed with the
+        // alternative nested one level down — descend to it, so reopening such a
+        // draft recovers its formatting instead of flattening to plain text.
+        if part.contentType == "multipart/mixed",
+           let alt = part.children.first(where: { $0.contentType == "multipart/alternative" }) {
+            return styledBody(of: alt)
+        }
         guard part.contentType == "multipart/alternative" else { return nil }
         for p in part.walk() where !p.isMultipart && p.mainType == "text" && p.subType == "html" {
             let text = CharsetDecoder.smartDecode(p.decodedPayload(), declared: p.charset).text
@@ -2334,6 +2675,76 @@ final class AppModel: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
     }
+
+    // MARK: recently-used recipients (To/Cc/Bcc auto-fill)
+
+    private static let recentRecipientsKey = "recentRecipients"
+    private var recentRecipients = RecentRecipients(
+        entries: UserDefaults.standard.stringArray(forKey: AppModel.recentRecipientsKey) ?? [])
+
+    /// Auto-fill matches for the token being typed in a recipient field, most
+    /// recently used first.
+    func recipientCompletions(prefix: String) -> [String] {
+        recentRecipients.matches(prefix: prefix)
+    }
+
+    /// Record the addresses a message was just sent *to* — only To feeds the
+    /// list, by design — bumping each to the front, and persist.
+    func recordSentRecipients(_ recipients: [String]) {
+        guard !recipients.isEmpty else { return }
+        // Record back-to-front so `record`'s insert-at-front leaves the To field's
+        // left-to-right order intact — the first-listed recipient ends up most
+        // recent, not least.
+        for r in recipients.reversed() { recentRecipients.record(r) }
+        UserDefaults.standard.set(recentRecipients.entries, forKey: Self.recentRecipientsKey)
+    }
+
+    /// Forget a recipient (the dropdown's Delete action), and persist.
+    func removeRecentRecipient(_ recipient: String) {
+        recentRecipients.remove(recipient)
+        UserDefaults.standard.set(recentRecipients.entries, forKey: Self.recentRecipientsKey)
+    }
+
+    // MARK: the user's own auto-correction list
+
+    private static let correctionsKey = "textCorrections"
+    /// Published so the Settings list reflects edits live. Typing in the composer
+    /// only *reads* this (via `correctionReplacement`), so it never re-renders.
+    @Published private var textCorrections = AppModel.loadCorrections()
+
+    private static func loadCorrections() -> TextCorrections {
+        guard let data = UserDefaults.standard.data(forKey: correctionsKey),
+              let decoded = try? JSONDecoder().decode(TextCorrections.self, from: data)
+        else { return TextCorrections() }
+        return decoded
+    }
+
+    private func persistCorrections() {
+        if let data = try? JSONEncoder().encode(textCorrections) {
+            UserDefaults.standard.set(data, forKey: Self.correctionsKey)
+        }
+    }
+
+    /// The correction for a just-completed word, or nil — the editor's hook.
+    func correctionReplacement(for word: String) -> String? {
+        textCorrections.replacement(for: word)
+    }
+
+    /// Add or update a correction (right-click quick-add and Settings), persist.
+    func addCorrection(trigger: String, replacement: String) {
+        if textCorrections.set(trigger: trigger, replacement: replacement) {
+            persistCorrections()
+        }
+    }
+
+    /// Forget a correction (Settings' delete), persist.
+    func removeCorrection(trigger: String) {
+        textCorrections.remove(trigger: trigger)
+        persistCorrections()
+    }
+
+    /// The rules, in order, for the Settings list.
+    var correctionRules: [TextCorrections.Rule] { textCorrections.rules }
 
     // MARK: write-back after a successful send
 
@@ -2744,6 +3155,54 @@ final class AppModel: ObservableObject {
         reloadTree()
     }
 
+    /// Sidebar right-click ▸ "Move to group": relocate this mailbox or folder
+    /// into another folder (`destinationID`) or the tree root (`nil` = Top
+    /// Level). `MailboxTreeMutator.moveInto` does the descmap.pce edits and the
+    /// file move and refuses the illegal cases (system mailboxes, a folder into
+    /// its own subtree, a name clash); here we resolve the directories, tear down
+    /// a selection the move would strand, and rebuild.
+    func moveIntoGroup(_ id: MailboxItem.ID, into destinationID: MailboxItem.ID?) {
+        guard let item = itemsByID[id] else { return }
+        let sourceDir = item.base.deletingLastPathComponent()
+        let filename = descmapFilename(of: id)
+
+        let destDir: URL
+        let destName: String
+        if let destinationID {
+            guard let dest = itemsByID[destinationID], dest.isFolder else { return }
+            destDir = dest.base            // a folder's base is its .fol directory
+            destName = dest.display
+        } else {
+            guard let rootURL else { return }
+            destDir = rootURL
+            destName = "the top level"
+        }
+
+        let moved: Bool
+        do {
+            moved = try MailboxTreeMutator.moveInto(filename: filename, from: sourceDir, to: destDir)
+        } catch {
+            showError("Couldn't move \u{201C}\(item.display)\u{201D}: \(error.localizedDescription)")
+            return
+        }
+        // Already there — nothing changed, so no teardown and no banner.
+        guard moved else { return }
+
+        // The move changes this item's id (its path prefix). If it — or, for a
+        // folder, anything inside it — was on screen, that selection is about to
+        // dangle; tear it down, as delete does. Its stale view-state keys are
+        // left to linger harmlessly, keyed on ids nothing can select again.
+        if let sel = selectedMailboxID, sel == id || sel.hasPrefix(id + "/") {
+            beginMailboxSwitch()
+            selectedMailboxID = nil
+            listedMailboxID = nil
+            selectMessage(nil)
+        }
+
+        showBanner("Moved \u{201C}\(item.display)\u{201D} to \(destName).")
+        reloadTree()
+    }
+
     // MARK: reordering & folder delete
 
     /// Whether this mailbox or folder can move up/down — i.e. there is a
@@ -2953,24 +3412,62 @@ final class AppModel: ObservableObject {
         return item
     }
 
+    /// Mailbox ▸ New… and Mailbox ▸ New Group…: prompt for a name and create a
+    /// mailbox or a group (folder) at the top level. It goes in at the top level
+    /// (alongside In/Out/Trash, below the separator); to file it inside a group,
+    /// use the sidebar's "Move to group" afterwards. Reuses the tested
+    /// `createMailbox`, so the name validation and duplicate checks come along.
+    func createTopLevel(asFolder: Bool) {
+        guard let rootURL else {
+            showError("Open a Eudora folder first.")
+            return
+        }
+        let noun = asFolder ? "group" : "mailbox"
+        let alert = NSAlert()
+        alert.messageText = asFolder ? "New Group" : "New Mailbox"
+        alert.informativeText = "Name for the new \(noun), created at the top level."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        if let created = createMailbox(named: name, inDirectory: rootURL,
+                                       idPrefix: nil, asFolder: asFolder) {
+            showBanner("Created \(noun) \u{201C}\(created.display)\u{201D}.")
+        }
+    }
+
     // MARK: receiving (POP3)
 
     /// Check mail: fetch new messages into the In box, then — only if the user
     /// opted in — delete them from the server in a second pass, after they're
     /// safely written locally.
-    func receiveMail(accounts: AccountStore) async {
+    /// - Parameter automatic: true for a timer-driven check (see
+    ///   `configureAutoCheck`). An automatic check stays quiet — no error banner,
+    ///   and no "No new mail" toast every interval — surfacing only actual new
+    ///   mail (through the list and the sidebar badge); a manual check reports
+    ///   its outcome as before.
+    func receiveMail(accounts: AccountStore, automatic: Bool = false) async {
         guard let inbox = base(ofType: .inbox) else {
-            showError("No In mailbox in this tree.")
+            if !automatic { showError("No In mailbox in this tree.") }
             return
         }
         guard accounts.pop.isConfigured else {
-            showError("Incoming mail not set up: server=\"\(accounts.pop.host)\", "
-                + "user=\"\(accounts.pop.username)\", port=\(accounts.pop.port). "
-                + "Fill these in Settings ▸ Incoming mail (POP3), then Save.")
+            if !automatic {
+                showError("Incoming mail not set up: server=\"\(accounts.pop.host)\", "
+                    + "user=\"\(accounts.pop.username)\", port=\(accounts.pop.port). "
+                    + "Fill these in Settings ▸ Incoming mail (POP3), then Save.")
+            }
             return
         }
         guard !accounts.incomingPassword.isEmpty else {
-            showError("Incoming password is empty — enter it in Settings ▸ Incoming mail (POP3), then Save.")
+            if !automatic {
+                showError("Incoming password is empty — enter it in Settings ▸ Incoming mail (POP3), then Save.")
+            }
             return
         }
         guard !isChecking else { return }
@@ -3002,16 +3499,79 @@ final class AppModel: ObservableObject {
             }
 
             reloadTree()
-            if let id = selectedMailboxID, itemsByID[id]?.type == .inbox { loadListing(force: true) }
-            showCheckMailNotice(fetched.isEmpty
-                        ? "No new mail"
-                        : "Received \(fetched.count) message\(fetched.count == 1 ? "" : "s")")
+            if let id = selectedMailboxID, itemsByID[id]?.type == .inbox {
+                // In is on screen: re-list it so the new mail shows now.
+                loadListing(force: true)
+            } else if !fetched.isEmpty, let inboxItem = item(ofType: .inbox) {
+                // In isn't on screen: arrange for it to open in date order,
+                // scrolled to the newest, so the arriving mail is in view the
+                // next time In is selected. Only its stored state changes now;
+                // nothing is visible until then.
+                viewState.sortByMailbox[inboxItem.id] = MessageSort(column: .date, ascending: true)
+                viewState.scrollTopRowByMailbox[inboxItem.id] = ViewState.scrollToBottom
+                if let root = rootURL?.path { ViewStateStore.save(viewState, forRoot: root) }
+            }
+            // Light the sidebar's new-mail badge on In (dismissed when the user
+            // next engages with In — see `clearInboxNewMailBadge`).
+            if !fetched.isEmpty { inboxHasNewMail = true }
+            // A silent automatic check says nothing when nothing arrived; it
+            // still confirms a real delivery. A manual check reports either way.
+            if !(automatic && fetched.isEmpty) {
+                showCheckMailNotice(fetched.isEmpty
+                            ? "No new mail"
+                            : "Received \(fetched.count) message\(fetched.count == 1 ? "" : "s")")
+            }
         } catch {
-            // Short line in the toolbar indicator; the full reason stays up in
-            // the banner until dismissed, since it's usually actionable.
-            showCheckMailNotice("Check mail failed")
-            showError("Check mail failed: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)")
+            // A manual check surfaces the failure — the short line in the toolbar
+            // indicator, plus the full reason in the banner until dismissed, since
+            // it's usually actionable. An automatic check swallows it rather than
+            // interrupting the user every interval over a transient blip.
+            if !automatic {
+                showCheckMailNotice("Check mail failed")
+                showError("Check mail failed: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)")
+            }
         }
+    }
+
+    // MARK: automatic Check Mail
+
+    private var autoCheckTimer: Timer?
+
+    /// (Re)start or stop the automatic Check Mail timer from the incoming-mail
+    /// settings. Idempotent — safe to call at launch and on every settings
+    /// change; it tears down any existing timer first. Off unless enabled, and
+    /// the interval is clamped to at least a minute (`POP3Account` clamps it too,
+    /// but this is the last guard against a zero-interval timer).
+    ///
+    /// Added to the run loop in `.common` mode so a check still fires while the
+    /// user is scrolling or holding a menu open. The block hops to the main actor,
+    /// reads the account handed over in `ContentView.onAppear` (`self.accounts`),
+    /// skips when it isn't ready, and fetches as `automatic` so a quiet interval
+    /// stays quiet.
+    func configureAutoCheck() {
+        autoCheckTimer?.invalidate()
+        autoCheckTimer = nil
+        guard let accounts, accounts.pop.autoCheckEnabled else { return }
+        // Check once right now, then on the interval: turning it on, changing the
+        // interval, and launching with it on should all fetch immediately and
+        // then start the clock. Silent (`automatic`), and skipped if the account
+        // isn't ready or the In box isn't in the tree yet.
+        if accounts.isReadyToReceive {
+            Task { @MainActor [weak self] in
+                guard let self, let accounts = self.accounts else { return }
+                await self.receiveMail(accounts: accounts, automatic: true)
+            }
+        }
+        let interval = TimeInterval(max(1, accounts.pop.autoCheckMinutes)) * 60
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, let accounts = self.accounts,
+                      accounts.isReadyToReceive else { return }
+                await self.receiveMail(accounts: accounts, automatic: true)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        autoCheckTimer = timer
     }
 
     // MARK: search (Find window)
@@ -3153,6 +3713,8 @@ final class AppModel: ObservableObject {
             // Mailbox already listed; just move the selection (onChange renders it).
             selectMessage(index)
         } else {
+            // Jumping into In from a search hit also dismisses its badge.
+            if inboxHasNewMail, hit.mailbox == inboxID { inboxHasNewMail = false }
             pendingMessageID = index
             selectedMailboxID = hit.mailbox   // onChange → loadListing() applies pending
         }

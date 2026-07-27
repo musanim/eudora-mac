@@ -120,6 +120,11 @@ final class MessageHeaderSortController: NSObject {
     /// sortable things; `sortColumn(at:x:header:)` splits it by x position.
     private static let columnSortKeys: [MessageSortColumn?] = [nil, .who, .date, .subject]
 
+    /// How close to a column edge counts as the resize divider rather than a
+    /// sort click, so a drag there resizes instead of sorting. Shares the resize
+    /// controller's catch zone so the two agree exactly.
+    private static let dividerSlop = MessageColumnResizeController.slop
+
     init(model: AppModel, table: NSTableView) {
         self.model = model
         self.table = table
@@ -150,6 +155,17 @@ final class MessageHeaderSortController: NSObject {
             let column = header.column(at: point)
             guard column >= 0 else { return event }
 
+            // A click on (or right next to) a column edge is a resize divider —
+            // let it through so the Who/Date columns can be dragged, and don't
+            // sort. This monitor used to consume *every* header click to keep
+            // AppKit from resizing (which would once have fought the pinned
+            // widths); now the text columns are meant to resize, so only clicks
+            // in the body of a header cell sort.
+            let rect = header.headerRect(ofColumn: column)
+            if point.x - rect.minX < Self.dividerSlop || rect.maxX - point.x < Self.dividerSlop {
+                return event
+            }
+
             guard let key = self.sortColumn(at: column, x: point.x, header: header) else {
                 return event
             }
@@ -159,9 +175,7 @@ final class MessageHeaderSortController: NSObject {
             // later clicks are still consumed, so AppKit doesn't get them either.
             guard event.clickCount == 1 else { return nil }
             self.model.toggleSort(key)
-            // Consumed. AppKit's own header handling is column dragging and
-            // resizing, both of which would fight the pinned widths that keep the
-            // headers aligned with their content (see `MessageColumnWidths`).
+            // Consumed, so AppKit doesn't also act on a body click.
             return nil
         }
     }

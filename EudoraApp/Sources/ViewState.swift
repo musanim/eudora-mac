@@ -39,6 +39,17 @@ struct ViewState: Codable {
     /// message. The index is clamped to the row count on restore.
     var scrollTopRowByMailbox: [String: Int] = [:]
 
+    /// A `scrollTopRowByMailbox` value meaning "open this mailbox scrolled to the
+    /// bottom" rather than at a specific top row. Set for the In box when mail
+    /// arrives while another mailbox is up (see `AppModel.receiveMail`), so the
+    /// newly-delivered messages — newest, and therefore at the bottom of the
+    /// oldest-first date order — are in view the next time In is selected. The
+    /// loader turns it into a reveal of the last row; the scroll recorder then
+    /// replaces it with the real top row once In is on screen. `Int.max` because
+    /// it can never be a genuine row index and clamps harmlessly to the last row
+    /// anywhere it's read without the sentinel check.
+    static let scrollToBottom = Int.max
+
     /// Per-mailbox sort column and direction; absent means mailbox order.
     ///
     /// Per mailbox rather than one setting for the app, because that is how
