@@ -239,6 +239,107 @@ fixed). Not yet compiled on Stephen's Mac or tested against real HTML mail.
 
 ---
 
+## 7. Incoming mail from more than one account
+
+**Decided 2026-07. Not yet built.**
+
+### The situation this replaces
+
+Stephen has two addresses. `stephen@musanim.com` is the main one and the home of
+a 30-year permanent archive, reached until now through Windows Eudora 7 in
+emulation on a dedicated MacBook, viewed remotely from the main MacBook Pro and
+an iPad. `stephen.malinowski@gmail.com` is secondary and readable natively
+everywhere. Gmail is currently configured to **forward a copy of everything to
+musanim**, purely so the archive sees it.
+
+Eudora 8 running natively on the main MacBook Pro retires the Windows machine.
+The forwarding then has no reason to exist — *if* Eudora 8 can collect Gmail
+directly.
+
+### The decisions
+
+- **Two (eventually N) incoming POP accounts; one outgoing.** Receiving becomes
+  a list. Sending stays single. Stephen doesn't need to send as Gmail; on the
+  rare occasion he wants a reply to go there he'll ask the correspondent, or
+  send that message from Gmail. This deliberately avoids the SPF/DMARC problem
+  of emitting `From: …@gmail.com` through musanim's SMTP server.
+- **Both accounts deliver into the same In mailbox.** No per-account inboxes, no
+  visible distinction. `stephen.malinowski@gmail.com` is already in the "me"
+  identity set, so the Who column resolves Gmail messages correctly.
+- **Nothing is deleted from either server.** `deleteAfterDownload` stays false.
+  It remains a per-account setting because the two accounts needn't agree
+  forever — musanim is Stephen's archive, Gmail's copy is Google's.
+- **Direct POP replaces the forwarding, and the two must never overlap.** With
+  one In box there is nothing to separate a forwarded copy from a directly
+  fetched one, so running both would duplicate every Gmail message. Forwarding
+  goes off at the moment direct POP goes on.
+
+### Gmail is not an ordinary POP server
+
+This is the part that governs the design, and none of it is in our code.
+
+A normal POP server offers every message and lets the client decide what to take
+and what to delete; our `deleteAfterDownload = false` plus UIDL tracking is
+exactly that contract. Gmail instead keeps its **own** server-side record of what
+it has handed out over POP and won't offer it again, whatever the client's UIDL
+set says. So the behaviour Stephen wants is bought with Gmail's settings, not
+ours:
+
+- **"When messages are accessed with POP" → keep Gmail's copy in the Inbox.**
+  This, not anything in Eudora 8, is what leaves the mail readable in Gmail on
+  the phone. It is also therefore the safety net for the whole transition:
+  Gmail retains everything regardless of what Eudora 8 does, so the cut-over
+  risks nothing. (An earlier draft of this plan proposed keeping the forwarding
+  on as a net — wrong, and it would have caused the duplication above.)
+- **Enable POP "for mail that arrives from now on"**, not "for all mail" —
+  which would drag the entire Gmail history into In on the first check. The
+  history is already in the archive by way of the forwarding.
+- **Recent mode** (`recent:` prefixed to the username) re-offers the last 30
+  days regardless of prior download. Not needed while Eudora 8 is the only POP
+  client, but it is the recovery route if Gmail and Eudora 8 ever disagree about
+  what has been delivered.
+- **An App Password is required** — 2-Step Verification on, then a 16-character
+  password. Google's plain-password access is long gone. No OAuth work is
+  implied: `POP3Client.login` sends `USER`/`PASS` and an App Password satisfies
+  it as-is.
+- **Gmail rate-limits POP polling.** `autoCheckMinutes` clamps at 1, which is
+  fine against musanim and a bad idea against Gmail; 15 minutes is the usual
+  recommended floor.
+
+### What the code change involves
+
+`AccountStore` holds one `pop: POP3Account` and one `incomingPassword`. The
+storage beneath is already per-account and needs no rework: `knownUIDs()` reads
+`all[pop.keychainAccount]` out of a dictionary, and the Keychain key is derived
+the same way. The work is:
+
+- `pop` becomes a list; `incomingPassword` becomes per-account.
+- `knownUIDs()` / `setKnownUIDs()` take an account rather than reading `pop`.
+- `receiveMail`'s fetch-and-deliver body becomes a loop, with `reloadTree`, the
+  sort/scroll arrangement, the new-mail badge and the notice hoisted out and run
+  once at the end.
+- **Per-account failure isolation.** Today a single `catch` wraps everything, so
+  with two accounts one server's failure would silently abandon the other's
+  fetch. Each account must succeed or fail independently, with results
+  aggregated into one notice.
+- **Migration must not be able to lose the musanim settings.** They live in
+  UserDefaults under `"POP3Account"` as a single object. The list is written
+  under a *new* key with the old one kept readable as a fallback, so a mistake
+  or a downgrade cannot wipe a configured server back to defaults. (This is why
+  `POP3Account.init(from:)` already decodes field-by-field with
+  `decodeIfPresent`.)
+- Settings grows from one fixed incoming section to an add/remove list — the
+  bulk of the work.
+
+### Rollout
+
+Stephen is not yet using musanim with Eudora 8, so the order is: build the
+multi-account support, leave the first slot empty, configure **Gmail** in the
+second and run it alone for a while. musanim moves over at the real cut-over,
+and the Gmail forwarding is switched off then.
+
+---
+
 ## Through-line
 
 Both security and encoding follow the same rule: **honor what's trustworthy,
