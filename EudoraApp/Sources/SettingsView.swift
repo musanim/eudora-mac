@@ -45,6 +45,70 @@ struct SettingsView: View {
     /// Installed font families, resolved once for the composing-face picker.
     private static let families: [String] = NSFontManager.shared.availableFontFamilies
 
+    /// The pane's fixed width. Only the height is the user's to choose; the
+    /// fields, captions and the two-column rows are laid out for this number.
+    private static let windowWidth: CGFloat = 480
+
+    /// Where AppKit files the window's frame. Any string works as long as it
+    /// stays stable — changing it silently forgets the remembered size.
+    private static let frameAutosaveName = "EudoraSettingsWindow"
+
+    /// Make the Settings window vertically resizable, and have AppKit remember
+    /// its frame across launches.
+    ///
+    /// SwiftUI's `Settings` scene hands back a window sized to its content and
+    /// with no `.resizable` bit, so both halves are done here: add the bit, and
+    /// restore/persist the frame by name. Autosaving starts automatically once
+    /// the name is set; restoring does not, hence the explicit
+    /// `setFrameUsingName`.
+    ///
+    /// The `.frame` modifier on the body is the load-bearing half of the
+    /// resizing, more than the style mask: SwiftUI drives the window's content
+    /// min/max from the root view's sizing on every layout pass, so a *fixed*
+    /// height there snaps the window back whatever the style mask says. An
+    /// open-ended `maxHeight` is what lets it grow.
+    ///
+    /// **`.resizable` must go on before the restore.** `setFrameUsingName(_:)`
+    /// is `setFrameUsingName(_:force:)` with `force: false`, and in that mode
+    /// AppKit applies only the *origin* to a window that isn't resizable — the
+    /// saved size is silently dropped. Reordering these two lines would leave a
+    /// window that remembers where it was but not how big.
+    private func configureWindow(_ w: NSWindow) {
+        w.styleMask.insert(.resizable)
+
+        // Guarded because `updateNSView` can resolve the same window more than
+        // once, and re-restoring would yank a window the user had just dragged
+        // back to its saved frame.
+        //
+        // Restore *then* name: `setFrameUsingName` reads UserDefaults directly
+        // and doesn't need the name to be set first, while naming first risks
+        // AppKit writing the current frame out and clobbering the saved value
+        // microseconds before it is read.
+        if w.frameAutosaveName != Self.frameAutosaveName {
+            w.setFrameUsingName(Self.frameAutosaveName)
+            w.setFrameAutosaveName(Self.frameAutosaveName)
+        }
+
+        // Width pinned by equal minimum and maximum, so only the horizontal
+        // edges offer a resize cursor.
+        //
+        // From the constant, never from `w.frame.width`. The window may not have
+        // been laid out when `WindowGrabber` resolves it — this codebase already
+        // knows that, which is why `SplashWindow.mainWindowDidAppear` refuses to
+        // trust a frame narrower than a point — and capturing a degenerate width
+        // here would be permanent: min == max == wrong, no way to widen it back,
+        // and the bad width autosaved and restored on every later launch.
+        //
+        // `contentMinSize`/`contentMaxSize` rather than `minSize`/`maxSize`
+        // because they share storage but are in the same coordinate space as the
+        // SwiftUI `.frame` above. `minSize` is a *frame* height, which the title
+        // bar makes about 28pt larger than the content — enough that AppKit
+        // would allow a drag shorter than SwiftUI's floor and clip the bottom.
+        w.contentMinSize = NSSize(width: Self.windowWidth, height: 360)
+        w.contentMaxSize = NSSize(width: Self.windowWidth,
+                                  height: .greatestFiniteMagnitude)
+    }
+
     /// The auto-check interval field, clamped to at least 1 minute on entry so
     /// the number field can never hold a zero or negative interval.
     private var autoCheckMinutes: Binding<Int> {
@@ -238,16 +302,27 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        // Tall enough to show every section without the form scrolling. Sized by
-        // estimate rather than measurement (there's no way to render here); if a
-        // little dead space shows at the bottom, or a rare state still scrolls,
-        // this height is the one number to nudge. The "Me" section grows a row
-        // per address, so a long identity set will scroll the form — expected.
-        .frame(width: 480, height: 880)
+        // Fixed width, free height. The width is a deliberate constant — the
+        // fields and captions are laid out for it — while the height is
+        // whatever the user drags it to, remembered between launches. The
+        // grouped form scrolls when the window is shorter than its content, so
+        // there is no height at which anything becomes unreachable.
+        //
+        // 880 was the old fixed height, kept as the *ideal* so a first run with
+        // no remembered frame opens showing everything, as it used to.
+        // One call: `width:` and `minHeight:` are different overloads and cannot
+        // be mixed, so the fixed width is expressed as min == ideal == max.
+        .frame(minWidth: Self.windowWidth, idealWidth: Self.windowWidth,
+               maxWidth: Self.windowWidth,
+               minHeight: 360, idealHeight: 880, maxHeight: .infinity)
         // The `!==` guard matters: `updateNSView` re-resolves on every
         // invalidation, and assigning the same window back would re-invalidate
         // the view and spin once per runloop turn while Settings sits open.
-        .background(WindowGrabber { if window !== $0 { window = $0 } })
+        .background(WindowGrabber { resolved in
+            guard window !== resolved else { return }
+            window = resolved
+            if let resolved { configureWindow(resolved) }
+        })
         .navigationTitle("Settings")
     }
 
