@@ -230,7 +230,7 @@ struct SettingsView: View {
             ?? window.firstResponder as? NSView
         DispatchQueue.main.async {
             if let start, start.window === window {
-                window.selectKeyViewFollowingView(start)
+                window.selectKeyView(following: start)
             } else {
                 window.selectNextKeyView(nil)
             }
