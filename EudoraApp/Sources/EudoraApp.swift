@@ -67,6 +67,18 @@ struct EudoraApp: App {
                 .environmentObject(accounts)
                 .environmentObject(composeSettings)
         }
+        // This is what makes the Settings window resizable, and it has to be
+        // here on the *scene* — nothing done to the NSWindow survives.
+        //
+        // A scene's resizability defaults to `.automatic`, which for `Settings`
+        // means "pin to the content's ideal size". SwiftUI re-asserts that on
+        // its own schedule, so inserting `.resizable` into the window's style
+        // mask and hand-setting its content min/max got overwritten a layout
+        // pass later — the window claimed to be resizable and refused to drag.
+        // `.contentSize` derives the window's limits from the root view's
+        // *minimum and maximum* instead of its ideal, which is what lets
+        // `SettingsView`'s `maxHeight: .infinity` mean anything.
+        .windowResizability(.contentSize)
     }
 
     // MARK: - Menu-bar commands

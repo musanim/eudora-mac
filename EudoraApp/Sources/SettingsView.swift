@@ -56,25 +56,28 @@ struct SettingsView: View {
     /// Make the Settings window vertically resizable, and have AppKit remember
     /// its frame across launches.
     ///
-    /// SwiftUI's `Settings` scene hands back a window sized to its content and
-    /// with no `.resizable` bit, so both halves are done here: add the bit, and
-    /// restore/persist the frame by name. Autosaving starts automatically once
-    /// the name is set; restoring does not, hence the explicit
-    /// `setFrameUsingName`.
+    /// Resizability is *not* set here — `.windowResizability(.contentSize)` on
+    /// the scene does that, and it has to, because nothing done to the NSWindow
+    /// survives SwiftUI's next layout pass. What this does is the part SwiftUI
+    /// doesn't offer: remembering the frame across launches.
     ///
-    /// The `.frame` modifier on the body is the load-bearing half of the
-    /// resizing, more than the style mask: SwiftUI drives the window's content
-    /// min/max from the root view's sizing on every layout pass, so a *fixed*
-    /// height there snaps the window back whatever the style mask says. An
-    /// open-ended `maxHeight` is what lets it grow.
-    ///
-    /// **`.resizable` must go on before the restore.** `setFrameUsingName(_:)`
+    /// **`.resizable` must be on before the restore.** `setFrameUsingName(_:)`
     /// is `setFrameUsingName(_:force:)` with `force: false`, and in that mode
     /// AppKit applies only the *origin* to a window that isn't resizable — the
-    /// saved size is silently dropped. Reordering these two lines would leave a
-    /// window that remembers where it was but not how big.
+    /// saved size is silently dropped. Hence the belt-and-braces insert below,
+    /// ordered before the restore.
     private func configureWindow(_ w: NSWindow) {
-        w.styleMask.insert(.resizable)
+        // Conditional: this runs on every body evaluation, which for a pane
+        // whose stores publish per keystroke means every character typed.
+        // `setStyleMask:` is not reliably a no-op on an equal value — it can
+        // rebuild the title bar — so don't hand it one.
+        //
+        // Resizability itself comes from `.windowResizability(.contentSize)` on
+        // the scene (see `EudoraApp`); SwiftUI sets this bit as a consequence.
+        // It stays here because the frame restore below needs it: with
+        // `force: false`, AppKit applies only the *origin* to a window that
+        // isn't resizable, silently dropping the saved size.
+        if !w.styleMask.contains(.resizable) { w.styleMask.insert(.resizable) }
 
         // Guarded because `updateNSView` can resolve the same window more than
         // once, and re-restoring would yank a window the user had just dragged
@@ -89,24 +92,61 @@ struct SettingsView: View {
             w.setFrameAutosaveName(Self.frameAutosaveName)
         }
 
-        // Width pinned by equal minimum and maximum, so only the horizontal
-        // edges offer a resize cursor.
-        //
-        // From the constant, never from `w.frame.width`. The window may not have
-        // been laid out when `WindowGrabber` resolves it — this codebase already
-        // knows that, which is why `SplashWindow.mainWindowDidAppear` refuses to
-        // trust a frame narrower than a point — and capturing a degenerate width
-        // here would be permanent: min == max == wrong, no way to widen it back,
-        // and the bad width autosaved and restored on every later launch.
-        //
-        // `contentMinSize`/`contentMaxSize` rather than `minSize`/`maxSize`
-        // because they share storage but are in the same coordinate space as the
-        // SwiftUI `.frame` above. `minSize` is a *frame* height, which the title
-        // bar makes about 28pt larger than the content — enough that AppKit
-        // would allow a drag shorter than SwiftUI's floor and clip the bottom.
-        w.contentMinSize = NSSize(width: Self.windowWidth, height: 360)
-        w.contentMaxSize = NSSize(width: Self.windowWidth,
-                                  height: .greatestFiniteMagnitude)
+        // Deliberately NOT setting contentMinSize/contentMaxSize. With
+        // `.windowResizability(.contentSize)` SwiftUI derives both from the root
+        // view's own minimum and maximum — which the `.frame` on the body
+        // already states — and a second, hand-set copy of the same numbers is
+        // one more thing to disagree with it. The earlier attempt set them and
+        // they were simply overwritten.
+
+        Self.logSizing(w)
+    }
+
+    /// Why the Settings window will or won't resize, in one line.
+    ///
+    /// Off, but intact — the way this codebase keeps its diagnostics. It earned
+    /// its keep immediately: two attempts at a resizable Settings pane failed
+    /// before the cause was found, and both failures would have been one line of
+    /// output each. What to read: `contentMin` and `contentMax` with *equal*
+    /// heights mean something is pinning the window to its fitting size, which
+    /// is what `.windowResizability(.contentSize)` on the scene exists to stop.
+    /// Printed twice because the telling value isn't the one right after
+    /// configuring, it's the one a layout pass later once SwiftUI has had its
+    /// say.
+    private static var logSizingEnabled = false
+
+    /// Whether the deferred dump has been queued. `configureWindow` runs on
+    /// every body evaluation — every keystroke — and without this the pane would
+    /// queue one deferred print per character typed.
+    private static var didLogSettled = false
+
+    private static func logSizing(_ w: NSWindow) {
+        guard logSizingEnabled else { return }
+        // `n` guards every number: `contentMaxSize` defaults to CGFLOAT_MAX on
+        // both axes, and `Int(CGFloat.greatestFiniteMagnitude)` is a trap — the
+        // diagnostic would crash on exactly the reading it was turned on for.
+        func n(_ v: CGFloat) -> String { v > 1e6 ? "∞" : String(Int(v)) }
+        func describe(_ o: AnyObject?) -> String {
+            o.map { String(describing: type(of: $0)) } ?? "nil"
+        }
+        func report(_ when: String) {
+            // `type(of:)` on the Optional itself would print
+            // `Optional<NSViewController>` — the static type, and useless. The
+            // hosting class is the whole point, and for a SwiftUI scene it may
+            // be the content *view* rather than a controller.
+            print("""
+                [Settings/\(when)] resizable=\(w.styleMask.contains(.resizable)) \
+                frame=\(n(w.frame.width))×\(n(w.frame.height)) \
+                contentMin=\(n(w.contentMinSize.width))×\(n(w.contentMinSize.height)) \
+                contentMax=\(n(w.contentMaxSize.width))×\(n(w.contentMaxSize.height)) \
+                controller=\(describe(w.contentViewController)) \
+                view=\(describe(w.contentView))
+                """)
+        }
+        report("configured")
+        guard !didLogSettled else { return }
+        didLogSettled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { report("settled") }
     }
 
     /// The auto-check interval field, clamped to at least 1 minute on entry so
@@ -117,6 +157,67 @@ struct SettingsView: View {
     }
 
     var body: some View {
+        // Form on top, Save fixed at the bottom. The button used to be the last
+        // Section, which put it inside the form's scroll view — so on a short
+        // window it scrolled away with everything else. A dialog's confirming
+        // action shouldn't be something you have to go looking for.
+        VStack(spacing: 0) {
+            settingsForm
+            Divider()
+            footer
+        }
+        // Fixed width, free height. The width is a deliberate constant — the
+        // fields and captions are laid out for it — while the height is
+        // whatever the user drags it to, remembered between launches. The
+        // grouped form scrolls when the window is shorter than its content, so
+        // there is no height at which anything becomes unreachable.
+        //
+        // 880 was the old fixed height and is kept as the *ideal*, so a first
+        // run with no remembered frame opens showing everything as it used to —
+        // plus ~50pt, because the Save row now sits outside the form rather than
+        // being the last thing in it.
+        //
+        // One call: `width:` and `minHeight:` are different overloads and cannot
+        // be mixed, so the fixed width is expressed as min == ideal == max.
+        .frame(minWidth: Self.windowWidth, idealWidth: Self.windowWidth,
+               maxWidth: Self.windowWidth,
+               minHeight: 360, idealHeight: 930, maxHeight: .infinity)
+        // Not `!==`-guarded any more. `configureWindow` is idempotent, and the
+        // window has to be re-asserted rather than configured once: SwiftUI
+        // rewrites the window's content min/max size from the root view on its
+        // own schedule, and a single early pass can be undone by a later one.
+        // The `window` *assignment* is still guarded, because reassigning the
+        // same value would invalidate the view and spin.
+        .background(WindowGrabber { resolved in
+            if window !== resolved { window = resolved }
+            if let resolved { configureWindow(resolved) }
+        })
+        .navigationTitle("Settings")
+    }
+
+    /// The Save row, outside the form's scroll view so it is always on screen.
+    private var footer: some View {
+        HStack(spacing: 12) {
+            if accounts.account.security == .startTLS {
+                Label("STARTTLS (587) isn't implemented yet — use SSL/TLS on 465 for now.",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(Color(red: 0.75, green: 0.05, blue: 0.05))
+            }
+            Spacer()
+            // Save writes to the Keychain and closes the window — the close is
+            // the confirmation, which is why there's no "Saved" checkmark.
+            Button("Save") {
+                accounts.save()
+                window?.close()
+            }
+            .keyboardShortcut(.defaultAction)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+    }
+
+    private var settingsForm: some View {
         Form {
             Section("Identity") {
                 TextField("Your name", text: $accounts.account.fromName)
@@ -285,45 +386,11 @@ struct SettingsView: View {
                         + "You can also right-click a word while writing a message to add it.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Section {
-                // Save writes to the Keychain and closes the window — the close
-                // is the confirmation now, so the old "Saved" checkmark is gone.
-                Button("Save") {
-                    accounts.save()
-                    window?.close()
-                }
-                .keyboardShortcut(.defaultAction)
-                if accounts.account.security == .startTLS {
-                    Label("STARTTLS (587) isn't implemented yet — use SSL/TLS on 465 for now.",
-                          systemImage: "exclamationmark.triangle.fill")
-                        .font(.callout.weight(.semibold))
-                        .foregroundStyle(Color(red: 0.75, green: 0.05, blue: 0.05))
-                }
-            }
         }
         .formStyle(.grouped)
-        // Fixed width, free height. The width is a deliberate constant — the
-        // fields and captions are laid out for it — while the height is
-        // whatever the user drags it to, remembered between launches. The
-        // grouped form scrolls when the window is shorter than its content, so
-        // there is no height at which anything becomes unreachable.
-        //
-        // 880 was the old fixed height, kept as the *ideal* so a first run with
-        // no remembered frame opens showing everything, as it used to.
-        // One call: `width:` and `minHeight:` are different overloads and cannot
-        // be mixed, so the fixed width is expressed as min == ideal == max.
-        .frame(minWidth: Self.windowWidth, idealWidth: Self.windowWidth,
-               maxWidth: Self.windowWidth,
-               minHeight: 360, idealHeight: 880, maxHeight: .infinity)
-        // The `!==` guard matters: `updateNSView` re-resolves on every
-        // invalidation, and assigning the same window back would re-invalidate
-        // the view and spin once per runloop turn while Settings sits open.
-        .background(WindowGrabber { resolved in
-            guard window !== resolved else { return }
-            window = resolved
-            if let resolved { configureWindow(resolved) }
-        })
-        .navigationTitle("Settings")
+        // Greedy, so the footer below is pinned to the bottom of the window
+        // rather than floating under the last section on a tall window.
+        .frame(maxHeight: .infinity)
     }
 
     /// The identity set as displayable rows: exact addresses, then domain rules
