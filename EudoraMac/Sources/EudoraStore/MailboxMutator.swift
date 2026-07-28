@@ -24,8 +24,45 @@ public enum MailboxMutator {
     /// this uses it for one it could not.
     public static let statusSendError = 5
 
-    /// Set the cached status byte for one message (e.g. read/unread). TOC-only;
-    /// the `.mbx` is untouched, so no backup is needed.
+    /// Set the cached status byte for one message, addressed by its **byte
+    /// offset** in the `.mbx`. TOC-only, and — unlike the index-based form
+    /// below — it never reads the mailbox at all.
+    ///
+    /// That matters because this is on the click path. Marking a message read
+    /// by index costs a full read of the `.mbx` plus a separator scan of every
+    /// byte of it, purely to turn an index into an offset. On a 612 MB Trash
+    /// that is not a cost you can pay each time a row is clicked; it was
+    /// tolerable only while Mark as Read was a deliberate menu command.
+    ///
+    /// Addressing by offset is also *sounder*, not merely faster. An index is a
+    /// position among `.mbx` records, so translating it needs those records; an
+    /// offset names the record directly. And the consistency the index form
+    /// establishes by comparing the whole TOC against the whole mailbox is,
+    /// for a single message, already implied here: the caller got this offset
+    /// from a listing built off the real records, and a TOC entry claiming the
+    /// same offset therefore describes the same message. A TOC with no entry at
+    /// that offset is left alone, exactly as before.
+    public static func setStatus(base: URL, offset: Int, status: Int) throws {
+        let tocURL = base.appendingPathExtension("toc")
+        guard var entries = Toc.read(tocURL),
+              let i = entries.firstIndex(where: { $0.offset == offset }) else { return }
+        let e = entries[i]
+        entries[i] = TocEntry(offset: e.offset, length: e.length, status: status,
+                              priority: e.priority, date: e.date, to: e.to, subject: e.subject)
+        // Atomic, unlike the index form this was split out of. A `.toc` write is
+        // a whole-file rebuild — ~4.9 MB for Trash's 22,515 entries — and this
+        // one now runs whenever a message is clicked rather than when a menu
+        // command is chosen. At that frequency, "truncate and rewrite in place"
+        // is a real window in which a crash leaves a half-written index.
+        do { try MailboxIO.atomicWrite(TocWriter.data(entries: entries), to: tocURL) }
+        catch { throw MutateError.ioError(error.localizedDescription) }
+    }
+
+    /// Set the cached status byte for one message by its 1-based index. TOC-only;
+    /// the `.mbx` is read but never written, so no backup is needed.
+    ///
+    /// Prefer the offset form above wherever the caller has an offset — this one
+    /// reads and scans the entire mailbox to find one.
     public static func setStatus(base: URL, index: Int, status: Int) throws {
         let mbxURL = base.appendingPathExtension("mbx")
         let tocURL = base.appendingPathExtension("toc")

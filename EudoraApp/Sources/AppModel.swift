@@ -50,6 +50,13 @@ struct MailboxItem: Identifiable, Hashable {
 /// message carries an attachment.
 struct MessageRow: Identifiable, Hashable, Sendable {
     let id: Int             // 1-based message index within the mailbox
+    /// Byte offset of this message's record in the `.mbx`.
+    ///
+    /// Carried so a status write can address the message directly. Going by
+    /// index instead costs a full read and separator scan of the mailbox to
+    /// translate one number — 612 MB on Trash — which is fine for a menu
+    /// command and not fine on the click path.
+    let offset: Int
     let statusGlyph: String
     /// Raw Eudora status byte, -1 when unknown. See `isUnsent`.
     let status: Int
@@ -494,8 +501,46 @@ final class AppModel: ObservableObject {
                         // dismisses the new-mail badge. Programmatic selection goes
                         // through `applyMessageSelection` directly, not this
                         // binding, so a delivery re-list can't trip this.
-                        self?.clearInboxNewMailBadge()
-                        self?.applyMessageSelection(new)
+                        guard let self else { return }
+                        self.clearInboxNewMailBadge()
+                        // Whether this is a real change, decided *before*
+                        // applying it. SwiftUI writes a selection binding back
+                        // when a control reconciles against changed contents —
+                        // every enrichment batch, every delivery refresh, even
+                        // the mark-read below — and an echo of the same set must
+                        // not restart the clock, or a message could be marked
+                        // read purely because rows were republished under it.
+                        let changed = new != self.selectedMessageIDs
+                        self.applyMessageSelection(new)
+                        // Clicking a message is what clears its unread flag.
+                        //
+                        // Eudora 7 could equate unread with never-opened,
+                        // because reading a message meant opening it. Eudora 8
+                        // shows the message in the preview without opening
+                        // anything, so that equation no longer holds and the
+                        // click — which you make anyway, to act on a message —
+                        // is what stands in for it.
+                        //
+                        // Hooked to this binding rather than to `loadMessage`
+                        // deliberately: only *user* selection comes through
+                        // here. Restoring the last selection at launch and
+                        // opening a search hit both go through
+                        // `applyMessageSelection` directly, so neither silently
+                        // marks a message you had left unread. The `changed`
+                        // filter above makes that structurally true rather than
+                        // merely true in practice: an echo is by definition
+                        // equal, so it can never get this far.
+                        //
+                        // `removalVeil` too: `applyMessageSelection` refuses a
+                        // non-empty selection while the veil is up, so `changed`
+                        // can be true with nothing applied, and mark-read would
+                        // run against the *previous* selection. Unreachable
+                        // today only because `afterRemoval` happens to clear the
+                        // selection before raising the veil — an ordering, not a
+                        // guarantee.
+                        if changed, self.removalVeil == nil {
+                            self.scheduleMarkSelectedRead()
+                        }
                     }
                 })
     }
@@ -1501,6 +1546,11 @@ final class AppModel: ObservableObject {
         listingTask?.cancel();  listingTask = nil
         enrichTask?.cancel();   enrichTask = nil
         previewTask?.cancel();  previewTask = nil
+        // A pending mark-read belongs to the mailbox being left. Its own
+        // re-check would refuse to fire anyway, but leaving a task running
+        // against a torn-down listing is the pattern this method exists to
+        // prevent.
+        markReadTask?.cancel(); markReadTask = nil
         listingGeneration &+= 1
         isListing = false
         isEnriching = false
@@ -1588,6 +1638,7 @@ final class AppModel: ObservableObject {
         let rows = listing.rows.map { r -> MessageRow in
             if r.statusGlyph == MailStore.unreadGlyph { unread += 1 }
             return MessageRow(id: r.index,
+                              offset: r.offset,
                               statusGlyph: r.statusGlyph,
                               status: r.status,
                               priority: Int(r.priority) ?? 0,
@@ -2989,6 +3040,58 @@ final class AppModel: ObservableObject {
     /// on the whole selection.
     var canActOnSelection: Bool { currentSelectionSet() != nil }
 
+    /// Clear the unread flag on the message the user has just selected.
+    ///
+    /// Waits out `selectionSettleDelay` — the same 150 ms the preview waits —
+    /// and is cancelled by the next selection, so running down the list with the
+    /// arrow keys marks only the message you come to rest on, not every one you
+    /// pass. Without that, holding an arrow key through fifty unread messages
+    /// would be fifty status writes and fifty tree reloads.
+    ///
+    /// Only for a single selection: shift-clicking twenty rows selects them but
+    /// displays none of them, and none of them has been read.
+    private func scheduleMarkSelectedRead() {
+        markReadTask?.cancel()
+        markReadTask = nil
+        // Nothing to do unless exactly one message is selected *and* it is
+        // actually unread — checked here so the common case (clicking around
+        // among messages already read) costs nothing at all. `selectedMessageID`
+        // is nil for a multi-selection, which is the single-selection test.
+        //
+        // A draft can't pass this: status 9 and 5 both render as a blank glyph,
+        // so `isUnread` is false for them and `markSelected`'s draft banner is
+        // never reached from here. Clicking a draft stays silent, as it should.
+        guard let index = selectedMessageID,
+              let pos = rowPositionByID[index], pos < rows.count,
+              rows[pos].isUnread else { return }
+        let mailbox = selectedMailboxID
+        markReadTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: selectionSettleDelay)
+            guard !Task.isCancelled, let self else { return }
+            // Re-checked after the wait: the selection, the rows and the mailbox
+            // can all have moved on while it slept. The mailbox especially —
+            // `openHit` assigns `selectedMailboxID` directly and its cancelling
+            // `loadListing` arrives a runloop hop later, so for that moment an
+            // index from the old mailbox is paired with the new one's base URL.
+            // Writing then would mark an unrelated message read, in the wrong
+            // file, silently.
+            //
+            // `listedMailboxID` is set when a load *starts*, not when its rows
+            // arrive, so it doesn't prove the rows in hand belong to `mailbox`.
+            // What does is the row re-check below: `loadListing` empties `rows`
+            // in the same turn it reassigns `listedMailboxID`, so a switch
+            // leaves nothing at `pos` to find.
+            guard self.selectedMailboxID == mailbox,
+                  self.listedMailboxID == mailbox,
+                  self.selectedMessageID == index,
+                  let pos = self.rowPositionByID[index], pos < self.rows.count,
+                  self.rows[pos].isUnread else { return }
+            self.markSelected(read: true)
+        }
+    }
+
+    private var markReadTask: Task<Void, Never>?
+
     func markSelected(read: Bool) {
         guard let sel = currentSelection() else { return }
         // Never on a draft. Status is a single byte, so writing read/unread over
@@ -3001,9 +3104,19 @@ final class AppModel: ObservableObject {
             return
         }
         do {
-            try MailboxMutator.setStatus(base: sel.item.base, index: sel.index,
-                                         status: read ? MailboxMutator.statusRead
-                                                      : MailboxMutator.statusUnread)
+            // Addressed by offset when the row is in hand, which is every case
+            // that matters: the offset form never opens the `.mbx`, while the
+            // index form reads and scans all of it to work the offset out. The
+            // index fallback is only for a status write arriving before the
+            // listing has landed.
+            let newStatus = read ? MailboxMutator.statusRead : MailboxMutator.statusUnread
+            if let pos = rowPositionByID[sel.index], pos < rows.count {
+                try MailboxMutator.setStatus(base: sel.item.base,
+                                             offset: rows[pos].offset, status: newStatus)
+            } else {
+                try MailboxMutator.setStatus(base: sel.item.base, index: sel.index,
+                                             status: newStatus)
+            }
             // Patch the one row rather than re-listing. A rebuild would discard
             // every enriched Who and attachment glyph and restart the whole
             // background parse — on Trash, minutes of re-work to change one
@@ -3017,9 +3130,9 @@ final class AppModel: ObservableObject {
             if let pos = rowPositionByID[sel.index], pos < rows.count {
                 let r = rows[pos]
                 rows[pos] = MessageRow(id: r.id,
+                                       offset: r.offset,
                                        statusGlyph: read ? " " : MailStore.unreadGlyph,
-                                       status: read ? MailboxMutator.statusRead
-                                                    : MailboxMutator.statusUnread,
+                                       status: newStatus,
                                        priority: r.priority,
                                        label: r.label,
                                        size: r.size,

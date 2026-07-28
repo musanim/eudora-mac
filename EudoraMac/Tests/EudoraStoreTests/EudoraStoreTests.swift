@@ -451,6 +451,75 @@ final class EudoraStoreTests: XCTestCase {
         XCTAssertEqual(rows[1].statusGlyph, " ")   // untouched
     }
 
+    /// The offset-addressed form, which is what the click path uses — clicking a
+    /// message clears its unread flag, and the index form would read and scan
+    /// the whole `.mbx` to translate the index (612 MB, on Trash).
+    func testSetStatusByOffsetUpdatesOneEntry() throws {
+        let (data, recs) = buildMbox([
+            message(from: "a@x.com", subject: "m", ctype: "text/plain; charset=us-ascii", body: "x"),
+            message(from: "b@x.com", subject: "n", ctype: "text/plain; charset=us-ascii", body: "y"),
+        ])
+        try data.write(to: mbx("O1"))
+        try writeToc(url: toc("O1"), entries: [
+            tocEntry(recs[0], status: 0, priority: 4, subject: "m"),   // unread
+            tocEntry(recs[1], status: 0, priority: 4, subject: "n"),   // unread
+        ])
+        let base = root.appendingPathComponent("O1")
+        try MailboxMutator.setStatus(base: base, offset: recs[1].offset,
+                                     status: MailboxMutator.statusRead)
+        let rows = MailStore(root: root).list(at: base, name: "O1")!.rows
+        XCTAssertEqual(rows[0].statusGlyph, "•", "the other message must be untouched")
+        XCTAssertEqual(rows[1].statusGlyph, " ")
+    }
+
+    /// The offset form and the index form must name the same message, or
+    /// clicking a row would mark a different one read than the menu command
+    /// does. Checked against the *second* record, so an off-by-one shows up.
+    func testSetStatusByOffsetAgreesWithSetStatusByIndex() throws {
+        let messages = (1...3).map {
+            message(from: "a@x.com", subject: "s\($0)",
+                    ctype: "text/plain; charset=us-ascii", body: "b\($0)")
+        }
+        let (data, recs) = buildMbox(messages)
+        for name in ["X1", "X2"] {
+            try data.write(to: mbx(name))
+            // `$0.offset` here is `enumerated`'s 0-based position, NOT the
+            // record's byte offset — which is `$0.element.offset`. The two
+            // meanings collide in one line; the subject just needs 1, 2, 3.
+            try writeToc(url: toc(name), entries: recs.enumerated().map {
+                tocEntry($0.element, status: 0, priority: 4, subject: "s\($0.offset + 1)")
+            })
+        }
+        try MailboxMutator.setStatus(base: root.appendingPathComponent("X1"),
+                                     index: 2, status: MailboxMutator.statusRead)
+        try MailboxMutator.setStatus(base: root.appendingPathComponent("X2"),
+                                     offset: recs[1].offset, status: MailboxMutator.statusRead)
+
+        let store = MailStore(root: root)
+        let byIndex = store.list(at: root.appendingPathComponent("X1"), name: "X1")!.rows
+        let byOffset = store.list(at: root.appendingPathComponent("X2"), name: "X2")!.rows
+        XCTAssertEqual(byIndex.map(\.statusGlyph), byOffset.map(\.statusGlyph))
+        XCTAssertEqual(byOffset.map(\.statusGlyph), ["•", " ", "•"])
+    }
+
+    /// An offset naming no TOC entry leaves the file alone rather than throwing
+    /// or corrupting it. This is the mailbox-changed-underneath case, and doing
+    /// nothing is the right answer — the status is a cache.
+    func testSetStatusByOffsetIgnoresAnUnknownOffset() throws {
+        let (data, recs) = buildMbox([
+            message(from: "a@x.com", subject: "m", ctype: "text/plain; charset=us-ascii", body: "x"),
+        ])
+        try data.write(to: mbx("O2"))
+        try writeToc(url: toc("O2"), entries: [tocEntry(recs[0], status: 0, priority: 4, subject: "m")])
+        let base = root.appendingPathComponent("O2")
+        let before = try Data(contentsOf: toc("O2"))
+
+        try MailboxMutator.setStatus(base: base, offset: 999_999,
+                                     status: MailboxMutator.statusRead)
+        XCTAssertEqual(try Data(contentsOf: toc("O2")), before, "the .toc must be untouched")
+        XCTAssertEqual(MailStore(root: root).list(at: base, name: "O2")!.rows[0].statusGlyph, "•")
+    }
+
     func testRemoveKeepsTocForGhostyMailbox() throws {
         // mbx has 3 messages; the .toc lists only #1 and #3 (a ghost at #2).
         // Deleting the first listed message must keep the .toc (so the survivor
