@@ -364,6 +364,32 @@ from the plan above:
   consulted only when the new one is *absent*; a present-but-unreadable list
   shows a warning in Settings and overwrites nothing.
 
+### Gmail hands back your own sent mail (diagnosed, not a bug)
+
+Seen during testing and worth recording, because it looks exactly like a
+delivery bug: a message sent from Eudora 8 arrived correctly at its recipient,
+and then reappeared in Eudora 8's **In** box a minute or two later.
+
+The In copy and the Out copy had the *same* `Message-ID` — the same message, not
+a copy — and the In copy carried `Received: … by smtp.gmail.com with **ESMTPSA**`
+and `Return-Path: <…@gmail.com>`. `ESMTPSA` is authenticated submission: the
+message had been sent *through Gmail's SMTP*. Gmail files everything submitted
+through its SMTP into Sent Mail, and Gmail's POP serves All Mail — Sent
+included. So the account had handed the message back to itself.
+
+Cause was configuration, not code: outgoing mail was pointed at
+`smtp.gmail.com` during testing. With outgoing set to musanim, as this design
+assumes, Gmail never sees the message and there is nothing to hand back.
+
+The general form survives that fix, though, and will matter if it ever becomes
+annoying: **anything sent from Gmail itself** — the web interface, the phone —
+lands in Gmail's Sent Mail and will be collected into In on the next check.
+Options considered and deferred: leave it (the Who column reads correctly, since
+the Gmail address is in the "me" set, so only the *filing* is wrong); skip
+messages whose `From` is one of the user's own identities; or deliver them to Out
+instead. Nothing built — Stephen is switching sending to musanim, and the
+frequency isn't yet known.
+
 Still open, deliberately not built:
 
 - **No defence against duplicate delivery beyond the UID set.** Editing a
