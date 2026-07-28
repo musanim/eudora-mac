@@ -8,36 +8,33 @@ public struct POP3Account: Codable, Equatable, Sendable {
     public var username: String
     /// When true, downloaded messages are removed from the server — but only in
     /// a second pass, after they've been written to the local archive.
+    ///
+    /// Per account, deliberately. The two servers needn't agree: musanim is the
+    /// permanent archive, while Gmail keeps its own copy under its "when
+    /// messages are accessed with POP" setting.
     public var deleteAfterDownload: Bool
-    /// Whether the app checks for new mail on a timer (see
-    /// `AppModel.configureAutoCheck`).
-    public var autoCheckEnabled: Bool
-    /// The auto-check interval in minutes. At least 1; clamped on decode and in
-    /// the settings field.
-    public var autoCheckMinutes: Int
 
     public init(host: String = "", port: Int = 995, username: String = "",
-                deleteAfterDownload: Bool = false,
-                autoCheckEnabled: Bool = false, autoCheckMinutes: Int = 1) {
+                deleteAfterDownload: Bool = false) {
         self.host = host
         self.port = port
         self.username = username
         self.deleteAfterDownload = deleteAfterDownload
-        self.autoCheckEnabled = autoCheckEnabled
-        self.autoCheckMinutes = max(1, autoCheckMinutes)
     }
 
-    /// Decoded field-by-field with `decodeIfPresent` so a blob written by an
-    /// older build — which had no auto-check keys — still loads instead of
-    /// throwing and wiping the saved server/username back to defaults.
+    /// Decoded field-by-field with `decodeIfPresent` so a blob written by a
+    /// different build still loads instead of throwing and wiping a saved
+    /// server/username back to defaults. Unknown keys are ignored by `Codable`,
+    /// so a blob from the single-account build — which carried `autoCheckEnabled`
+    /// and `autoCheckMinutes` here before they became one app-wide setting —
+    /// decodes cleanly. `AccountStore` reads those two out of the old blob
+    /// separately when it migrates.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         host = try c.decodeIfPresent(String.self, forKey: .host) ?? ""
         port = try c.decodeIfPresent(Int.self, forKey: .port) ?? 995
         username = try c.decodeIfPresent(String.self, forKey: .username) ?? ""
         deleteAfterDownload = try c.decodeIfPresent(Bool.self, forKey: .deleteAfterDownload) ?? false
-        autoCheckEnabled = try c.decodeIfPresent(Bool.self, forKey: .autoCheckEnabled) ?? false
-        autoCheckMinutes = max(1, try c.decodeIfPresent(Int.self, forKey: .autoCheckMinutes) ?? 1)
     }
 
     public var keychainAccount: String { "pop:\(username)@\(host):\(port)" }

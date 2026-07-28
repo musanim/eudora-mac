@@ -194,12 +194,12 @@ struct ContentView: View {
         // Auto-check is a live preference: persist it the moment it changes (the
         // Save button isn't required for it), and reconfigure — which restarts
         // the timer and does an immediate check when it's on.
-        .onChange(of: accounts.pop.autoCheckEnabled) { _ in
-            accounts.persistIncomingSettings()
+        .onChange(of: accounts.autoCheckEnabled) { _ in
+            accounts.persistAutoCheck()
             model.configureAutoCheck()
         }
-        .onChange(of: accounts.pop.autoCheckMinutes) { _ in
-            accounts.persistIncomingSettings()
+        .onChange(of: accounts.autoCheckMinutes) { _ in
+            accounts.persistAutoCheck()
             model.configureAutoCheck()
         }
         // React to selection *after* the view-update pass, so the follow-on

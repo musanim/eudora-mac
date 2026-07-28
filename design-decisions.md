@@ -338,6 +338,48 @@ multi-account support, leave the first slot empty, configure **Gmail** in the
 second and run it alone for a while. musanim moves over at the real cut-over,
 and the Gmail forwarding is switched off then.
 
+Status: **[built — pending Stephen's build and real testing]**. What differed
+from the plan above:
+
+- **Auto-check is one app-wide setting, not per account.** The 15-minute floor
+  quoted earlier was third-party convention, not a Google rule; the documented
+  limits are 15 simultaneous connections and daily bandwidth, neither of which
+  one client polling sequentially approaches. So a single one-minute interval
+  serves both accounts and `autoCheckEnabled`/`autoCheckMinutes` moved off
+  `POP3Account` onto `AccountStore`. If a server ever does throttle, that is the
+  setting to make per-account.
+- **A half-configured account is reported, not silently skipped.** With one
+  working account and one half-typed, dropping the second in silence makes
+  Check Mail say "No new mail", which reads as "the new server doesn't work".
+  The notice now says how many accounts aren't set up.
+- **`save()` trims host and username, and carries the keys across when it
+  does.** `keychainAccount` — which also keys the downloaded-UID set — is built
+  from those two fields, so a pasted trailing space is a *different* account and
+  every message still on the server comes down again into In. Trimming alone
+  would have caused that once, on the first save of an already-untrimmed
+  account, so the password and the UID set are moved to the new key.
+- **A corrupt stored list no longer falls back to the legacy single account.**
+  That would have silently resurrected the pre-migration setup — losing any
+  account added since — with nothing to say it had happened. The legacy key is
+  consulted only when the new one is *absent*; a present-but-unreadable list
+  shows a warning in Settings and overwrites nothing.
+
+Still open, deliberately not built:
+
+- **No defence against duplicate delivery beyond the UID set.** Editing a
+  configured account's host or username still starts it with an empty set, and
+  Gmail can be reached under more than one hostname. The real fix is for
+  `Delivery.deliverIncoming` to skip a message whose `Message-ID` is already in
+  the target mailbox — worth doing before this points at the musanim archive.
+- **A failed delete pass is never retried.** If deletion throws after delivery
+  succeeded, those UIDs are already known, so the next check skips them and
+  `deleteAfterDownload` quietly stops applying to them. No loss and no
+  duplication; the setting just doesn't finish its job.
+- **`POP3Client.fetchNew` holds every message body in memory** before any is
+  delivered. Fine for a daily check, not for a first sync of a large account.
+- **Editing a saved account orphans its old Keychain entry** in every case
+  except the trimming one handled above.
+
 ---
 
 ## Through-line

@@ -3556,30 +3556,34 @@ final class AppModel: ObservableObject {
 
     // MARK: receiving (POP3)
 
-    /// Check mail: fetch new messages into the In box, then — only if the user
-    /// opted in — delete them from the server in a second pass, after they're
-    /// safely written locally.
+    /// Check mail: fetch new messages from **every** configured incoming account
+    /// into the one In box, then — per account, and only where the user opted in
+    /// — delete them from that server in a second pass, after they're safely
+    /// written locally.
+    ///
+    /// Accounts are collected one at a time, and each succeeds or fails on its
+    /// own: a server that is down, refusing the password, or simply slow must
+    /// not cost the other accounts their mail. That is the whole reason the body
+    /// below is a loop with the `do`/`catch` *inside* it rather than around it.
+    ///
     /// - Parameter automatic: true for a timer-driven check (see
     ///   `configureAutoCheck`). An automatic check stays quiet — no error banner,
     ///   and no "No new mail" toast every interval — surfacing only actual new
-    ///   mail (through the list and the sidebar badge); a manual check reports
-    ///   its outcome as before.
+    ///   mail (through the list and the sidebar glyph); a manual check reports
+    ///   its outcome either way.
     func receiveMail(accounts: AccountStore, automatic: Bool = false) async {
         guard let inbox = base(ofType: .inbox) else {
             if !automatic { showError("No In mailbox in this tree.") }
             return
         }
-        guard accounts.pop.isConfigured else {
+        let ready = accounts.readyIncoming
+        guard !ready.isEmpty else {
             if !automatic {
-                showError("Incoming mail not set up: server=\"\(accounts.pop.host)\", "
-                    + "user=\"\(accounts.pop.username)\", port=\(accounts.pop.port). "
-                    + "Fill these in Settings ▸ Incoming mail (POP3), then Save.")
-            }
-            return
-        }
-        guard !accounts.incomingPassword.isEmpty else {
-            if !automatic {
-                showError("Incoming password is empty — enter it in Settings ▸ Incoming mail (POP3), then Save.")
+                showError(accounts.hasPartiallyConfiguredIncoming
+                    ? "Incoming mail is only half set up — every account needs a server, "
+                      + "a username and a password. Finish it in Settings ▸ Incoming mail, then Save."
+                    : "No incoming mail accounts are set up. Add one in "
+                      + "Settings ▸ Incoming mail, then Save.")
             }
             return
         }
@@ -3588,72 +3592,148 @@ final class AppModel: ObservableObject {
         checkMailNotice = nil        // spinner only, until this fetch resolves
         defer { isChecking = false }
 
-        do {
-            let known = accounts.knownUIDs()
-            let fetched = try await POP3Client.fetchNew(account: accounts.pop,
-                                                        password: accounts.incomingPassword,
-                                                        knownUIDs: known)
-            var newKnown = known
-            var delivered: [String] = []
-            for msg in fetched {
-                try Delivery.deliverIncoming(messageData: msg.raw, to: inbox)
-                newKnown.insert(msg.uid)
-                delivered.append(msg.uid)
-                // Persist after each delivery so a mid-batch failure can't cause
-                // the already-stored messages to be re-downloaded as duplicates.
-                accounts.setKnownUIDs(newKnown)
-            }
+        var received = 0
+        /// One entry per account that failed, as "user@host: reason". Collected
+        /// rather than thrown so the accounts after it are still collected.
+        var failures: [String] = []
 
-            // Delete pass — only after every message is stored locally.
-            if accounts.pop.deleteAfterDownload, !delivered.isEmpty {
-                try await POP3Client.delete(account: accounts.pop,
-                                            password: accounts.incomingPassword,
-                                            uids: Set(delivered))
-            }
-
-            // Nothing arrived, so nothing changes: no tree walk, no re-list, no
-            // glyph. This guard *is* the fix for "the In box repaints on every
-            // check" — the reload and the re-list below used to run
-            // unconditionally, so a check that found nothing still blanked the
-            // list and drew it again. A quiet automatic check must be invisible.
-            if !fetched.isEmpty {
-                if let id = selectedMailboxID, itemsByID[id]?.type == .inbox {
-                    // In is on screen: fold the new mail into the list already
-                    // showing, without blanking it or moving it. (Reloads the
-                    // tree itself, once the rows are back.)
-                    refreshInPlaceAfterDelivery()
-                } else {
-                    // In isn't on screen. Nothing is arranged for the next time
-                    // it is selected — no forced sort, no scroll — because
-                    // arriving mail is not entitled to move a list the user
-                    // positioned. The tree walk is what lights In's unread
-                    // indicator.
-                    reloadTree()
+        for entry in ready {
+            let account = entry.account
+            do {
+                let known = accounts.knownUIDs(for: account)
+                let fetched = try await POP3Client.fetchNew(account: account,
+                                                            password: entry.password,
+                                                            knownUIDs: known)
+                var newKnown = known
+                var delivered: [String] = []
+                // On the way out of this scope by *any* route, including the
+                // throw from `deliverIncoming` below. Whatever was written to
+                // disk is recorded as downloaded, so a failure partway through a
+                // batch can't leave already-delivered messages looking new and
+                // deliver them a second time on the next check.
+                // Guarded on something actually having been delivered:
+                // `newKnown` can only differ from `known` if it was, and
+                // without the guard every idle account rewrote its whole UID
+                // array to UserDefaults on every tick of a one-minute timer.
+                defer {
+                    if !delivered.isEmpty { accounts.setKnownUIDs(newKnown, for: account) }
                 }
-                // Light the sidebar's new-mail glyph on In (dismissed when the
-                // user next engages with In — see `clearInboxNewMailBadge`).
-                // This is deliberately *not* the same signal as the bold
-                // unread name: bold means "In holds unread mail" and stays lit
-                // as long as that is true, while the glyph means "mail arrived
-                // since you last looked" and clears on engagement.
-                inboxHasNewMail = true
+                for msg in fetched {
+                    try Delivery.deliverIncoming(messageData: msg.raw, to: inbox)
+                    newKnown.insert(msg.uid)
+                    delivered.append(msg.uid)
+                    // Counted here, per message, not as `fetched.count` after
+                    // the loop: a throw partway through would skip that line and
+                    // leave `received` at zero while messages were already on
+                    // disk — so the In box wouldn't refresh and the sidebar
+                    // glyph wouldn't light for mail that had genuinely arrived.
+                    received += 1
+                    // Periodic checkpoint, for the one case the `defer` above
+                    // can't cover: the process dying outright. Every 25 rather
+                    // than every message because `setKnownUIDs` reads the whole
+                    // dictionary, rebuilds an array from the set and
+                    // re-serialises the plist — per message that is quadratic in
+                    // the batch size. Invisible for a dozen messages, not
+                    // invisible for the first sync of a long-untouched account,
+                    // which is what adding a new server is. Worst case after a
+                    // crash is 24 messages delivered twice.
+                    if delivered.count % 25 == 0 {
+                        accounts.setKnownUIDs(newKnown, for: account)
+                    }
+                }
+
+                // Delete pass — this account's setting, this account's server,
+                // and only after every message from it is stored locally.
+                if account.deleteAfterDownload, !delivered.isEmpty {
+                    try await POP3Client.delete(account: account,
+                                                password: entry.password,
+                                                uids: Set(delivered))
+                }
+            } catch {
+                let reason = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                failures.append("\(account.username)@\(account.host): \(reason)")
             }
-            // A silent automatic check says nothing when nothing arrived; it
-            // still confirms a real delivery. A manual check reports either way.
-            if !(automatic && fetched.isEmpty) {
-                showCheckMailNotice(fetched.isEmpty
-                            ? "No new mail"
-                            : "Received \(fetched.count) message\(fetched.count == 1 ? "" : "s")")
+        }
+
+        // Nothing arrived, so nothing changes: no tree walk, no re-list, no
+        // glyph. This guard *is* the fix for "the In box repaints on every
+        // check" — the reload and the re-list below used to run unconditionally,
+        // so a check that found nothing still blanked the list and drew it
+        // again. A quiet automatic check must be invisible.
+        if received > 0 {
+            if let id = selectedMailboxID, itemsByID[id]?.type == .inbox {
+                // In is on screen: fold the new mail into the list already
+                // showing, without blanking it or moving it. (Reloads the tree
+                // itself, once the rows are back.)
+                refreshInPlaceAfterDelivery()
+            } else {
+                // In isn't on screen. Nothing is arranged for the next time it
+                // is selected — no forced sort, no scroll — because arriving
+                // mail is not entitled to move a list the user positioned. The
+                // tree walk is what lights In's unread indicator.
+                reloadTree()
             }
-        } catch {
-            // A manual check surfaces the failure — the short line in the toolbar
-            // indicator, plus the full reason in the banner until dismissed, since
-            // it's usually actionable. An automatic check swallows it rather than
-            // interrupting the user every interval over a transient blip.
-            if !automatic {
-                showCheckMailNotice("Check mail failed")
-                showError("Check mail failed: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)")
-            }
+            // Light the sidebar's new-mail glyph on In (dismissed when the user
+            // next engages with In — see `clearInboxNewMailBadge`). This is
+            // deliberately *not* the same signal as the bold unread name: bold
+            // means "In holds unread mail" and stays lit as long as that is
+            // true, while the glyph means "mail arrived since you last looked"
+            // and clears on engagement.
+            inboxHasNewMail = true
+        }
+
+        report(received: received, failures: failures, accountCount: ready.count,
+               skipped: accounts.partiallyConfigured.count, automatic: automatic)
+    }
+
+    /// The outcome of one Check Mail, across however many accounts it covered.
+    ///
+    /// A manual check always says something. An automatic one speaks only when
+    /// mail actually arrived: a silent interval must stay silent, and a server
+    /// that is briefly unreachable is not worth interrupting anyone over — it
+    /// will be retried in a minute. That deliberately means a *persistently*
+    /// broken account can go unnoticed while auto-check is on, which is the
+    /// price of a quiet timer; a manual Check Mail is how you find out.
+    /// - Parameter skipped: incoming accounts begun but not finished. They are
+    ///   not failures — nothing was attempted — but they must be mentioned. The
+    ///   case that matters is one working account plus one half-typed: without
+    ///   this the new account is dropped in silence and the report says "No new
+    ///   mail", which reads as "that server doesn't work" when the truth is
+    ///   "you haven't finished setting it up".
+    private func report(received: Int, failures: [String], accountCount: Int,
+                        skipped: Int, automatic: Bool) {
+        if automatic && received == 0 { return }
+
+        let mail = received == 0
+            ? "No new mail"
+            : "Received \(received) message\(received == 1 ? "" : "s")"
+        let note = skipped == 0 ? ""
+            : " · \(skipped) account\(skipped == 1 ? "" : "s") not set up"
+
+        guard !failures.isEmpty else {
+            showCheckMailNotice(mail + note)
+            return
+        }
+        // "Check mail failed" only when nothing at all arrived. A partial
+        // failure — a delete pass that threw, or a delivery that broke partway
+        // through a batch — leaves real mail in the In box, and saying the check
+        // failed would contradict the messages the user can see and the glyph
+        // that just lit.
+        let summary = received == 0 && failures.count == accountCount
+            ? "Check mail failed"
+            : "\(mail) · \(failures.count) of \(accountCount) "
+              + "account\(accountCount == 1 ? "" : "s") failed"
+        showCheckMailNotice(summary + note)
+        if !automatic {
+            // Headed to match the notice. Opening "Check mail failed:" when the
+            // notice says "Received 3 messages · 1 of 2 accounts failed" is the
+            // same contradiction the summary above exists to avoid.
+            let heading = received == 0 && failures.count == accountCount
+                ? "Check mail failed:"
+                : "Check mail: \(failures.count) of \(accountCount) "
+                  + "account\(accountCount == 1 ? "" : "s") failed:"
+            showError(heading + "\n" + failures.joined(separator: "\n"))
         }
     }
 
@@ -3664,8 +3744,11 @@ final class AppModel: ObservableObject {
     /// (Re)start or stop the automatic Check Mail timer from the incoming-mail
     /// settings. Idempotent — safe to call at launch and on every settings
     /// change; it tears down any existing timer first. Off unless enabled, and
-    /// the interval is clamped to at least a minute (`POP3Account` clamps it too,
-    /// but this is the last guard against a zero-interval timer).
+    /// the interval is clamped to at least a minute (`AccountStore` clamps it on
+    /// write too, but this is the last guard against a zero-interval timer).
+    ///
+    /// One timer for the app, not one per account: `receiveMail` collects every
+    /// configured account on each tick. See `AccountStore.autoCheckEnabled`.
     ///
     /// Added to the run loop in `.common` mode so a check still fires while the
     /// user is scrolling or holding a menu open. The block hops to the main actor,
@@ -3675,7 +3758,7 @@ final class AppModel: ObservableObject {
     func configureAutoCheck() {
         autoCheckTimer?.invalidate()
         autoCheckTimer = nil
-        guard let accounts, accounts.pop.autoCheckEnabled else { return }
+        guard let accounts, accounts.autoCheckEnabled else { return }
         // Check once right now, then on the interval: turning it on, changing the
         // interval, and launching with it on should all fetch immediately and
         // then start the clock. Silent (`automatic`), and skipped if the account
@@ -3686,7 +3769,7 @@ final class AppModel: ObservableObject {
                 await self.receiveMail(accounts: accounts, automatic: true)
             }
         }
-        let interval = TimeInterval(max(1, accounts.pop.autoCheckMinutes)) * 60
+        let interval = TimeInterval(max(1, accounts.autoCheckMinutes)) * 60
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, let accounts = self.accounts,

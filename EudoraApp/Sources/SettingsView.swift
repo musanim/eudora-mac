@@ -48,8 +48,8 @@ struct SettingsView: View {
     /// The auto-check interval field, clamped to at least 1 minute on entry so
     /// the number field can never hold a zero or negative interval.
     private var autoCheckMinutes: Binding<Int> {
-        Binding(get: { accounts.pop.autoCheckMinutes },
-                set: { accounts.pop.autoCheckMinutes = max(1, $0) })
+        Binding(get: { accounts.autoCheckMinutes },
+                set: { accounts.autoCheckMinutes = max(1, $0) })
     }
 
     var body: some View {
@@ -70,24 +70,42 @@ struct SettingsView: View {
                 SecureField("Password", text: $accounts.password)
             }
             Section("Incoming mail (POP3)") {
-                TextField("Server", text: $accounts.pop.host)
-                TextField("Port", value: $accounts.pop.port, format: .number)
-                TextField("Username", text: $accounts.pop.username)
-                SecureField("Password", text: $accounts.incomingPassword)
-                Toggle("Delete mail from server after downloading",
-                       isOn: $accounts.pop.deleteAfterDownload)
-                if accounts.pop.deleteAfterDownload {
-                    Text("Messages are deleted only after they're written to your local archive.")
-                        .font(.caption).foregroundStyle(.secondary)
+                // Only when the stored list existed and wouldn't decode. A blank
+                // pane after a real loss looks exactly like a blank pane on a
+                // fresh install, and the difference matters: here there is
+                // something to recover, and nothing has been overwritten yet.
+                if accounts.incomingLoadFailed {
+                    Text("Your saved incoming accounts couldn't be read and are "
+                            + "shown blank. They haven't been overwritten — if you "
+                            + "have a backup, restore it before saving.")
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
+                // One block per server. Mail from all of them is delivered into
+                // the single In box — there is no per-account mailbox, by
+                // design (design-decisions.md §7).
+                ForEach($accounts.incoming) { $entry in
+                    IncomingAccountEditor(
+                        entry: $entry,
+                        canRemove: accounts.incoming.count > 1,
+                        onRemove: { remove(entry) })
+                }
+                Button {
+                    accounts.incoming.append(IncomingAccount())
+                } label: {
+                    Label("Add account", systemImage: "plus")
+                }
+                Divider()
+                // One interval for the app, not one per account: Check Mail
+                // collects them all on each tick.
                 HStack(spacing: 6) {
-                    Toggle("", isOn: $accounts.pop.autoCheckEnabled)
+                    Toggle("", isOn: $accounts.autoCheckEnabled)
                         .labelsHidden()
                     Text("Automatically check for new mail every")
                     TextField("", value: autoCheckMinutes, format: .number)
                         .frame(width: 56)
                         .multilineTextAlignment(.trailing)
-                        .disabled(!accounts.pop.autoCheckEnabled)
+                        .disabled(!accounts.autoCheckEnabled)
                     Text("minutes")
                 }
             }
@@ -252,6 +270,83 @@ struct SettingsView: View {
         model.addCorrection(trigger: newCorrectionTrigger, replacement: newCorrectionReplacement)
         newCorrectionTrigger = ""
         newCorrectionReplacement = ""
+    }
+
+    /// Remove an incoming account, and forget its password.
+    ///
+    /// The row goes first, then `forgetPassword` — which checks that no
+    /// remaining row still uses the same login before it touches the Keychain,
+    /// so removing one of two rows pointing at the same server can't disarm the
+    /// one being kept.
+    ///
+    /// The list never empties: the remove button is hidden at one row
+    /// (`canRemove`), because a Settings pane with nothing to type into is a
+    /// dead end. Clearing the last account is done by emptying its fields.
+    private func remove(_ entry: IncomingAccount) {
+        // Deferred to the next turn of the run loop. The button lives *inside*
+        // the row being removed, and the row owns text fields that may still be
+        // first responder — `TextField(value:format:)` for the port commits on
+        // focus loss. Shrinking the array that `ForEach($accounts.incoming)`
+        // indexes into, from within that row's own update pass, is the standard
+        // way to get an index-out-of-range crash out of SwiftUI. Letting the
+        // pass finish first costs nothing here.
+        DispatchQueue.main.async {
+            guard accounts.incoming.count > 1,
+                  let i = accounts.incoming.firstIndex(where: { $0.id == entry.id })
+            else { return }
+            let removed = accounts.incoming[i].account
+            accounts.incoming.remove(at: i)
+            accounts.forgetPassword(for: removed)
+            accounts.persistIncomingAccounts()
+        }
+    }
+}
+
+/// One incoming server's fields, extracted so the `ForEach` body is a single
+/// row bound to a single element.
+///
+/// This is not a rendering optimisation and shouldn't be mistaken for one:
+/// every keystroke writes through `$accounts.incoming`, which publishes, which
+/// re-evaluates the whole of `SettingsView.body` — font pickers included. That
+/// is the `AppModel`/store re-render caveat in CLAUDE.md, and it applies here.
+/// Settings is a small, user-paced pane, so it doesn't matter; if it ever does,
+/// the fix is to make this `Equatable` over plain values rather than to move
+/// code around.
+private struct IncomingAccountEditor: View {
+    @Binding var entry: IncomingAccount
+    let canRemove: Bool
+    let onRemove: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                // The server is the only thing that distinguishes one block from
+                // the next at a glance, so it is the heading. Empty until it has
+                // one, rather than showing a placeholder that looks like a value.
+                Text(entry.account.host.isEmpty ? "New account" : entry.account.host)
+                    .font(.headline)
+                    .foregroundStyle(entry.account.host.isEmpty ? .secondary : .primary)
+                Spacer()
+                if canRemove {
+                    Button(role: .destructive, action: onRemove) {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Remove this account")
+                }
+            }
+            TextField("Server", text: $entry.account.host)
+            TextField("Port", value: $entry.account.port, format: .number)
+            TextField("Username", text: $entry.account.username)
+            SecureField("Password", text: $entry.password)
+            Toggle("Delete mail from server after downloading",
+                   isOn: $entry.account.deleteAfterDownload)
+            if entry.account.deleteAfterDownload {
+                Text("Messages are deleted only after they're written to your local archive.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
     }
 }
 
