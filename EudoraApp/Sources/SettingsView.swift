@@ -182,6 +182,17 @@ struct SettingsView: View {
         .frame(minWidth: Self.windowWidth, idealWidth: Self.windowWidth,
                maxWidth: Self.windowWidth,
                minHeight: 360, idealHeight: 930, maxHeight: .infinity)
+        // Return moves to the next field, the way Tab does.
+        //
+        // Attached to the container rather than to each field: SwiftUI
+        // propagates a submit outward through the hierarchy, so one handler here
+        // serves every text field in the form, including the ones inside the
+        // per-account rows that don't exist until an account is added.
+        //
+        // The traversal is AppKit's own, so the order is exactly the order Tab
+        // already follows and the two can't disagree. It wraps at the end,
+        // again like Tab.
+        .onSubmit(advanceFocus)
         // Not `!==`-guarded any more. `configureWindow` is idempotent, and the
         // window has to be re-asserted rather than configured once: SwiftUI
         // rewrites the window's content min/max size from the root view on its
@@ -193,6 +204,37 @@ struct SettingsView: View {
             if let resolved { configureWindow(resolved) }
         })
         .navigationTitle("Settings")
+    }
+
+    /// Move focus one step along the key-view loop — Tab's own traversal.
+    ///
+    /// Neither half of this is incidental.
+    ///
+    /// **The starting view is captured now.** `selectNextKeyView(nil)` works
+    /// from `window.firstResponder`, and during a Return that is the shared
+    /// *field editor* — an `NSTextView` whose place in the loop is not the
+    /// field's — or, for an instant, the window itself, in which case AppKit
+    /// falls back to `initialFirstResponder` and focus would leap to the top of
+    /// the form rather than to the next field. The editor's delegate is the
+    /// control being edited, which is the view actually wanted.
+    ///
+    /// **The move is deferred a runloop turn.** AppKit isn't finished when the
+    /// submit action runs: after it returns, the Return movement ends editing
+    /// and then *re-establishes* it on the same field with its text selected.
+    /// Moving focus from inside that would simply be undone — the symptom being
+    /// a Return that appears to do nothing but highlight the text.
+    private func advanceFocus() {
+        guard let window else { return }
+        let editor = window.firstResponder as? NSTextView
+        let start = (editor?.isFieldEditor == true ? editor?.delegate as? NSView : nil)
+            ?? window.firstResponder as? NSView
+        DispatchQueue.main.async {
+            if let start, start.window === window {
+                window.selectKeyViewFollowingView(start)
+            } else {
+                window.selectNextKeyView(nil)
+            }
+        }
     }
 
     /// The Save row, outside the form's scroll view so it is always on screen.
@@ -208,10 +250,26 @@ struct SettingsView: View {
             // Save writes to the Keychain and closes the window — the close is
             // the confirmation, which is why there's no "Saved" checkmark.
             Button("Save") {
+                // Commit whatever is mid-edit first. `TextField(value:format:)`
+                // — the Port and interval fields — writes through only on Return
+                // or on losing focus, and neither ⌘S nor a click on this button
+                // moves the first responder. Without this, saving while the
+                // caret sits in Port stores the *old* port.
+                window?.makeFirstResponder(nil)
                 accounts.save()
                 window?.close()
             }
-            .keyboardShortcut(.defaultAction)
+            .help("Save your settings (⌘S)")
+            // Deliberately NOT `.keyboardShortcut(.defaultAction)`. That made
+            // Save the window's default button, so Return anywhere in the pane
+            // saved and closed it — in a form of forty-odd fields, where Return
+            // is a natural thing to press after typing one. Return now advances
+            // the focus instead (see `onSubmit` on the body). ⌘S still saves.
+            //
+            // Kept prominent so it still reads as the confirming action, even
+            // though it is no longer the Return target.
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut("s", modifiers: .command)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
@@ -329,6 +387,18 @@ struct SettingsView: View {
                     TextField("Add address or *@domain", text: $newIdentity)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit(addIdentity)
+                        // Stops the submit reaching the body's handler as well.
+                        // Return here means "add this one", and the field clears
+                        // ready for another — moving focus away too would be
+                        // wrong, and adding several in a row is the normal way
+                        // this field is used.
+                        //
+                        // Order matters and the failure is silent: the scope
+                        // must be OUTSIDE the `onSubmit`, so the handler sits
+                        // inside it. Reversed, `addIdentity` becomes an ancestor
+                        // action relative to the trigger and Return does nothing
+                        // at all — neither adds nor advances.
+                        .submitScope()
                     Button("Add", action: addIdentity)
                         .disabled(newIdentity.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
@@ -371,12 +441,18 @@ struct SettingsView: View {
                     }
                 }
                 HStack {
+                    // No `onSubmit` here on purpose: Return in "Word" should
+                    // advance to "Replacement" (the body's handler does that),
+                    // and only Return in "Replacement" adds the rule.
                     TextField("Word", text: $newCorrectionTrigger)
                         .textFieldStyle(.roundedBorder)
                     Image(systemName: "arrow.right").foregroundStyle(.secondary)
                     TextField("Replacement", text: $newCorrectionReplacement)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit(addCorrection)
+                        // As above: Return adds the rule and leaves both fields
+                        // ready for the next one, rather than also advancing.
+                        .submitScope()
                     Button("Add", action: addCorrection)
                         .disabled(newCorrectionTrigger.trimmingCharacters(in: .whitespaces).isEmpty
                                   || newCorrectionReplacement.trimmingCharacters(in: .whitespaces).isEmpty)
