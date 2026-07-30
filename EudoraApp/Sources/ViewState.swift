@@ -39,13 +39,30 @@ struct ViewState: Codable {
     /// message. The index is clamped to the row count on restore.
     var scrollTopRowByMailbox: [String: Int] = [:]
 
-    // A `scrollToBottom` sentinel used to live here: delivery would arrange for
-    // In to open scrolled to its newest mail, and force In's sort to
-    // date-ascending to make "newest" mean the bottom. Both were removed
-    // deliberately — arriving mail no longer moves the list or overrides a sort
-    // the user chose. It announces itself in the sidebar, and, when In is on
-    // screen, by appearing in the list without shifting it (see
-    // `AppModel.refreshInPlaceAfterDelivery`).
+    /// Per-mailbox: was the list left scrolled so its **last row** was visible?
+    ///
+    /// Recorded as its own fact rather than inferred from `scrollTopRowByMailbox`
+    /// because a top-row index cannot express it. "Top row 412" means the bottom
+    /// only for as long as the mailbox has 412-plus-a-screenful of rows; the
+    /// moment mail is delivered it means somewhere in the middle. Bottom-ness is
+    /// the thing the user actually chose, so it is the thing to store.
+    ///
+    /// Absent and `false` are the same state; the recorder removes the key rather
+    /// than storing `false`, for the same reason `sortByMailbox` does.
+    ///
+    /// **A `scrollToBottom` sentinel used to live here and was deliberately
+    /// removed (fa2bc4a). This is not that, and the difference is the point.**
+    /// The old one was set *by delivery*: mail arriving would arrange for In to
+    /// open at the bottom and would force In's sort to date-ascending to make
+    /// "bottom" mean "newest" — overriding a sort the user had chosen, on the
+    /// strength of mail having turned up. What was wrong with it was the policy,
+    /// not the mechanism. This flag is written only by the scroll recorder, from
+    /// where the user actually left the list, and nothing here touches the sort:
+    /// if you leave a list at the bottom it stays at the bottom, and if you
+    /// leave it anywhere else nothing moves. Arriving mail still never moves a
+    /// list the user positioned — it just no longer un-positions one that was
+    /// positioned at the end.
+    var atBottomByMailbox: [String: Bool] = [:]
 
     /// Per-mailbox sort column and direction; absent means mailbox order.
     ///
@@ -69,6 +86,8 @@ struct ViewState: Codable {
             try c.decodeIfPresent([String: Int].self, forKey: .selectedMessageOffsetByMailbox) ?? [:]
         scrollTopRowByMailbox =
             try c.decodeIfPresent([String: Int].self, forKey: .scrollTopRowByMailbox) ?? [:]
+        atBottomByMailbox =
+            try c.decodeIfPresent([String: Bool].self, forKey: .atBottomByMailbox) ?? [:]
         sortByMailbox =
             try c.decodeIfPresent([String: MessageSort].self, forKey: .sortByMailbox) ?? [:]
     }

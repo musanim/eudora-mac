@@ -121,15 +121,21 @@ struct MenuBarView: View {
             // Deliberately unlabelled: File ▸ New Message shows the ⌘N hint, and
             // two items advertising the same key reads as a mistake.
             Button("New Message") { model.composeNew() }
-            Button("Reply") { model.reply(all: false) }
-                .keyboardShortcut("r", modifiers: .command)
-                .disabled(!model.canActOnMessage)
-            Button("Reply to All") { model.reply(all: true) }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
-                .disabled(!model.canActOnMessage)
-            // No ⌘L hint — the real command in `EudoraApp` has no shortcut.
-            Button("Forward") { model.forward() }
-                .disabled(!model.canActOnMessage)
+            // Grouped to stay under `ViewBuilder`'s ten-child limit, which this
+            // menu reached when Blah Blah Blah was added — the same reason
+            // `eudoraCommands` groups its own Message items. The grouping has no
+            // effect on how the menu looks.
+            Group {
+                Button("Reply") { model.reply(all: false) }
+                    .keyboardShortcut("r", modifiers: .command)
+                    .disabled(!model.canActOnMessage)
+                Button("Reply to All") { model.reply(all: true) }
+                    .keyboardShortcut("r", modifiers: [.command, .shift])
+                    .disabled(!model.canActOnMessage)
+                // No ⌘L hint — the real command in `EudoraApp` has no shortcut.
+                Button("Forward") { model.forward() }
+                    .disabled(!model.canActOnMessage)
+            }
             Divider()
             Button("Mark as Read") { model.markSelected(read: true) }
                 .keyboardShortcut("u", modifiers: [.command, .shift])
@@ -137,6 +143,11 @@ struct MenuBarView: View {
             Button("Mark as Unread") { model.markSelected(read: false) }
                 .keyboardShortcut("u", modifiers: .command)
                 .disabled(!model.canActOnMessage)
+            Divider()
+            // Not `.disabled` on anything: a view mode, usable with no
+            // selection. Mirrors the real command in `EudoraApp`.
+            Toggle("Blah Blah Blah (All Headers)", isOn: $model.showAllHeaders)
+                .keyboardShortcut("b", modifiers: [.command, .shift])
             Divider()
             // `canActOnSelection`, not `canActOnMessage`: Delete (like
             // Transfer) acts on the whole multi-selection, where Reply/Forward

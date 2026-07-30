@@ -132,6 +132,12 @@ struct MessagePreview: Sendable {
     let from: String
     let to: String
     let date: String
+    /// The header block as it sits on disk, for "Blah Blah Blah". A `var` with a
+    /// default because it can't be filled in by `render`, which is handed a
+    /// parsed `MIMEPart` and never sees the bytes — `loadMessage` re-reads it by
+    /// offset and assigns it afterwards. Empty when that read failed, which the
+    /// view treats as "nothing to show" rather than an error.
+    var rawHeaders: String = ""
     let isHTML: Bool
     let content: String          // HTML string when isHTML, else plain text
     let images: [String: EmbeddedImage]  // eudora-image:<id> -> bytes (HTML only)
@@ -383,6 +389,20 @@ final class AppModel: ObservableObject {
         }
     }
     private static let showJunkKey = "showJunkMailbox"
+
+    /// Eudora 7's "Blah Blah Blah": show the message's headers as they arrived.
+    ///
+    /// A mode rather than a per-message state, which is what 7 did and what the
+    /// use for it wants — you turn it on because you are looking into something,
+    /// and you want it to stay on across the several messages you compare. It
+    /// costs nothing to leave on: the block is read with the message either way.
+    @Published var showAllHeaders: Bool = UserDefaults.standard.bool(forKey: AppModel.allHeadersKey) {
+        didSet {
+            guard showAllHeaders != oldValue else { return }
+            UserDefaults.standard.set(showAllHeaders, forKey: Self.allHeadersKey)
+        }
+    }
+    private static let allHeadersKey = "showAllHeaders"
 
     /// The tree as shown to the user: the full `tree`, minus the Junk mailbox when
     /// it's hidden. The one source every mailbox picker should draw from.
@@ -1001,15 +1021,50 @@ final class AppModel: ObservableObject {
     /// bridge's `updateNSView` is invoked.
     @Published var pendingScrollTopRow: Int?
 
+    /// Whether the current mailbox's list was last left scrolled to its end.
+    ///
+    /// The remembered fact, not a live measurement — only the AppKit bridge can
+    /// see where the list actually is. Used where bottom-ness has to be decided
+    /// without the geometry to hand: the delivery refresh, and the restore
+    /// write-back when the table has gone away.
+    var selectedMailboxWasAtBottom: Bool {
+        selectedMailboxID.map { viewState.atBottomByMailbox[$0] == true } ?? false
+    }
+
     /// Records the message list's scroll position for the current mailbox.
     ///
     /// Scrolling fires continuously, so the write to UserDefaults is coalesced —
     /// the in-memory state updates immediately, the save lands once the scroll
     /// has been still for a moment.
-    func rememberScroll(topRow: Int) {
-        guard let mailbox = selectedMailboxID, topRow >= 0 else { return }
-        guard viewState.scrollTopRowByMailbox[mailbox] != topRow else { return }
+    ///
+    /// - Parameter atBottom: whether the list is scrolled to its end. Stored
+    ///   separately from `topRow` because a row index can't express it: "top row
+    ///   412" is the end only until the row count changes, and delivery changes
+    ///   it. See `ViewState.atBottomByMailbox`.
+    func rememberScroll(topRow: Int, atBottom: Bool) {
+        // `listedMailboxID` as well as `selectedMailboxID`: the sidebar writes
+        // the selection a turn before `loadListing` clears the rows, and in that
+        // window the table still shows the *previous* mailbox at the previous
+        // position. A bounds change landing there would file that reading under
+        // the newly-selected mailbox's key — harmless-ish for a top row, which
+        // the `-1` guard mostly catches once the rows clear, but bottom-ness is
+        // a sticky flag and would be inherited outright.
+        guard let mailbox = selectedMailboxID, listedMailboxID == mailbox,
+              topRow >= 0 else { return }
+        let wasAtBottom = viewState.atBottomByMailbox[mailbox] == true
+        // Both compared before returning early: the top row can be unchanged
+        // while bottom-ness flips — a window resized taller brings the last row
+        // into view without moving the clip origin at all.
+        guard viewState.scrollTopRowByMailbox[mailbox] != topRow
+                || wasAtBottom != atBottom else { return }
         viewState.scrollTopRowByMailbox[mailbox] = topRow
+        // Removed rather than stored false, so the blob doesn't accumulate an
+        // entry for every mailbox ever scrolled.
+        if atBottom {
+            viewState.atBottomByMailbox[mailbox] = true
+        } else {
+            viewState.atBottomByMailbox.removeValue(forKey: mailbox)
+        }
 
         // Coalesce with a generation token rather than a DispatchWorkItem: a
         // work item's block is escaping and doesn't inherit this method's main
@@ -1308,8 +1363,26 @@ final class AppModel: ObservableObject {
 
             // Hand the remembered scroll position to the AppKit bridge, clamped
             // to what this mailbox now holds.
-            if let mailbox = self.selectedMailboxID,
-               let top = self.viewState.scrollTopRowByMailbox[mailbox], !self.rows.isEmpty {
+            //
+            // Bottom-ness first, and it wins: it is the more specific fact. A
+            // mailbox left at the end has a remembered top row too, but that
+            // number describes the end only for the row count it was recorded
+            // at — which is precisely what delivery changes while the mailbox is
+            // away. Honouring the index instead would put a list that was at the
+            // bottom back into the middle, one screenful short of the new mail,
+            // which is the symptom this whole change exists to remove.
+            //
+            // A *reveal* of the last row rather than a top-row pin, because
+            // pinning the last row to the top is not what "at the bottom" looks
+            // like: `originY` clamps it to the maximum legal origin, so it
+            // happens to land correctly today, but only as a side effect of the
+            // clamp. `pendingRevealRow` says what is meant.
+            if let mailbox = self.selectedMailboxID, !self.rows.isEmpty,
+               self.viewState.atBottomByMailbox[mailbox] == true {
+                self.pendingScrollTopRow = nil
+                self.pendingRevealRow = self.rows.count - 1
+            } else if let mailbox = self.selectedMailboxID,
+                      let top = self.viewState.scrollTopRowByMailbox[mailbox], !self.rows.isEmpty {
                 self.pendingScrollTopRow = min(top, self.rows.count - 1)
             } else {
                 self.pendingScrollTopRow = nil
@@ -1368,6 +1441,28 @@ final class AppModel: ObservableObject {
             ?? 0
         let anchorID: Int? = rows.indices.contains(top) ? rows[top].id : nil
 
+        // …unless the list was sitting at the end, in which case the end is the
+        // anchor. Holding the *top* row still is what "nothing moved" means for
+        // a list positioned in the middle; for one deliberately parked at the
+        // bottom it means the opposite, because the new mail lands below the
+        // viewport and holding the top row is precisely what keeps it out of
+        // sight. Two readings of "don't move", and which one is right is
+        // decided by where the user left the list.
+        //
+        // No test of the sort here. Under a descending sort new rows land above
+        // everything, so a list parked at the end is still parked at the same
+        // message and the reveal is a no-op; the top-row anchor case is
+        // unaffected. And a list short enough to fit the pane is never recorded
+        // as "at the end" at all — see `Scrolling.lastRowVisible`, where that
+        // exclusion is load-bearing rather than tidiness. So the rule states
+        // itself: if the end was in view, keep the end in view.
+        //
+        // Which does mean "the bottom" is whatever sorts last, not necessarily
+        // the newest. Under a Who sort, mail from Zoe follows and mail from
+        // Alice doesn't. That is the honest consequence of not testing the sort,
+        // and it is still what the user asked for by parking at the end.
+        let wasAtBottom = selectedMailboxWasAtBottom
+
         // Every listed row's enrichment, keyed by the index it will still have.
         // Delivery appends to the .mbx and the .toc, so nothing already listed
         // is renumbered — unlike a removal, which is why `afterRemoval` has to
@@ -1397,7 +1492,23 @@ final class AppModel: ObservableObject {
                 // This runs in the same main-actor turn as the `setRows` inside
                 // `rebuildRows`, so the new rows and their corrected offset reach
                 // the table together — the uncorrected position is never drawn.
-                if let anchorID, let pos = self.rowPositionByID[anchorID], !self.rows.isEmpty {
+                if wasAtBottom, !self.rows.isEmpty {
+                    self.pendingScrollTopRow = nil
+                    self.pendingRevealRow = self.rows.count - 1
+                    // Re-asserted now rather than waiting for the reveal's bounds
+                    // change to be observed and recorded. A second delivery
+                    // arriving inside that window would otherwise read a flag
+                    // that hasn't caught up and fall back to anchoring the top
+                    // row — dropping out of follow-the-bottom precisely when
+                    // mail is arriving fast enough to matter. Same reasoning as
+                    // `pendingScrollTopRow` taking precedence above.
+                    //
+                    // In memory only; no save is scheduled. This is a re-assert
+                    // of a value the user's own scrolling put on disk, not a new
+                    // fact, and the reveal's own bounds change routes through
+                    // `rememberScroll` a beat later and coalesces a save then.
+                    if let mailbox { self.viewState.atBottomByMailbox[mailbox] = true }
+                } else if let anchorID, let pos = self.rowPositionByID[anchorID], !self.rows.isEmpty {
                     self.pendingScrollTopRow = min(pos, self.rows.count - 1)
                 } else {
                     // No usable anchor: In was empty before this delivery, or
@@ -1765,7 +1876,25 @@ final class AppModel: ObservableObject {
                 // Costs two id arrays on a mailbox that may hold 22,515 rows;
                 // negligible beside the sort and the 22,515 dictionary inserts
                 // `setRows` does on the line above.
-                if self.rows.map(\.id) != before { self.keepSelectionVisible() }
+                //
+                // And when the list was parked at its end, the end wins over the
+                // selection. Both want `pendingRevealRow`, which holds one row,
+                // and whichever is written last takes it — today that is the
+                // selection, silently, by arriving second. Stated deliberately
+                // instead: a displaced selection is still findable and still
+                // selected, whereas losing the end of the list is the whole
+                // symptom this exists to remove. Without this, opening a
+                // date-sorted mailbox parked at its end scrolls back to the
+                // selection a second or two later, and the bounds observer then
+                // records that mid-list position — so one visit silently costs
+                // the mailbox its bottom-ness.
+                if self.rows.map(\.id) != before {
+                    if self.selectedMailboxWasAtBottom, !self.rows.isEmpty {
+                        self.pendingRevealRow = self.rows.count - 1
+                    } else {
+                        self.keepSelectionVisible()
+                    }
+                }
             }
         }
     }
@@ -1904,11 +2033,18 @@ final class AppModel: ObservableObject {
 
             let rendered = await Task.detached(priority: .userInitiated) { () -> RenderedMessage? in
                 guard let msg = store.message(at: base, index: index) else { return nil }
-                return RenderedMessage(
-                    preview: AppModel.render(msg.part,
-                                             sourceNote: note,
-                                             locator: AttachmentLocator(mailRoot: root)),
-                    offset: msg.record.offset)
+                var preview = AppModel.render(msg.part,
+                                              sourceNote: note,
+                                              locator: AttachmentLocator(mailRoot: root))
+                // Read here, on the same background hop, rather than lazily when
+                // the toggle is switched on: the read is bounded and cheap
+                // (offset-addressed, stops at the blank line), and doing it now
+                // keeps the toggle a pure view change. Fetching on demand would
+                // put a mailbox read on the main actor behind a menu item.
+                preview.rawHeaders = store.rawHeaderBlock(at: base,
+                                                          offset: msg.record.offset,
+                                                          length: msg.record.length) ?? ""
+                return RenderedMessage(preview: preview, offset: msg.record.offset)
             }.value
 
             guard !Task.isCancelled, let self else { return }
@@ -3373,6 +3509,10 @@ final class AppModel: ObservableObject {
         // id nothing can select again.
         viewState.sortByMailbox[id] = nil
         viewState.scrollTopRowByMailbox[id] = nil
+        // Worse than a leak if left: mailbox ids are path-derived, so a mailbox
+        // re-created under the same name would inherit the old one's stuck flag
+        // and open at its end for no reason anyone could trace.
+        viewState.atBottomByMailbox[id] = nil
         viewState.selectedMessageOffsetByMailbox[id] = nil
         if viewState.selectedMailbox == id { viewState.selectedMailbox = nil }
         if let root = rootURL?.path { ViewStateStore.save(viewState, forRoot: root) }
@@ -3706,6 +3846,12 @@ final class AppModel: ObservableObject {
         defer { isChecking = false }
 
         var received = 0
+        /// Messages fetched, recognised as already in the In box, and discarded.
+        /// Counted and reported rather than passed over in silence: the case
+        /// this guard exists for is a mis-sequenced cut-over — Gmail polled
+        /// directly while it is still forwarding into musanim — and a silent
+        /// guard would hide exactly the misconfiguration the user needs to see.
+        var duplicates = 0
         /// One entry per account that failed, as "user@host: reason". Collected
         /// rather than thrown so the accounts after it are still collected.
         var failures: [String] = []
@@ -3718,29 +3864,61 @@ final class AppModel: ObservableObject {
                                                             password: entry.password,
                                                             knownUIDs: known)
                 var newKnown = known
-                var delivered: [String] = []
+                /// UIDs this account has finished with — delivered *or*
+                /// recognised as duplicates. Both belong here: a duplicate that
+                /// went unrecorded would be re-fetched and re-discarded on every
+                /// check for as long as it sat on the server.
+                var handled: [String] = []
+                /// UIDs actually written to disk — the delete pass reads this,
+                /// not `handled`, so a message discarded as a duplicate keeps
+                /// its copy on the server.
+                ///
+                /// This is the one place the design could destroy mail rather
+                /// than merely inconvenience the user: a false-positive
+                /// duplicate that had also been deleted from the server would be
+                /// gone from everywhere, with nothing to say it happened. The
+                /// UID set already stops it being re-fetched, so leaving it
+                /// there costs nothing but a little server-side clutter — and it
+                /// keeps the guard non-destructive, which is what makes it safe
+                /// to have switched on during a cut-over.
+                var deliveredUIDs: [String] = []
+                // Built here, not hoisted out of the account loop, and only when
+                // something arrived. Per-account so the second account's batch is
+                // checked against what the first one just delivered; skipped
+                // entirely on an empty fetch so a quiet automatic check still
+                // touches no disk. The scan is cheap next to the delivery it
+                // guards — see `MessageIDIndex.init(scanning:)`.
+                var seen = fetched.isEmpty ? MessageIDIndex() : MessageIDIndex(scanning: inbox)
                 // On the way out of this scope by *any* route, including the
-                // throw from `deliverIncoming` below. Whatever was written to
+                // throw from `deliverIfNew` below. Whatever was written to
                 // disk is recorded as downloaded, so a failure partway through a
                 // batch can't leave already-delivered messages looking new and
                 // deliver them a second time on the next check.
-                // Guarded on something actually having been delivered:
+                // Guarded on something actually having been handled:
                 // `newKnown` can only differ from `known` if it was, and
                 // without the guard every idle account rewrote its whole UID
                 // array to UserDefaults on every tick of a one-minute timer.
                 defer {
-                    if !delivered.isEmpty { accounts.setKnownUIDs(newKnown, for: account) }
+                    if !handled.isEmpty { accounts.setKnownUIDs(newKnown, for: account) }
                 }
                 for msg in fetched {
-                    try Delivery.deliverIncoming(messageData: msg.raw, to: inbox)
-                    newKnown.insert(msg.uid)
-                    delivered.append(msg.uid)
                     // Counted here, per message, not as `fetched.count` after
                     // the loop: a throw partway through would skip that line and
                     // leave `received` at zero while messages were already on
                     // disk — so the In box wouldn't refresh and the sidebar
                     // glyph wouldn't light for mail that had genuinely arrived.
-                    received += 1
+                    // A duplicate counts towards `duplicates`, never `received`:
+                    // nothing was written, so there is nothing to refresh to.
+                    switch try Delivery.deliverIfNew(messageData: msg.raw, to: inbox,
+                                                     seen: &seen) {
+                    case .delivered:
+                        received += 1
+                        deliveredUIDs.append(msg.uid)
+                    case .duplicate:
+                        duplicates += 1
+                    }
+                    newKnown.insert(msg.uid)
+                    handled.append(msg.uid)
                     // Periodic checkpoint, for the one case the `defer` above
                     // can't cover: the process dying outright. Every 25 rather
                     // than every message because `setKnownUIDs` reads the whole
@@ -3750,17 +3928,20 @@ final class AppModel: ObservableObject {
                     // invisible for the first sync of a long-untouched account,
                     // which is what adding a new server is. Worst case after a
                     // crash is 24 messages delivered twice.
-                    if delivered.count % 25 == 0 {
+                    if handled.count % 25 == 0 {
                         accounts.setKnownUIDs(newKnown, for: account)
                     }
                 }
 
                 // Delete pass — this account's setting, this account's server,
                 // and only after every message from it is stored locally.
-                if account.deleteAfterDownload, !delivered.isEmpty {
+                // `deliveredUIDs`, not `handled`: a duplicate was never written
+                // here, so deleting it would leave no copy anywhere if the guard
+                // was wrong. See the declaration.
+                if account.deleteAfterDownload, !deliveredUIDs.isEmpty {
                     try await POP3Client.delete(account: account,
                                                 password: entry.password,
-                                                uids: Set(delivered))
+                                                uids: Set(deliveredUIDs))
                 }
             } catch {
                 let reason = (error as? LocalizedError)?.errorDescription
@@ -3781,10 +3962,18 @@ final class AppModel: ObservableObject {
                 // itself, once the rows are back.)
                 refreshInPlaceAfterDelivery()
             } else {
-                // In isn't on screen. Nothing is arranged for the next time it
-                // is selected — no forced sort, no scroll — because arriving
-                // mail is not entitled to move a list the user positioned. The
-                // tree walk is what lights In's unread indicator.
+                // In isn't on screen. Still nothing is *arranged* here — no
+                // forced sort, no scroll written — because arriving mail is not
+                // entitled to move a list the user positioned. The tree walk is
+                // what lights In's unread indicator.
+                //
+                // Following the bottom needs nothing at this point either, which
+                // is the nice property of storing bottom-ness rather than a row
+                // index: if In was left at its end, `atBottomByMailbox` already
+                // says so, and `loadListing` will reveal the last row whenever In
+                // is next selected — by then including whatever arrived in the
+                // meantime. A remembered top row would have needed fixing up
+                // here, against a mailbox not on screen, on every delivery.
                 reloadTree()
             }
             // Light the sidebar's new-mail glyph on In (dismissed when the user
@@ -3796,7 +3985,8 @@ final class AppModel: ObservableObject {
             inboxHasNewMail = true
         }
 
-        report(received: received, failures: failures, accountCount: ready.count,
+        report(received: received, duplicates: duplicates, failures: failures,
+               accountCount: ready.count,
                skipped: accounts.partiallyConfigured.count, automatic: automatic)
     }
 
@@ -3814,15 +4004,24 @@ final class AppModel: ObservableObject {
     ///   this the new account is dropped in silence and the report says "No new
     ///   mail", which reads as "that server doesn't work" when the truth is
     ///   "you haven't finished setting it up".
-    private func report(received: Int, failures: [String], accountCount: Int,
-                        skipped: Int, automatic: Bool) {
-        if automatic && received == 0 { return }
+    /// - Parameter duplicates: messages fetched and discarded because the In box
+    ///   already held their `Message-ID`. This makes an automatic check speak
+    ///   when it otherwise wouldn't, which is deliberate: the guard firing means
+    ///   two sources are delivering the same mail, and during the Eudora 7
+    ///   cut-over that is a misconfiguration to be seen and fixed rather than
+    ///   quietly absorbed. A silent guard would let a wrongly-sequenced
+    ///   cut-over look like everything was fine.
+    private func report(received: Int, duplicates: Int, failures: [String],
+                        accountCount: Int, skipped: Int, automatic: Bool) {
+        if automatic && received == 0 && duplicates == 0 { return }
 
         let mail = received == 0
             ? "No new mail"
             : "Received \(received) message\(received == 1 ? "" : "s")"
-        let note = skipped == 0 ? ""
-            : " · \(skipped) account\(skipped == 1 ? "" : "s") not set up"
+        let dup = duplicates == 0 ? ""
+            : " · \(duplicates) duplicate\(duplicates == 1 ? "" : "s") ignored"
+        let note = dup + (skipped == 0 ? ""
+            : " · \(skipped) account\(skipped == 1 ? "" : "s") not set up")
 
         guard !failures.isEmpty else {
             showCheckMailNotice(mail + note)
@@ -3833,7 +4032,10 @@ final class AppModel: ObservableObject {
         // through a batch — leaves real mail in the In box, and saying the check
         // failed would contradict the messages the user can see and the glyph
         // that just lit.
-        let summary = received == 0 && failures.count == accountCount
+        // `duplicates == 0` as well: a check that fetched mail, recognised it as
+        // already held and then tripped over a failing delete pass did not fail
+        // to check mail. It did its job and hit a snag afterwards.
+        let summary = received == 0 && duplicates == 0 && failures.count == accountCount
             ? "Check mail failed"
             : "\(mail) · \(failures.count) of \(accountCount) "
               + "account\(accountCount == 1 ? "" : "s") failed"

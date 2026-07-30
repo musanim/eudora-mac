@@ -147,6 +147,23 @@ struct ContentView: View {
                 // redundant. `MoveToMenuButton` still exists — the Transfer menu
                 // uses it — and `model.reply/forward/moveSelected` are still the
                 // handlers those routes call.
+                // The exception to the rule stated just above. Eudora 7 put Blah
+                // Blah Blah on the toolbar and Stephen reached for it there for
+                // thirty years; it is also a *mode* rather than an action, so
+                // unlike Reply it wants somewhere that shows its current state at
+                // a glance. Tinted when on, for that reason.
+                // A `Toggle` in `.button` style rather than a `Button` with a
+                // hand-tinted label: it carries a real pressed-in on-state, which
+                // is what a mode button wants, and it avoids fighting the toolbar
+                // button style for the symbol's tint — an outer `.foregroundStyle`
+                // is unreliable there on macOS 13, and hand-setting the *off*
+                // colour would leave this button a different shade from the three
+                // beside it.
+                Toggle(isOn: $model.showAllHeaders) {
+                    Label("Blah Blah Blah", systemImage: "text.alignleft")
+                }
+                .toggleStyle(.button)
+                .help(model.showAllHeaders ? "Hide all headers" : "Show all headers")
                 Button { model.deleteSelected() } label: {
                     Label("Delete", systemImage: "trash")
                 }.disabled(!hasSelection)
@@ -1714,6 +1731,21 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         ///   that as "don't touch anything"; recording it would overwrite a good
         ///   remembered position.
         static func topVisibleRow(table: NSTableView, clipView: NSClipView) -> Int {
+            let visible = visibleRows(table: table, clipView: clipView)
+            guard visible.length > 0 else { return -1 }
+            return visible.location
+        }
+
+        /// Every row intersecting the visible content area, or a zero-length
+        /// range when there are none.
+        ///
+        /// This is `topVisibleRow`'s rect, factored out unchanged — every detail
+        /// of it is load-bearing and the reasoning is in that method's comment,
+        /// which is the one to read before touching any of this. Split out
+        /// because the *end* of the range answers a second question that
+        /// `topVisibleRow` computed and discarded: whether the last row is on
+        /// screen, which is what "stick to the bottom" is decided by.
+        static func visibleRows(table: NSTableView, clipView: NSClipView) -> NSRange {
             let hidden = clipView.contentInsets.top
             let top = table.convert(NSPoint(x: 0, y: clipView.bounds.minY + hidden),
                                     from: clipView).y
@@ -1725,8 +1757,72 @@ struct TableScrollStateSyncer: NSViewRepresentable {
                                  width: max(table.bounds.width, 1),
                                  height: max(height, 1))
             let visible = table.rows(in: content)
-            guard visible.length > 0, visible.location >= 0 else { return -1 }
-            return visible.location
+            guard visible.length > 0, visible.location >= 0 else {
+                return NSRange(location: 0, length: 0)
+            }
+            return visible
+        }
+
+        /// Whether the list has been **scrolled to its end** — not merely whether
+        /// its last row happens to be on screen.
+        ///
+        /// The distinction is the whole correctness of "stick to the bottom".
+        /// A mailbox shorter than the pane shows its last row at every scroll
+        /// position, because it has only one; calling that "at the bottom" would
+        /// record the flag for practically every small mailbox in the tree, and
+        /// then the first delivery that pushed one past a screenful would scroll
+        /// it to its end. Under a newest-first sort that means scrolling *away*
+        /// from the mail that just arrived — the exact opposite of the point.
+        /// Hence `visible.location > 0`: the list is at its end only if it could
+        /// have been somewhere else.
+        ///
+        /// The obvious cost — a list parked at the bottom of a small window
+        /// losing the flag once the window is grown until everything fits — does
+        /// **not** apply, because a resize doesn't reach the recorder at all
+        /// (see the observers in `attach`). The flag survives the growing, and
+        /// shrinking back re-pins. Recording only ever happens on a scroll.
+        ///
+        /// No tolerance at the other end either — one row short of the end is
+        /// not the end. A fuzzy test would make the list creep: a delivery would
+        /// scroll you the rest of the way down, and being "near enough" after
+        /// that, the next one would too, walking a position you chose
+        /// deliberately to the end one message at a time.
+        ///
+        /// `>=` rather than `==` because `rows(in:)` can report a range running
+        /// one past the last row when the document is taller than its rows (the
+        /// trailing pad, or SwiftUI still refining row-height estimates).
+        /// Prints what the recorder saw, per bounds change: the visible range,
+        /// the row count, the resulting flag and the clip origin.
+        ///
+        /// Off, intact, in the manner of `diagnose` and `diagnoseRestore` beside
+        /// it. The two questions it exists to settle without argument are "was
+        /// the list recorded as being at its end when I left it" and "did the
+        /// reveal land and hold" — both of which turn on geometry that is still
+        /// settling for several turns after a listing lands, and neither of
+        /// which can be reasoned out from the code.
+        static let diagnoseBottom = false
+
+        /// Which geometry notification arrived, with the size and origin it
+        /// carried and whether we called it a resize.
+        ///
+        /// Off, intact. This one settles a question the documentation doesn't:
+        /// AppKit posts bounds-changed and frame-changed for a clip view for
+        /// different reasons and in an order it doesn't specify, and a resize can
+        /// produce one or both. Everything about the pin's dedupe rests on that
+        /// behaviour, and one drag with this on records it for good instead of
+        /// leaving the next reader to reason it out.
+        static func diagnoseGeometry(_ note: Notification, clipView: NSClipView,
+                                     resized: Bool) {
+            guard diagnoseGeometryOn else { return }
+            let name = note.name == NSView.frameDidChangeNotification ? "frame" : "bounds"
+            print("geom diag: \(name)  frame \(clipView.frame.size)"
+                  + "  originY \(clipView.bounds.origin.y)  resized \(resized)")
+        }
+        static let diagnoseGeometryOn = false
+
+        static func lastRowVisible(_ visible: NSRange, rowCount: Int) -> Bool {
+            guard visible.length > 0, rowCount > 0, visible.location > 0 else { return false }
+            return visible.location + visible.length >= rowCount
         }
 
         /// The clip origin that puts `row` flush at the top of the visible
@@ -1800,6 +1896,21 @@ struct TableScrollStateSyncer: NSViewRepresentable {
     final class Coordinator: @unchecked Sendable {
         weak var table: NSTableView?
         var observer: NSObjectProtocol?
+        /// Frame changes on the clip view. **Load-bearing, not insurance —
+        /// don't "simplify" it away.**
+        ///
+        /// `NSViewBoundsDidChangeNotification` is posted when the bounds change
+        /// *independently of the frame*; a frame-driven resize does not reliably
+        /// post it. Dragging the list/preview divider shortens the clip view's
+        /// frame without touching its origin, so the bounds observer alone hears
+        /// nothing at all and the list silently stops following its end.
+        ///
+        /// It has its own handler, which only ever pins and never records. A
+        /// frame change is by definition not a user scroll, so it has no
+        /// business in the recorder — and letting it in meant a window widened
+        /// by its right edge, or the sidebar being resized, cleared In's
+        /// new-mail badge.
+        var frameObserver: NSObjectProtocol?
         /// KVO pins that keep the forced row height in place against SwiftUI's
         /// resets — see `pinRowHeight`. Invalidated automatically when this
         /// coordinator (and so the array) deallocates, or replaced on re-attach.
@@ -1819,6 +1930,37 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         /// True while we're programmatically scrolling, so the bounds
         /// notification that results isn't recorded as a user scroll.
         var isRestoring = false
+        /// The same idea for a *reveal*, but narrower: a reveal's resulting
+        /// position is meant to be recorded (it moves the list the way the user
+        /// would have), so this doesn't suppress recording. It suppresses only
+        /// the new-mail badge dismissal, which must happen on real user input
+        /// alone — see the observer in `attach`. Cleared a turn after the scroll,
+        /// by which time the notification has been delivered.
+        var isRevealing = false
+        /// True from the moment a pin is *scheduled* until the notification its
+        /// scroll produces has been delivered.
+        ///
+        /// Set synchronously in the notification handler, not inside the pin
+        /// itself: the handler is what tests it, and a flag raised a turn later
+        /// is not in force where it is read. It guards the *recorder*, which is
+        /// the thing that would otherwise be fed two bad readings — the pin's own
+        /// echo, and the twin notification of a resize that posted both frame and
+        /// bounds. Either would record a mid-resize position and drop the very
+        /// flag the pin is acting on.
+        ///
+        /// Cleared unconditionally by whoever set it, never inside the pin's
+        /// guards: a pin that declines (not parked at the end, a listing in
+        /// flight) must still lower it, or the recorder is dead for the session.
+        var isPinningBottom = false
+        /// Bumped per pin, so the confirmation passes of a drag's ~120 frames
+        /// don't all fire. Only the newest survives.
+        var pinGeneration = 0
+        /// The clip view's height at the last notification, so a *resize* can be
+        /// told from a *scroll*. Both arrive as bounds changes and they need
+        /// opposite treatment: a scroll is the user choosing a position and is
+        /// recorded, a resize is the viewport changing under a position the user
+        /// already chose and must not be.
+        var lastClipHeight: CGFloat = 0
         /// Bumped per restore attempt. `updateNSView` runs on *any* model
         /// change, so several restore chains can be in flight at once; only the
         /// newest may touch `isRestoring`, or an older one finishing would
@@ -1827,6 +1969,7 @@ struct TableScrollStateSyncer: NSViewRepresentable {
 
         deinit {
             if let observer = observer { NotificationCenter.default.removeObserver(observer) }
+            if let frameObserver { NotificationCenter.default.removeObserver(frameObserver) }
             if let scrollMonitor = scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
         }
     }
@@ -1844,7 +1987,13 @@ struct TableScrollStateSyncer: NSViewRepresentable {
             // synchronously; this re-enforce is here in case those ever miss.
             if let table = coordinator.table { Self.enforceRowHeight(table) }
             applyPendingScroll(coordinator: coordinator, attemptsLeft: 5)
-            applyPendingReveal(coordinator: coordinator, attemptsLeft: 5)
+            // 15, not 5. The budget was set when a reveal only ever followed a
+            // re-sort, where the rows already exist and one retry is generous.
+            // It now also carries "a 22,515-row mailbox has just been handed to
+            // `Table` and hasn't realized its rows yet" — and since a reveal
+            // that runs out of attempts silently doesn't happen, the failure is
+            // invisible. 15 × 0.2s = 3s, still bounded.
+            applyPendingReveal(coordinator: coordinator, attemptsLeft: 15)
             applyPendingFocus(coordinator: coordinator, attemptsLeft: 5)
         }
     }
@@ -1937,8 +2086,89 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         DispatchQueue.main.async {
             guard coordinator.revealGeneration == generation,
                   let table = coordinator.table, table.numberOfRows > row else { return }
+            coordinator.isRevealing = true
             table.scrollRowToVisible(row)
             model.clearPendingReveal()
+
+            // One confirmation pass, for the reason `verifyPendingScroll` has a
+            // whole state machine: SwiftUI keeps refining the table's row-height
+            // estimates for several turns after a listing lands, so the document
+            // grows *under* a scroll that was correct when it was issued. On a
+            // long mailbox that leaves a reveal of the last row a row or two
+            // short of the end — the newest message half under the bottom edge,
+            // which is exactly the thing this feature is judged on. One re-scroll
+            // is enough; this isn't chasing a moving target, just letting the
+            // first estimate settle.
+            //
+            // Only re-scrolls when the row is genuinely not fully in view, so a
+            // reveal that landed correctly costs one geometry read and nothing
+            // else. `isRevealing` is cleared here, after the notification from
+            // the scroll above has been delivered.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                defer { coordinator.isRevealing = false }
+                guard coordinator.revealGeneration == generation,
+                      let table = coordinator.table, table.numberOfRows > row,
+                      let clip = table.enclosingScrollView?.contentView else { return }
+                let visible = Scrolling.visibleRows(table: table, clipView: clip)
+                let shown = visible.length > 0
+                    && row >= visible.location && row < visible.location + visible.length
+                if !shown { table.scrollRowToVisible(row) }
+            }
+        }
+    }
+
+    /// Put the list back at its end after the viewport changed size, if that is
+    /// where the user left it.
+    ///
+    /// The case this exists for is dragging the list/preview divider: the clip
+    /// view gets shorter while its origin stays put, so the last row slides out
+    /// below the new bottom edge and a list that was at its end no longer is. A
+    /// window resize is the same event. Any mailbox, not just In.
+    ///
+    /// Guarded on the pending channels for the usual reason — a restore or a
+    /// reveal that hasn't landed yet is the position the list is *going* to be
+    /// at, and pinning now would fight it and then be undone.
+    @MainActor
+    private func pinToBottom(coordinator: Coordinator) {
+        // `isListing` and `isRevealing` are the two windows where the rows on
+        // screen aren't the ones this decision is about. During a mailbox switch
+        // the table still holds the *previous* mailbox's rows while
+        // `selectedMailboxWasAtBottom` already answers for the new one — and the
+        // summary bar appearing and disappearing changes the clip height on
+        // every switch, so the resize path really does fire there. `rememberScroll`
+        // defends against the same class of thing with `listedMailboxID`.
+        //
+        // `isRevealing` covers the 0.15s in which `applyPendingReveal` has
+        // cleared `pendingRevealRow` but its confirmation pass hasn't run: a
+        // resize landing there would pin to the bottom over a reveal of the
+        // *selected* row, and the confirmation would then yank it back. A
+        // visible jump.
+        guard model.selectedMailboxWasAtBottom, !model.isListing,
+              !coordinator.isRevealing,
+              model.pendingScrollTopRow == nil, model.pendingRevealRow == nil,
+              let table = coordinator.table, table.numberOfRows > 0 else { return }
+        let row = table.numberOfRows - 1
+        table.scrollRowToVisible(row)
+
+        // One confirmation, for the reason recorded twice already in this file:
+        // SwiftUI keeps refining row-height estimates for several turns, so the
+        // document grows under a scroll that was right when it was issued. Mid-
+        // drag that self-corrects — the next frame re-pins — but the *last*
+        // frame of a drag has no successor, so a short landing there is what
+        // sticks: you let go and the newest message sits half under the edge.
+        //
+        // Generation-guarded, and that matters more here than for the reveal: a
+        // two-second drag would otherwise queue ~120 of these.
+        coordinator.pinGeneration += 1
+        let generation = coordinator.pinGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            guard coordinator.pinGeneration == generation,
+                  let table = coordinator.table, table.numberOfRows > 0,
+                  let clip = table.enclosingScrollView?.contentView else { return }
+            let visible = Scrolling.visibleRows(table: table, clipView: clip)
+            if !Scrolling.lastRowVisible(visible, rowCount: table.numberOfRows) {
+                table.scrollRowToVisible(table.numberOfRows - 1)
+            }
         }
     }
 
@@ -1972,25 +2202,80 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         clipView.postsBoundsChangedNotifications = true
         installScrollMonitor(coordinator: coordinator)
 
-        // Everything captured here is weak or a reference type held elsewhere.
-        // Capturing `coordinator` strongly would be a cycle — coordinator owns
-        // the token, the token owns this block — and the observer would then
-        // never be removed, so each teardown of the Table (which happens
-        // whenever a mailbox lists empty) would leave a live observer behind and
-        // register another.
+        // `coordinator` is captured weakly: strongly would be a cycle —
+        // coordinator owns the token, the token owns the block — and the
+        // observer would then never be removed, so each teardown of the Table
+        // (which happens whenever a mailbox lists empty) would leave a live
+        // observer behind and register another. `self` *is* captured now, by
+        // value, because the pin needs `model`; that's a struct copy, not a
+        // retain, so it doesn't reopen the cycle.
         let model = self.model
-        coordinator.observer = NotificationCenter.default.addObserver(
-            forName: NSView.boundsDidChangeNotification,
-            object: clipView,
-            queue: .main
-        ) { [weak table, weak clipView, weak coordinator] _ in
+        coordinator.lastClipHeight = clipView.bounds.height
+        clipView.postsFrameChangedNotifications = true
+
+        // A frame change is a resize and nothing else, so this handler only ever
+        // pins — it never records. See `Coordinator.frameObserver` for why a
+        // frame change must not reach the recorder.
+        let onFrameChange: @Sendable (Notification) -> Void = {
+            [weak clipView, weak coordinator] note in
+            guard let clipView, let coordinator, !coordinator.isRestoring else { return }
+            let height = clipView.bounds.height
+            let resized = abs(height - coordinator.lastClipHeight) > 0.5
+            coordinator.lastClipHeight = height
+            Scrolling.diagnoseGeometry(note, clipView: clipView, resized: resized)
+            guard resized else { return }
+            schedulePin(coordinator: coordinator)
+        }
+
+        let onBoundsChange: @Sendable (Notification) -> Void = {
+            [weak table, weak clipView, weak coordinator] note in
             guard let table, let clipView, let coordinator,
                   !coordinator.isRestoring else { return }
+
+            // A resize, not a scroll? Then the user didn't move the list — the
+            // viewport moved around it — and a list parked at its end should
+            // still be at its end afterwards. Dragging the list/preview divider
+            // up shortens the clip view, so the last row slides out below the
+            // new bottom edge and the list appears to drift away from where it
+            // was left. Re-pin instead, and don't record: the position reported
+            // mid-resize is an artefact of the resize, and recording it would
+            // drop the very flag that says to re-pin. Any mailbox; a window
+            // resize is the same event from here.
+            //
+            // A resize never *confers* bottom-ness either — this path returns
+            // without recording, so growing the window until the last row comes
+            // into view doesn't mark the list as parked at its end. Only
+            // scrolling there does. Bottom-ness records a choice.
+            let height = clipView.bounds.height
+            let resized = abs(height - coordinator.lastClipHeight) > 0.5
+            coordinator.lastClipHeight = height
+            Scrolling.diagnoseGeometry(note, clipView: clipView, resized: resized)
+            if resized, table.numberOfRows > 0 {
+                schedulePin(coordinator: coordinator)
+                return
+            }
+            // Our own echo, or the twin of a resize that posted frame *and*
+            // bounds — same height as the one just handled, so `resized` is
+            // false and it would otherwise fall through to the recorder carrying
+            // a reading taken before the pin ran, dropping the flag.
+            if coordinator.isPinningBottom { return }
             // The same inset-aware reading the wheel uses, so the position that
             // gets remembered is the one the user sees at the top rather than
             // the row hidden under the header — otherwise every restore came
             // back a row higher than where they left off.
-            let top = Scrolling.topVisibleRow(table: table, clipView: clipView)
+            // One geometry read, two answers — the top row to remember and
+            // whether the end of the list is on screen. Read together so they
+            // can't disagree: computing them from two separate probes would let
+            // a bounds change land between them and record a top row from one
+            // scroll position with the bottom-ness of another.
+            let visible = Scrolling.visibleRows(table: table, clipView: clipView)
+            let top = visible.length > 0 ? visible.location : -1
+            let atBottom = Scrolling.lastRowVisible(visible, rowCount: table.numberOfRows)
+            if Scrolling.diagnoseBottom {
+                print("bottom diag: visible \(visible.location)+\(visible.length)"
+                      + " of \(table.numberOfRows)  atBottom \(atBottom)"
+                      + "  clipY \(clipView.bounds.origin.y)")
+            }
             // -1 covers the mid-reload case as well as an empty table: the clip
             // can still be parked at an origin inherited from the mailbox being
             // left — a deep position in a 3,155-row mailbox landing on a 134-row
@@ -2003,13 +2288,61 @@ struct TableScrollStateSyncer: NSViewRepresentable {
             Task { @MainActor in
                 // A restore that hasn't been applied yet is still authoritative;
                 // the snap-to-top that follows a reload must not clobber it.
-                guard model.pendingScrollTopRow == nil else { return }
+                //
+                // `pendingRevealRow` for the same reason, which is newly load-
+                // bearing: the stick-to-the-bottom path deliberately leaves
+                // `pendingScrollTopRow` nil, and `isRestoring` is only set by
+                // `applyPendingScroll`. So without this guard every bounds change
+                // a freshly-published table emits before the reveal lands gets
+                // recorded — `top 0, atBottom false` — which erases the very flag
+                // the reveal is acting on. In the happy path the reveal follows a
+                // beat later and re-records; in the unhappy one (attempts
+                // exhausted, mailbox switched) a failed restore has destroyed the
+                // remembered position.
+                guard model.pendingScrollTopRow == nil, model.pendingRevealRow == nil else { return }
                 // A user scroll in In dismisses its new-mail badge. This is the
                 // user-scroll path (guarded above); the restore write-back calls
                 // `rememberScroll` directly, so delivery's re-list won't clear it.
-                model.clearInboxNewMailBadge()
-                model.rememberScroll(topRow: top)
+                //
+                // `isRevealing` closes the hole the guard above cannot: the
+                // reveal clears `pendingRevealRow` before its own bounds
+                // notification is delivered, so that one notification arrives
+                // looking exactly like a user scroll. For a bottom-parked In that
+                // meant delivery lit the new-mail glyph and then put it out again
+                // a fraction of a second later, with the user having done nothing
+                // — breaking the invariant recorded on `inboxHasNewMail`, that
+                // only user input dismisses it. The position is still worth
+                // recording, so only the badge is gated.
+                if !coordinator.isRevealing { model.clearInboxNewMailBadge() }
+                model.rememberScroll(topRow: top, atBottom: atBottom)
             }
+        }
+        coordinator.observer = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: clipView,
+            queue: .main,
+            using: onBoundsChange
+        )
+        coordinator.frameObserver = NotificationCenter.default.addObserver(
+            forName: NSView.frameDidChangeNotification,
+            object: clipView,
+            queue: .main,
+            using: onFrameChange
+        )
+    }
+
+    /// Schedule a pin, and hold the recorder off until its scroll has echoed.
+    ///
+    /// The flag goes up **here**, synchronously, because the notification
+    /// handlers are what test it; raised inside `pinToBottom` — a turn later —
+    /// it would never be in force where it is read. It comes down
+    /// unconditionally, outside that method's guards, because a pin that
+    /// declines still has to lower it or the recorder stays shut for good.
+    private func schedulePin(coordinator: Coordinator) {
+        coordinator.isPinningBottom = true
+        Task { @MainActor in
+            pinToBottom(coordinator: coordinator)
+            DispatchQueue.main.async { coordinator.isPinningBottom = false }
         }
     }
 
@@ -2414,7 +2747,28 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         // Write the restored position straight back: recording was
         // suppressed throughout the restore, so without this the remembered
         // value would only ever be rewritten by a later user scroll.
-        model.rememberScroll(topRow: row)
+        //
+        // Bottom-ness is measured from the geometry we have right here rather
+        // than carried in with `row`. This path restores a *top row*, and
+        // whether that leaves the end of the list on screen depends on the row
+        // count and the pane height — a position recorded as mid-list in a tall
+        // window is the bottom in a short one. Asking the table is the only
+        // answer that can't be stale.
+        //
+        // Re-bound here: the `table`/`scrollView` above are scoped to the
+        // `attemptsLeft > 0` branch, and this line is also reached when the
+        // attempts ran out. If the table has gone away entirely there is nothing
+        // to measure, so the remembered flag is carried through unchanged rather
+        // than being cleared on no evidence.
+        let restoredAtBottom: Bool
+        if let table = coordinator.table, let scrollView = table.enclosingScrollView {
+            restoredAtBottom = Scrolling.lastRowVisible(
+                Scrolling.visibleRows(table: table, clipView: scrollView.contentView),
+                rowCount: table.numberOfRows)
+        } else {
+            restoredAtBottom = model.selectedMailboxWasAtBottom
+        }
+        model.rememberScroll(topRow: row, atBottom: restoredAtBottom)
     }
 }
 
@@ -2745,6 +3099,24 @@ struct PaneDividerHandle: View {
                     pushedCursor = false
                 }
             }
+            // The other half of the pair, for the case `onHover` cannot cover:
+            // this view being *destroyed* while the pointer is over it. SwiftUI
+            // does not deliver `onHover(false)` on removal, and it takes the
+            // `@State` flag with it, so the push would leak — and per the note
+            // above, a spare push means someone else's cursor gets popped later.
+            //
+            // Not hypothetical since the header divider appeared: it exists only
+            // while Blah Blah Blah is on, so hovering the rule and pressing
+            // ⇧⌘B destroys it under the pointer. It also goes away on every
+            // selection change, because `loadMessage` clears `preview` before it
+            // renders — so arrow-keying down the list with the pointer resting
+            // where the drag left it would leak one push per message.
+            .onDisappear {
+                if pushedCursor {
+                    NSCursor.pop()
+                    pushedCursor = false
+                }
+            }
             // `minimumDistance: 0` so the drag starts on mouse-down rather than
             // after a few points of slop, which on a divider reads as stickiness.
             //
@@ -2764,9 +3136,65 @@ struct PaneDividerHandle: View {
     }
 }
 
+/// Sizing for the raw header block, when "Blah Blah Blah" is on.
+///
+/// Separate from `PaneLayout` because the two clamps answer different questions.
+/// `PaneLayout` splits the whole detail area between two panes that both matter;
+/// this one carves a strip off the top of a pane whose remainder is the message
+/// itself, so it is stated as "leave at least this much for the body" rather
+/// than as two competing minimums.
+/// (Note for anyone tempted to make the preview pane self-sizing: `PreviewView`
+/// is handed an explicit `.frame(height:)` by the split view, and the header
+/// handle only redistributes space *inside* that fixed frame. So dragging it
+/// posts no geometry notification on the message list's clip view, and the
+/// list's stick-to-the-bottom behaviour is untouched by it. A self-sizing
+/// preview would change that.)
+enum HeaderPaneLayout {
+    /// Two or three header lines — below this the strip isn't worth having.
+    static let minimum: CGFloat = 44
+    /// What must be left for everything that isn't the block: the padding (24),
+    /// the subject (up to two lines, ~40), the attachment chips when present
+    /// (~33), the 9 pt handle, and a usable amount of body.
+    ///
+    /// Approximate on purpose. Measuring the real chrome would make the ceiling
+    /// depend on the message being shown — which is the "the app resized the
+    /// pane behind my back" problem the `GeometryReader` below exists to
+    /// prevent. But it has to be generous rather than tight: the chrome sits
+    /// *above* the block, so under-reserving pushes the handle itself past the
+    /// bottom of a `.clipped()` pane, where it cannot be grabbed to drag back.
+    /// The subject is capped at two lines for the same reason — an unbounded
+    /// `.headline` wrapping to four lines would blow any fixed figure.
+    static let reservedForTheRest: CGFloat = 185
+    static let defaultHeight: Double = 120
+
+    /// `stored`, clamped to what a pane of `pane` points can give it.
+    static func height(_ stored: Double, pane: CGFloat) -> CGFloat {
+        let ceiling = pane - reservedForTheRest
+        // A pane too short to honour both: give the headers the floor and let
+        // the body be clipped. Showing two header lines and no message beats
+        // showing a negative-height view, which lays out as a crash in some
+        // SwiftUI versions and as nothing at all in others.
+        guard ceiling >= minimum else { return minimum }
+        return min(max(CGFloat(stored), minimum), ceiling)
+    }
+}
+
 struct PreviewView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var fontSettings: ComposeSettings
+
+    /// Height of the raw header block, remembered across launches. `@AppStorage`
+    /// for the same reason `previewPaneHeight` is: where you like a divider is a
+    /// property of the window, not of the tree that happens to be open. Every
+    /// read is clamped by `HeaderPaneLayout`, never trusted.
+    @AppStorage("headerPaneHeight") private var storedHeaderHeight: Double =
+        HeaderPaneLayout.defaultHeight
+
+    /// The header height when the current drag began; nil when not dragging.
+    @State private var headerDragStart: Double?
+
+    /// The height being dragged to, before it is committed.
+    @State private var liveHeaderHeight: Double?
 
     /// Wrapped in a `GeometryReader` so the pane's height is decided by the
     /// split view and the user, never by the message being shown.
@@ -2794,17 +3222,27 @@ struct PreviewView: View {
     /// pane must take the height it is given and not ask for one.)
     var body: some View {
         GeometryReader { geo in
-            content
+            content(paneHeight: geo.size.height)
                 .frame(width: geo.size.width, height: geo.size.height,
                        alignment: .topLeading)
                 .clipped()
+                // Turning the block off destroys the divider, and if that
+                // happens mid-drag `onEnded` never runs — leaving `liveHeaderHeight`
+                // set for the rest of the session, honoured on screen but never
+                // committed, so the height silently reverts at the next launch.
+                // Discarded rather than committed, matching this file's stance
+                // that a cancelled drag should be harmless.
+                .onChange(of: model.showAllHeaders) { _ in
+                    liveHeaderHeight = nil
+                    headerDragStart = nil
+                }
                 // The rule that used to be overlaid here is now drawn by
                 // `PaneDividerHandle`, which sits above this pane in the stack
                 // and carries the drag as well as the line.
         }
     }
 
-    @ViewBuilder private var content: some View {
+    @ViewBuilder private func content(paneHeight: CGFloat) -> some View {
         if model.selectedMessageIDs.count > 1 {
             // A multi-selection previews nothing (the design decision — Mail's
             // convention). Checked before `preview`: a stale render must not
@@ -2813,9 +3251,45 @@ struct PreviewView: View {
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let p = model.preview {
+            let headerHeight = HeaderPaneLayout.height(liveHeaderHeight ?? storedHeaderHeight,
+                                                       pane: paneHeight)
             VStack(alignment: .leading, spacing: 0) {
-                headers(p)
-                Divider()
+                headers(p, blockHeight: headerHeight)
+                // Draggable only while the raw block is showing. The three-line
+                // From/To/Date summary has nothing to reveal, so a resize handle
+                // over it would be a control that does nothing — and it would
+                // put the resize cursor on a rule the user has looked at without
+                // touching for months.
+                if model.showAllHeaders {
+                    PaneDividerHandle { translation in
+                        // The same three rules as the list/preview divider, for
+                        // the same reasons: clear the base when a fresh gesture
+                        // reports its zero (so a cancelled drag can't teleport
+                        // the next one), measure from where the drag began
+                        // rather than compounding each event, and start from the
+                        // *clamped* height so a short window doesn't spend the
+                        // first inch of the drag re-clamping to where it already
+                        // was.
+                        if translation == 0 { headerDragStart = nil }
+                        let base = headerDragStart ?? Double(headerHeight)
+                        if headerDragStart == nil { headerDragStart = base }
+                        // Dragging down makes the header block *larger* — the
+                        // opposite sense to the pane divider above, because here
+                        // the thing being sized is above the handle rather than
+                        // below it.
+                        liveHeaderHeight = Double(
+                            HeaderPaneLayout.height(base + Double(translation),
+                                                    pane: paneHeight))
+                    } onEnded: {
+                        // Committed once, not per frame: `@AppStorage` writes to
+                        // UserDefaults and a drag emits at the refresh rate.
+                        if let liveHeaderHeight { storedHeaderHeight = liveHeaderHeight }
+                        liveHeaderHeight = nil
+                        headerDragStart = nil
+                    }
+                } else {
+                    Divider()
+                }
                 if p.isHTML {
                     HTMLMailView(html: p.content, images: p.images,
                                  onCopyLink: { url in model.showBanner("Link copied: \(url)") },
@@ -2873,13 +3347,28 @@ struct PreviewView: View {
         }
     }
 
-    private func headers(_ p: MessagePreview) -> some View {
+    private func headers(_ p: MessagePreview, blockHeight: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 3) {
+            // Capped so a very long subject can't grow the chrome past what
+            // `HeaderPaneLayout.reservedForTheRest` allows for it, which would
+            // push the drag handle off the bottom of the pane.
             Text(p.subject.isEmpty ? "(no subject)" : p.subject)
                 .font(.headline)
-            headerLine("From", p.from)
-            headerLine("To", p.to)
-            headerLine("Date", p.date)
+                .lineLimit(2)
+            if model.showAllHeaders {
+                // Branching on the toggle alone, not on the text being non-empty:
+                // if the re-read failed, the panel has to say so. Falling back to
+                // the ordinary summary would leave the button lit and the pane
+                // unchanged, which reads as "the button is broken".
+                rawHeaderBlock(p.rawHeaders.isEmpty
+                    ? "(headers unavailable — the message couldn't be re-read)"
+                    : p.rawHeaders,
+                               height: blockHeight)
+            } else {
+                headerLine("From", p.from)
+                headerLine("To", p.to)
+                headerLine("Date", p.date)
+            }
             if !p.attachments.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
@@ -2892,6 +3381,38 @@ struct PreviewView: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The raw block, in place of the From/To/Date summary.
+    ///
+    /// Monospaced because that is how a header block is meant to be read — the
+    /// `Received:` chain you open this for is a column of aligned timestamps and
+    /// hostnames, and a proportional face makes it soup. `.system(design:
+    /// .monospaced)` rather than the body font from Settings: this is not the
+    /// message, it is the envelope, and it shouldn't follow a font choice made
+    /// for reading prose.
+    ///
+    /// Independently scrollable so a long chain — a dozen `Received:` lines is
+    /// ordinary for a forwarded message — can't push the body off the bottom of
+    /// the pane. `height`, not `maxHeight`: the strip takes exactly what the
+    /// divider below it was dragged to, so its size is the user's decision and
+    /// doesn't change from one message to the next. `.fixedSize` is gone with
+    /// the cap — it would have fought the explicit height.
+    ///
+    /// The tradeoff, taken deliberately: a short block no longer shrinks to fit,
+    /// so three lines of headers leave whitespace above the rule. A block that
+    /// sized itself to each message would move the rule out from under the
+    /// pointer every time the selection changed — which is the behaviour this
+    /// pane has been carefully arranged not to have.
+    private func rawHeaderBlock(_ text: String, height: CGFloat) -> some View {
+        ScrollView {
+            Text(text)
+                .font(.system(size: 11, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.trailing, 4)
+        }
+        .frame(height: height)
     }
 
     @ViewBuilder

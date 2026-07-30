@@ -356,4 +356,78 @@ public struct MailStore: Sendable {
         let rec = recs[index - 1]
         return (rec, MIMEParser.parse(Mbox.messageBytes(bytes, rec)))
     }
+
+    /// The message's header block exactly as it sits on disk — Eudora 7's
+    /// "Blah Blah Blah".
+    ///
+    /// Deliberately **not** built from `MIMEPart.headers`. That list is the
+    /// parser's reading of the headers: continuation lines unfolded onto one
+    /// line, values whitespace-trimmed, anything without a colon dropped. Those
+    /// are the right choices for *using* a header and the wrong ones for showing
+    /// someone what arrived — the reason to open this panel at all is usually
+    /// that something looks wrong, and a view that has already tidied the
+    /// evidence can't answer the question. So this re-reads the bytes.
+    ///
+    /// Addressed by **offset**, not index. The index form would have to read the
+    /// whole `.mbx` and scan every byte for record separators just to find the
+    /// record — 613 MB for Trash, on the main thread, per keystroke of a toggle.
+    /// The caller already has the offset: it comes back from `message(at:index:)`
+    /// as `record.offset` and is what `rememberSelection` stores.
+    ///
+    /// Reads at most `headerReadLimit` bytes and stops at the header/body
+    /// separator, so a message with a large attachment costs no more than one
+    /// with none. Returns nil when the mailbox can't be read or nothing starts
+    /// at `offset`; returns the block *without* Eudora's `From ???@???` envelope
+    /// line, which is a storage artifact rather than a header.
+    ///
+    /// Decoded as Latin-1 because it is the one decoding that cannot fail:
+    /// headers are meant to be ASCII, real ones sometimes aren't, and a raw view
+    /// that refused to show a message because its bytes were malformed would be
+    /// broken exactly when it was needed. Encoded words are left encoded — that
+    /// is what "raw" means, and the decoded forms are already on screen above.
+    public func rawHeaderBlock(at base: URL, offset: Int, length: Int? = nil) -> String? {
+        guard offset >= 0 else { return nil }
+        // `FileHandle`, not `Data(contentsOf:options: .mappedIfSafe)`. This is on
+        // the click path — every message opened — and `.mappedIfSafe` maps only
+        // when the OS thinks it safe, falling back to reading the *entire* file
+        // on a network or removable volume. That would turn a 128 KB read into
+        // 613 MB on Trash, silently, depending on where the archive lives. A
+        // seek and a bounded read cannot do that.
+        guard let handle = try? FileHandle(forReadingFrom: mbxURL(base)) else { return nil }
+        defer { try? handle.close() }
+        guard (try? handle.seek(toOffset: UInt64(offset))) != nil else { return nil }
+        // Clamped to the record when the caller knows its length. Without this a
+        // message with *no* blank line — a truncated record, or one of the
+        // not-newline-terminated records `Mbox.findRecords` documents as real in
+        // this tree — falls through to "the whole read is headers" and renders
+        // the following messages' bytes as though they were this one's. That is
+        // exactly the malformed message someone opens this panel to inspect.
+        let cap = min(length ?? Self.headerReadLimit, Self.headerReadLimit)
+        guard let read = try? handle.read(upToCount: cap), !read.isEmpty else { return nil }
+        let slice = [UInt8](read)
+        // Confirm a record really starts here rather than trusting the caller: a
+        // stale offset would otherwise render the middle of some other message
+        // as though it were this one's headers.
+        guard slice.starts(with: Mbox.separator) else { return nil }
+        let message = Mbox.messageBytes(fromRecord: slice)
+        let header = Self.headerBytes(of: message)
+        guard !header.isEmpty else { return nil }
+        return String(header.map { Character(UnicodeScalar($0)) })
+    }
+
+    /// How far into a record to read looking for the end of the headers. Beyond
+    /// this the block is shown truncated rather than not at all — a header block
+    /// larger than this is pathological, and half an answer beats none.
+    static let headerReadLimit = 128 * 1024
+
+    /// The bytes up to the blank line that ends the headers, CRLF or LF.
+    static func headerBytes(of message: [UInt8]) -> [UInt8] {
+        if let i = Bytes.find([0x0d, 0x0a, 0x0d, 0x0a], in: message) {
+            return Array(message[0..<i])
+        }
+        if let i = Bytes.find([0x0a, 0x0a], in: message) {
+            return Array(message[0..<i])
+        }
+        return message
+    }
 }

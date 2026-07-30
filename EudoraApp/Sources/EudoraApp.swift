@@ -194,6 +194,15 @@ struct EudoraApp: App {
             }
             .disabled(!messageCommandsEnabled)
             Divider()
+            // Outside the Group deliberately: this is a view mode, not an action
+            // on a message, so it stays usable with nothing selected — you turn
+            // it on and then go looking. Named as Eudora named it, with the plain
+            // description after it so the menu is still readable by someone who
+            // never met Eudora 7. ⇧⌘B because ⌘B is bold in the composer and ⌘H
+            // belongs to Hide.
+            Toggle("Blah Blah Blah (All Headers)", isOn: $model.showAllHeaders)
+                .keyboardShortcut("b", modifiers: [.command, .shift])
+            Divider()
             Button("Delete") { model.deleteSelected() }
                 .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(!deleteCommandEnabled)
