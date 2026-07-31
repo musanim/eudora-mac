@@ -27,6 +27,17 @@ struct EudoraApp: App {
                 .environmentObject(accounts)
                 .environmentObject(composeSettings)
                 .frame(minWidth: 900, minHeight: 560)
+                // A one-point, invisible `SettingsLink`, kept only so it can be
+                // clicked programmatically when Settings has to be reopened.
+                // It is the only opener that still works on macOS 26 — see
+                // `HiddenSettingsLink`.
+                .background(HiddenSettingsLink())
+                // Bring Settings back if it was open at quit — the
+                // adjust-a-setting, quit, rebuild, re-test loop. Hung off the
+                // main window rather than `init` so the reopen happens after
+                // there is a window for it to come up in front of. Does nothing
+                // when Settings was closed. See `SettingsWindowState`.
+                .onAppear { SettingsWindowState.reopenIfItWasOpen() }
         }
         .commands { eudoraCommands }
 
@@ -238,6 +249,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         onQuit()
+    }
+
+    /// Note whether Settings was open, so the next launch can bring it back.
+    ///
+    /// Asked here rather than tracked as the window opens and closes: SwiftUI's
+    /// `Settings` scene keeps its window alive across a close, so there is no
+    /// dependable "opened again" moment to observe. See
+    /// `SettingsWindowState.recordWhetherOpen`.
+    ///
+    /// `applicationWillTerminate` and not `applicationShouldTerminate`: the
+    /// latter can be answered `.terminateCancel` by the unsaved-draft review, and
+    /// recording there would file "quitting" state for a quit that didn't happen.
+    func applicationWillTerminate(_ notification: Notification) {
+        SettingsWindowState.recordWhetherOpen()
     }
 }
 

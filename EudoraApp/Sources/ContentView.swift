@@ -298,6 +298,7 @@ struct SidebarView: View {
             } else {
                 MailboxTree(tree: model.visibleTree,
                             treeVersion: model.treeVersion,
+                            treeIdentityVersion: model.treeIdentityVersion,
                             selected: model.selectedMailboxID,
                             inboxHasNewMail: model.inboxHasNewMail,
                             selection: model.mailboxSelection,
@@ -336,6 +337,11 @@ struct SidebarView: View {
 struct MailboxTree: View, Equatable {
     let tree: [MailboxItem]
     let treeVersion: Int
+    /// Bumped when the tree's identity graph changes — a move, a new or deleted
+    /// group — but *not* on a rename, and never when a mailbox merely gains
+    /// unread mail. Used as the `List`'s identity, which is what stops SwiftUI
+    /// diffing a restructured outline. See the `.id()` in `body`.
+    let treeIdentityVersion: Int
     let selected: MailboxItem.ID?
     /// Whether In is carrying unlooked-at new mail — drives the unread glyph on
     /// the In row. In `==` so the badge appearing/clearing re-renders the tree.
@@ -361,6 +367,10 @@ struct MailboxTree: View, Equatable {
         a.treeVersion == b.treeVersion && a.selected == b.selected
             && a.inboxHasNewMail == b.inboxHasNewMail
     }
+    // `treeIdentityVersion` is deliberately *not* in `==`. It only ever moves
+    // when `treeVersion` does — both are published in the same synchronous
+    // block, in `startTreeReload` and in `open` — so comparing it would be
+    // redundant, and this view has to re-render on a structural change anyway.
 
     var body: some View {
         List(selection: selection) {
@@ -373,6 +383,53 @@ struct MailboxTree: View, Equatable {
             }
             OutlineGroup(otherMailboxes, children: \.children) { item in row(for: item) }
         }
+        // Rebuild the outline outright when the tree's shape changes, rather
+        // than letting SwiftUI diff it.
+        //
+        // This fixes a crash, not a cosmetic problem. `OutlineGroup` in a `List`
+        // is backed by `NSOutlineView` through SwiftUI's `OutlineListCoordinator`,
+        // and it keeps expansion state internally, keyed on item identity. Moving
+        // an **expanded** group into another group — creating PEOPLE and moving
+        // the by-letter groups into it, on 2026jul30 — makes the diff delete an
+        // expanded subtree from one parent and insert it under another inside a
+        // single animated batch. SwiftUI asserts partway through:
+        //
+        //     _assertionFailure  ←  ViewListTree.visitItem(_:force:)
+        //     ←  OutlineListCoordinator.outlineView(_:child:ofItem:)
+        //     ←  -[NSOutlineView _recursiveCollapseItemEntry:…]
+        //     ←  OutlineListCoordinator.recursivelyDiffRows(_:with:by:expandAll:)
+        //
+        // Changing the identity makes SwiftUI discard the outline and build a
+        // fresh one, so there is no diff to get wrong.
+        //
+        // Chosen over the two subtler options deliberately. Wrapping the publish
+        // in `disablesAnimations` governs how a diff is *applied*, not whether it
+        // runs, and only avoids the crash on versions where it happens to route
+        // `List` down a reload path — an implementation accident, where `.id()`
+        // is a documented identity contract. And swapping `OutlineGroup` for
+        // `DisclosureGroup`s does not help by itself: both compile down to the
+        // same `NSOutlineView` and the same coordinator, so it changes who owns
+        // the expansion bool, not who runs the diff. What *would* help there is
+        // collapsing a subtree before moving it — a day's work, and the reason to
+        // reach for it is that, not the DisclosureGroups.
+        //
+        // The cost, accepted knowingly: every move, new group or deleted group
+        // collapses the sidebar to its default expansion. Annoying exactly when
+        // reorganising — but restructuring is occasional, and a crash
+        // mid-reorganise is worse than re-expanding a folder.
+        //
+        // `treeIdentityVersion`, NOT `treeVersion` and NOT `treeStructureVersion`.
+        // `treeVersion` bumps on every tree walk, including after each delivery,
+        // which would throw the outline away whenever mail arrived.
+        // `treeStructureVersion` also moves on a *rename*, which rewrites only a
+        // display name — every row keeps its identity, nothing reparents, and
+        // SwiftUI's diff is safe for it. Only the identity graph matters here.
+        .id(treeIdentityVersion)
+        // Prints once per rebuild, so the next reorganise says plainly whether
+        // this fired, when, and how often. The crash it prevents is a SwiftUI
+        // assertion with none of our frames on the stack — there is nothing to
+        // instrument on the failing side, so instrument the fix instead.
+        .onAppear { PerfLog.mark("sidebar outline built (identity \(treeIdentityVersion))") }
     }
 
     /// The pinned system boxes and everything else, split off `tree` (already

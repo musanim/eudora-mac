@@ -36,9 +36,29 @@ enum BodyAntialiasing: String, CaseIterable, Identifiable {
         case .eudora: return "Eudora-style"
         }
     }
-    /// The HTML reader (WKWebView) can't do the pixel halo, so only `.system`
-    /// smooths there; `.off` and `.eudora` both render crisp (no bolding).
-    var htmlSmoothingOn: Bool { self == .system }
+    /// Whether the HTML reader antialiases at all.
+    ///
+    /// This setting means two different things in two places, which is worth
+    /// stating plainly because it isn't obvious from the name. The plain-text
+    /// reader is a real `NSTextView` with a custom draw, so all three modes are
+    /// real there. The HTML reader is a `WKWebView`, where the only lever is the
+    /// `-webkit-font-smoothing` CSS property — the Eudora halo cannot exist,
+    /// because it is a pixel pass over a cached bitmap and a web view will not
+    /// hand one over. So the three modes collapse to on or off.
+    ///
+    /// `.eudora` used to land on *off*, which was an accident rather than a
+    /// decision, and a bad one: `-webkit-font-smoothing: none` disables
+    /// antialiasing outright, which at 15px turns a light face — Optima, in the
+    /// message that exposed this — into something barely readable. Nothing
+    /// about Eudora 7 suggests "no smoothing at all" for HTML; it smoothed like
+    /// anything else. So `.eudora` now smooths here, and only `.off` doesn't.
+    ///
+    /// Note this is the one part of the HTML style block that is *not* a
+    /// fallback. `font-family`, `font-size` and `color` are set on `body`, so
+    /// any styling the sender applies overrides them and their mail arrives
+    /// looking as they intended. Smoothing inherits into every element and
+    /// applies to every character regardless of whose font it is.
+    var htmlSmoothingOn: Bool { self != .off }
 }
 
 @MainActor

@@ -27,12 +27,460 @@ func openSettingsWindowLegacy() {
     }
 }
 
+/// Whether Settings was open at quit, and where its form was scrolled to.
+///
+/// The window's *frame* is not here — AppKit's own frame autosave already
+/// remembers size and position (see `SettingsView.configureWindow`). This is the
+/// two things it doesn't cover.
+///
+/// It exists for the rebuild-and-retest loop: adjust a setting, quit, rebuild,
+/// run, and be put back where you were rather than hunting for the section
+/// again.
+enum SettingsWindowState {
+    private static let openKey = "SettingsWindowWasOpen"
+    private static let scrollKey = "SettingsWindowScrollY"
+
+    static var wasOpen: Bool {
+        get { UserDefaults.standard.bool(forKey: openKey) }
+        set { UserDefaults.standard.set(newValue, forKey: openKey) }
+    }
+
+    /// The form's scroll offset, in points from the top. `nil` when nothing has
+    /// been recorded — distinct from 0, which legitimately means "at the top".
+    static var scrollY: CGFloat? {
+        get {
+            guard UserDefaults.standard.object(forKey: scrollKey) != nil else { return nil }
+            return CGFloat(UserDefaults.standard.double(forKey: scrollKey))
+        }
+        set {
+            if let newValue { UserDefaults.standard.set(Double(newValue), forKey: scrollKey) }
+            else { UserDefaults.standard.removeObject(forKey: scrollKey) }
+        }
+    }
+
+    /// The name AppKit files the Settings window's frame under. Also how the
+    /// window is *recognised* at quit — see `recordWhetherOpen`.
+    static let frameAutosaveName = "EudoraSettingsWindow"
+
+    /// Record whether Settings is open. Called from `applicationWillTerminate`.
+    ///
+    /// Asked at quit rather than tracked as it happens, which is the difference
+    /// between working and not. SwiftUI's `Settings` scene keeps its window and
+    /// its hosting view alive after the window is closed — that is why `@State`
+    /// in a Settings pane survives a close and reopen — so a close observer
+    /// clears the flag, and the reopen doesn't reliably set it again, because
+    /// SwiftUI need not run `updateNSView` for a window it is merely showing
+    /// once more. One question at quit has no such edge.
+    ///
+    /// `isVisible` rather than existence: the window object outlives its closing.
+    @MainActor
+    static func recordWhetherOpen() {
+        let open = NSApp.windows.contains {
+            $0.frameAutosaveName == frameAutosaveName && $0.isVisible
+        }
+        wasOpen = open
+        // Forced, because the process is about to `exit()`. UserDefaults writes
+        // are asynchronous to disk, and `applicationWillTerminate` is the last
+        // moment there is — a write left in the buffer is a write that never
+        // happened. Deprecated in the sense that you shouldn't call it *often*,
+        // which this doesn't: once, at quit.
+        UserDefaults.standard.synchronize()
+        if SettingsWindowTracker.diagnose {
+            print("Settings diag: at quit, wasOpen=\(open). Windows:")
+            for w in NSApp.windows {
+                print("   autosave='\(w.frameAutosaveName)' visible=\(w.isVisible) "
+                      + "title='\(w.title)' class=\(type(of: w))")
+            }
+        }
+    }
+
+    /// Reopen Settings if it was open when the app last quit.
+    ///
+    /// Deliberately *not* using `SettingsLink`, which is the sanctioned route on
+    /// macOS 14+ but is a `View` — it can only be clicked, never invoked. The
+    /// selector is the only programmatic opener there is. It is deprecated on 14+
+    /// and logs a "Please use SettingsLink" warning, which is noise rather than
+    /// breakage.
+    ///
+    /// Both spellings are tried because Apple renamed it: `showSettingsWindow:`
+    /// is the modern one, `showPreferencesWindow:` the older, and which responds
+    /// has moved between releases. `sendAction` reports whether anything handled
+    /// it, so this asks rather than assumes.
+    ///
+    /// **Waits for the splash to come down**, rather than opening on a timer.
+    /// Opening a titled window while the splash is up trips the watcher armed in
+    /// `SplashWindow.arm()`, which takes any such window for the main one: at
+    /// best it re-centres the splash over Settings, at worst it hides Settings in
+    /// the main window's place and leaves the real main window invisible. The
+    /// tree open blocks the main thread for several seconds, so any fixed delay
+    /// short enough to feel responsive would land inside that window.
+    @MainActor
+    static func reopenIfItWasOpen(attemptsLeft: Int = 40) {
+        if SettingsWindowTracker.diagnose, attemptsLeft == 40 {
+            print("Settings diag: at launch, wasOpen=\(wasOpen), "
+                  + "splash showing=\(SplashWindow.isShowing)")
+        }
+        guard wasOpen else { return }
+        guard !SplashWindow.isShowing else {
+            guard attemptsLeft > 0 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                reopenIfItWasOpen(attemptsLeft: attemptsLeft - 1)
+            }
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NSApp.activate(ignoringOtherApps: true)
+            // Two routes, tried in order, each *verified by looking for the
+            // window* rather than by what it returns.
+            //
+            // `sendAction`'s answer cannot be trusted here. On macOS 14+ the
+            // deprecated selector is still accepted by a responder — which makes
+            // `sendAction` return `true` — and then does nothing but log "Please
+            // use SettingsLink". Observed on macOS 26: handled=true, no window,
+            // `SettingsView` never even evaluated. Believing the return value is
+            // what made the first version of this silently fail.
+            _ = NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            _ = NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                if isOpen {
+                    if SettingsWindowTracker.diagnose { print("Settings diag: selector opened it") }
+                    return
+                }
+                // The menu item, performed on its own target rather than sent
+                // down the responder chain. This is the route the *user* takes
+                // when they pick Settings from the app menu, so whatever SwiftUI
+                // wires that item to is by definition still a working opener —
+                // which the bare selector no longer is. Finding it by action
+                // rather than by title is the house style; see
+                // `MinimizeKeyStripper.minimizeItem`.
+                if let (menu, index) = settingsMenuItem() {
+                    menu.performActionForItem(at: index)
+                } else if SettingsWindowTracker.diagnose {
+                    print("Settings diag: no ⌘, item found in the app menu")
+                }
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    if isOpen {
+                        if SettingsWindowTracker.diagnose { print("Settings diag: menu opened it") }
+                        return
+                    }
+                    // Last resort, and the most likely to work: click a real
+                    // `SettingsLink`. See `HiddenSettingsLink`.
+                    let clicked = SettingsLinkOpener.click()
+                    if SettingsWindowTracker.diagnose {
+                        print("Settings diag: menu route failed; hidden SettingsLink "
+                              + (clicked ? "clicked" : "NOT FOUND"))
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        if SettingsWindowTracker.diagnose {
+                            print("Settings diag: after link route, open=\(isOpen)")
+                        }
+                        if !isOpen {
+                            print("Settings: could not reopen — selector, app-menu item "
+                                  + "and SettingsLink all failed.")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the Settings window is on screen right now.
+    @MainActor
+    static var isOpen: Bool {
+        NSApp.windows.contains {
+            $0.frameAutosaveName == frameAutosaveName && $0.isVisible
+        }
+    }
+
+    /// The app menu's Settings item.
+    ///
+    /// Found by its **⌘,** key equivalent, not by its action. Looking for
+    /// `showSettingsWindow:`/`showPreferencesWindow:` found nothing on macOS 26 —
+    /// SwiftUI wires the item to something of its own now — whereas ⌘, is the
+    /// shortcut Apple has published for this item since forever, and unlike the
+    /// title it doesn't move with localisation.
+    @MainActor
+    private static func settingsMenuItem() -> (NSMenu, Int)? {
+        guard let appMenu = NSApp.mainMenu?.items.first?.submenu else { return nil }
+        if SettingsWindowTracker.diagnose {
+            print("Settings diag: app menu contents —")
+            for item in appMenu.items {
+                let action = item.action.map(NSStringFromSelector) ?? "(none)"
+                print("   '\(item.title)'  key='\(item.keyEquivalent)'  action=\(action)"
+                      + "  enabled=\(item.isEnabled)")
+            }
+        }
+        for (index, item) in appMenu.items.enumerated()
+        where item.keyEquivalent == "," && item.keyEquivalentModifierMask.contains(.command) {
+            return (appMenu, index)
+        }
+        return nil
+    }
+}
+
+/// The one opener Apple hasn't taken away.
+///
+/// `SettingsLink` is the sanctioned way to open the Settings scene on macOS 14+,
+/// and it is a `View`: it can be clicked but not called. So the app keeps one,
+/// one point square and effectively invisible, in the main window — and when
+/// Settings has to be reopened programmatically, the `NSButton` behind it is
+/// found and sent `performClick(_:)`.
+///
+/// **Measured on macOS 26, 2026jul30, and the reason this exists** — both honest
+/// routes are dead there, and each fails in a way that looks like success:
+///
+/// - `NSApp.sendAction(Selector(("showSettingsWindow:")))` returns **`true`** and
+///   does nothing. A responder accepts it, logs "Please use SettingsLink", and
+///   no window is created — `SettingsView` isn't even evaluated. Believing that
+///   return value is what made the first two attempts at this silently fail.
+/// - The app menu's Settings item is no longer wired to `showSettingsWindow:` or
+///   `showPreferencesWindow:` at all, so finding it by action returns nil. (It is
+///   still findable by its ⌘, key equivalent, which is what `settingsMenuItem`
+///   now does.)
+///
+/// So: never trust an opener's return value — check for the window. All three
+/// routes are kept, in ascending order of desperation, because the earlier two
+/// are correct on earlier systems and cost nothing to try.
+struct HiddenSettingsLink: View {
+    var body: some View {
+        if #available(macOS 14, *) {
+            SettingsLink { Color.clear.frame(width: 1, height: 1) }
+                .buttonStyle(.plain)
+                .background(SettingsLinkGrabber())
+                .frame(width: 1, height: 1)
+                .opacity(0.01)
+                .accessibilityHidden(true)
+        }
+    }
+}
+
+/// Finds the `NSButton` that `SettingsLink` renders as, and remembers it.
+private struct SettingsLinkGrabber: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        // Deferred: during this layout pass the button may not be in the
+        // hierarchy yet. Same reason every other bridge in this app retries.
+        DispatchQueue.main.async {
+            guard SettingsLinkOpener.button == nil, let parent = nsView.superview else { return }
+            SettingsLinkOpener.button = Self.firstButton(in: parent)
+        }
+    }
+
+    /// The background view is a *sibling* of the link, so the search starts at
+    /// their shared parent. That subtree holds nothing else clickable — the link
+    /// is one point square with an empty label — so the first button found is it.
+    private static func firstButton(in view: NSView) -> NSButton? {
+        if let b = view as? NSButton { return b }
+        for sub in view.subviews {
+            if let found = firstButton(in: sub) { return found }
+        }
+        return nil
+    }
+}
+
+@MainActor
+enum SettingsLinkOpener {
+    static weak var button: NSButton?
+
+    /// Click the hidden link. Returns whether there was one to click.
+    @discardableResult
+    static func click() -> Bool {
+        guard let button else { return false }
+        button.performClick(nil)
+        return true
+    }
+}
+
+/// Watches the Settings window so its open/closed state and scroll position
+/// survive a quit.
+///
+/// A class, held by `@StateObject`, because it owns notification tokens that
+/// have to outlive a body evaluation and be removed exactly once. Not an
+/// `NSWindowDelegate`: SwiftUI owns the Settings window's delegate and taking it
+/// would break whatever it uses it for.
+@MainActor
+final class SettingsWindowTracker: ObservableObject {
+    /// Holds the notification tokens so they are removed exactly once, when the
+    /// tracker goes away.
+    ///
+    /// A separate, *non*-isolated class purely so its `deinit` can touch its own
+    /// storage: a `@MainActor` type's `deinit` cannot read main-actor properties
+    /// before Swift 6.1's isolated deinit, so tokens held directly here could
+    /// never be removed. Same shape as `SplashWindow`'s observer handling.
+    private final class ObserverBox: @unchecked Sendable {
+        var tokens: [NSObjectProtocol] = []
+        deinit { tokens.forEach(NotificationCenter.default.removeObserver) }
+    }
+    private let observers = ObserverBox()
+
+    private weak var window: NSWindow?
+    private var saveGeneration = 0
+
+    /// True while `restore` is still re-asserting the saved offset, so its own
+    /// programmatic scrolls aren't recorded as the user's.
+    ///
+    /// Without this the feature walks itself back to the top: the early restore
+    /// attempts clamp against a form that hasn't reached full height, each
+    /// clamped position is recorded, and the shallower value is what next launch
+    /// restores. `TableScrollStateSyncer` gates its recorder the same way, for
+    /// the same reason.
+    private var isRestoring = false
+
+    /// Idempotent: `configureWindow` runs on every body evaluation, which for a
+    /// pane whose stores publish per keystroke is every character typed.
+    ///
+    /// Note this does **not** record that Settings is open — that question is
+    /// asked once at quit, in `SettingsWindowState.recordWhetherOpen`, because
+    /// SwiftUI reuses this window and view across a close and reopen and there
+    /// is no reliable "opened again" moment to hook.
+    func attach(to w: NSWindow) {
+        guard window !== w else { return }
+        window = w
+        attachScrollRecorder(in: w, attemptsLeft: 12)
+    }
+
+    /// Find the form's scroll view, restore the saved offset, and record further
+    /// scrolling.
+    ///
+    /// Retried because the `NSScrollView` doesn't exist during the layout pass
+    /// that first resolves the window, and its document height keeps growing for
+    /// several turns afterwards as SwiftUI settles the form — the same lesson as
+    /// `TableScrollStateSyncer.verifyPendingScroll`, learned there the hard way.
+    private func attachScrollRecorder(in w: NSWindow, attemptsLeft: Int) {
+        guard observers.tokens.isEmpty else { return }
+        guard let scrollView = Self.tallestScrollView(in: w.contentView) else {
+            if attemptsLeft > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak w] in
+                    guard let self, let w else { return }
+                    self.attachScrollRecorder(in: w, attemptsLeft: attemptsLeft - 1)
+                }
+            }
+            return
+        }
+        if Self.diagnose {
+            print("Settings scroll: found \(type(of: scrollView))"
+                  + "  doc height \(scrollView.documentView?.frame.height ?? -1)"
+                  + "  clip height \(scrollView.contentView.bounds.height)"
+                  + "  saved \(String(describing: SettingsWindowState.scrollY))")
+        }
+
+        let clip = scrollView.contentView
+        clip.postsBoundsChangedNotifications = true
+        observers.tokens.append(NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification, object: clip, queue: .main
+        ) { [weak self] note in
+            // Straight off the notification: the clip view that changed is the
+            // one being asked about, and reading `self` synchronously here would
+            // be touching main-actor state from a block that isn't isolated —
+            // which `SplashWindow` and `TableScrollStateSyncer` both go out of
+            // their way to avoid. It would also re-walk the whole view hierarchy
+            // on every scroll tick.
+            guard let clipView = note.object as? NSClipView else { return }
+            let y = clipView.bounds.origin.y
+            Task { @MainActor in self?.record(y) }
+        })
+
+        if let saved = SettingsWindowState.scrollY {
+            isRestoring = true
+            restore(saved, in: scrollView, attemptsLeft: 10, lastMaxY: -1)
+        }
+    }
+
+    /// Printed once when the form's scroll view is located, or not at all if it
+    /// never is. Off, intact, in the manner of the other diagnostics here.
+    ///
+    /// The question it answers: grouped `Form` is backed by a real `NSScrollView`
+    /// on macOS 13–15, but SwiftUI's form rendering has changed since and this
+    /// cannot be checked without running it. If the scroll position never comes
+    /// back, turn this on — silence means the retry loop expired without finding
+    /// anything, which is a different problem from finding it and mis-scrolling.
+    ///
+    /// Also covers the open/closed half: what `recordWhetherOpen` saw at quit,
+    /// what `reopenIfItWasOpen` found at launch, which of the three opener
+    /// routes worked, and a dump of the app menu. Switching this on is what
+    /// found the macOS 26 behaviour recorded on `HiddenSettingsLink` — three
+    /// builds' worth of guessing replaced by one run.
+    static let diagnose = false
+
+    /// Coalesced, because scrolling posts these continuously and each write is a
+    /// UserDefaults hit. Same generation-token trick as `AppModel.rememberScroll`.
+    private func record(_ y: CGFloat) {
+        guard !isRestoring else { return }
+        saveGeneration += 1
+        let generation = saveGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self, self.saveGeneration == generation else { return }
+            SettingsWindowState.scrollY = y
+        }
+    }
+
+    /// Scroll to `y`, and keep re-asserting it while the form is still growing.
+    ///
+    /// A single scroll lands short: at the moment the scroll view first exists,
+    /// its document is a fraction of its final height, so the offset clamps to
+    /// whatever fits and the pane comes back near the top. Re-applying until the
+    /// position sticks is what makes a deep section actually reappear.
+    private func restore(_ y: CGFloat, in scrollView: NSScrollView,
+                         attemptsLeft: Int, lastMaxY: CGFloat) {
+        let clip = scrollView.contentView
+        let maxY = max(0, (scrollView.documentView?.frame.height ?? 0) - clip.bounds.height)
+        let target = min(y, maxY)
+        clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: target))
+        scrollView.reflectScrolledClipView(clip)
+
+        // Stop when we've landed on `target` *and* the document has stopped
+        // growing. Comparing against the raw `y` instead would never converge
+        // whenever the saved offset is deeper than the form can now scroll — a
+        // shorter window, or a collapsed section — and it would then re-assert
+        // ten times over a second and a half, fighting the user if they scrolled
+        // meanwhile.
+        let landed = abs(clip.bounds.origin.y - target) <= 1
+        let settled = abs(maxY - lastMaxY) <= 1
+        guard attemptsLeft > 0, !(landed && settled) else {
+            isRestoring = false
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self else { return }
+            self.restore(y, in: scrollView, attemptsLeft: attemptsLeft - 1, lastMaxY: maxY)
+        }
+    }
+
+    /// The scroll view with the tallest document, not merely the first found.
+    ///
+    /// Today the grouped `Form` is the only scrollable thing in this window, so
+    /// either rule picks it. "Tallest" is chosen because it stays right if a
+    /// section ever gains a nested `List` or `TextEditor` — where "first" would
+    /// silently start scrolling the wrong thing, and the symptom would be the
+    /// pane not restoring rather than anything that points at the cause.
+    private static func tallestScrollView(in view: NSView?) -> NSScrollView? {
+        guard let view else { return nil }
+        var best: NSScrollView?
+        func walk(_ v: NSView) {
+            if let s = v as? NSScrollView {
+                let h = s.documentView?.frame.height ?? 0
+                if h > (best?.documentView?.frame.height ?? -1) { best = s }
+            }
+            v.subviews.forEach(walk)
+        }
+        walk(view)
+        return best
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var accounts: AccountStore
     @EnvironmentObject var composeSettings: ComposeSettings
     /// The Settings window, so Save can close it. Captured by `WindowGrabber`.
     @State private var window: NSWindow?
+
+    /// Remembers that this window was open, and where its form was scrolled to,
+    /// so a quit-rebuild-run cycle puts you back where you were.
+    @StateObject private var tracker = SettingsWindowTracker()
 
     /// The "me" set editor's in-progress new entry and last rescan result.
     @State private var newIdentity = ""
@@ -51,7 +499,10 @@ struct SettingsView: View {
 
     /// Where AppKit files the window's frame. Any string works as long as it
     /// stays stable — changing it silently forgets the remembered size.
-    private static let frameAutosaveName = "EudoraSettingsWindow"
+    ///
+    /// Shared with `SettingsWindowState`, which uses it at quit to pick this
+    /// window out of `NSApp.windows`. One constant, so the two can't drift.
+    private static let frameAutosaveName = SettingsWindowState.frameAutosaveName
 
     /// Make the Settings window vertically resizable, and have AppKit remember
     /// its frame across launches.
@@ -98,6 +549,13 @@ struct SettingsView: View {
         // already states — and a second, hand-set copy of the same numbers is
         // one more thing to disagree with it. The earlier attempt set them and
         // they were simply overwritten.
+
+        // After the frame work above, so the scroll restore measures a window
+        // that is already its remembered size — restoring an offset against the
+        // default height and then resizing would leave it pointing somewhere
+        // else. `attach` is idempotent and returns immediately for a window it
+        // has already seen.
+        tracker.attach(to: w)
 
         Self.logSizing(w)
     }
@@ -350,6 +808,11 @@ struct SettingsView: View {
                 Picker("Antialiasing", selection: $composeSettings.bodyAntialiasing) {
                     ForEach(BodyAntialiasing.allCases) { Text($0.label).tag($0) }
                 }
+                Text("Eudora-style applies when reading plain text. HTML mail is "
+                        + "drawn by the system web view, which can't do the halo, "
+                        + "so there it means ordinary smoothing — only None turns "
+                        + "smoothing off there.")
+                    .font(.caption).foregroundStyle(.secondary)
                 if composeSettings.bodyAntialiasing == .eudora {
                     HStack {
                         Text("Halo lightness")
@@ -359,8 +822,10 @@ struct SettingsView: View {
                             + "edge, the way Eudora 7 did. Slide right for a lighter halo.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Text("Used to compose messages and to read plain-text and unstyled "
-                        + "mail. On your screen only — sent mail carries no font "
+                Text("Used to compose messages, to read plain text, and as the "
+                        + "fallback for HTML mail — a sender's own font, size and "
+                        + "colour override it, so their mail looks as they meant "
+                        + "it to. On your screen only; sent mail carries no font "
                         + "unless you style it.")
                     .font(.caption).foregroundStyle(.secondary)
             }

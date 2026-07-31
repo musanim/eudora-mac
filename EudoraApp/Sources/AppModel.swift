@@ -427,12 +427,31 @@ final class AppModel: ObservableObject {
     ///
     /// Those menus are now AppKit and lazy (see MoveToMenu.swift), so they hold
     /// no items to invalidate and don't need the distinction. Kept because it is
-    /// cheap and any future view that draws the tree's shape will want it; drop
-    /// it, with `treeShape` and `shapeSignature`, if none appears.
+    /// cheap and any future view that draws the tree's shape will want it.
     @Published private(set) var treeStructureVersion = 0
 
     /// Hash of the last published shape, to tell the two apart.
     private var treeShape = 0
+
+    /// Bumped when the tree's *identity graph* changes — ids, folder-ness or
+    /// order. Narrower than `treeStructureVersion`, which also moves on a
+    /// rename.
+    ///
+    /// **Do not remove this, and do not widen it.** It is the sidebar `List`'s
+    /// `.id()` (see `MailboxTree`), and it is what stops SwiftUI diffing a
+    /// restructured outline — a diff that crashed the app outright on
+    /// 2026jul30 when expanded groups were moved into a new one. Every bump
+    /// discards and rebuilds the sidebar, collapsing it, so anything added to
+    /// the signature is paid for by the user on every occurrence of it.
+    ///
+    /// A rename is deliberately *excluded*: it rewrites only the descmap
+    /// display field, every row keeps its identity, nothing reparents, and
+    /// SwiftUI's diff handles it safely. Renaming is a normal action, not a
+    /// restructuring one, and it shouldn't collapse 6,699 rows.
+    @Published private(set) var treeIdentityVersion = 0
+
+    /// Hash of the last published identity graph.
+    private var treeIdentity = 0
     @Published var status: String = "No Eudora folder open."
 
     // Selected mailbox (sidebar) and message (table), by their ids. Reactions
@@ -492,6 +511,28 @@ final class AppModel: ObservableObject {
                                 self.inboxHasNewMail = false
                             }
                         }
+                        // Refuse a nil the List writes because the selected row
+                        // isn't among the ones it has realized.
+                        //
+                        // It already did this transiently while reconciling
+                        // against a replaced tree, and it was harmless because
+                        // the right value was written back in the same drain.
+                        // Since the sidebar rebuilds outright on a structural
+                        // change (`MailboxTree`'s `.id()`), the new outline
+                        // starts *collapsed* — so a mailbox nested in a group is
+                        // genuinely not a realized row, nothing writes back, and
+                        // the nil sticks: `onChange` fires, `loadListing` runs,
+                        // and a rename of some unrelated folder silently drops
+                        // the user out of the mailbox they were reading.
+                        //
+                        // Safe to refuse because every deliberate clear —
+                        // `deleteMailbox`, `moveIntoGroup`, `open` — assigns
+                        // `selectedMailboxID` directly rather than through this
+                        // binding. `itemsByID` is rebuilt in the same block as
+                        // `tree`, so it always describes what the List is
+                        // reconciling against.
+                        if new == nil, let current = self.selectedMailboxID,
+                           self.itemsByID[current] != nil { return }
                         self.selectedMailboxID = new
                     }
                 })
@@ -913,6 +954,21 @@ final class AppModel: ObservableObject {
         tree = Self.buildItems(nodes, prefix: "",
                                outboxUnsent: Self.outboxHasUnsent(in: nodes, store: s))
         treeVersion &+= 1
+        // Seeded in the same turn as the tree itself, for both halves of the
+        // invariant `startTreeReload` keeps.
+        //
+        // Without the bump, opening a different Eudora folder replaces every
+        // item under an *unchanged* sidebar `.id()`, so SwiftUI diffs one
+        // folder's outline against another's — the most extreme restructure
+        // there is, and the exact crash path `treeIdentityVersion` exists to
+        // close. Without seeding the two signatures, they stay 0 while the real
+        // tree is on screen, and the first reload for any reason — a delivery,
+        // a mark-as-read — reads as a structural change and collapses the
+        // sidebar for a message count.
+        treeShape = Self.shapeSignature(tree)
+        treeIdentity = Self.identitySignature(tree)
+        treeStructureVersion &+= 1
+        treeIdentityVersion &+= 1
         itemsByID = [:]
         indexItems(tree)
         // Abandon anything still running against the *previous* tree. Without
@@ -1240,6 +1296,22 @@ final class AppModel: ObservableObject {
     /// A hash of everything the Move menus draw: ids, labels, folder-ness and
     /// nesting. Deliberately excludes `messageCount` and `hasUnread`, which are
     /// the only things our own mutations change.
+    /// A hash of the tree's identity graph: ids, folder-ness and order, but
+    /// **not** display names. Keys the sidebar's `.id()` — see
+    /// `treeIdentityVersion` for why a rename must not move it.
+    private static func identitySignature(_ items: [MailboxItem]) -> Int {
+        var hasher = Hasher()
+        func walk(_ items: [MailboxItem]) {
+            for item in items {
+                hasher.combine(item.id)
+                hasher.combine(item.isFolder)
+                if let kids = item.children { walk(kids) }
+            }
+        }
+        walk(items)
+        return hasher.finalize()
+    }
+
     private static func shapeSignature(_ items: [MailboxItem]) -> Int {
         var hasher = Hasher()
         func walk(_ items: [MailboxItem]) {
@@ -3121,6 +3193,13 @@ final class AppModel: ObservableObject {
             guard self.treeReloadGeneration == generation else { return }
             let items = Self.buildItems(nodes, prefix: "", outboxUnsent: outboxUnsent)
             let shape = Self.shapeSignature(items)
+            let identity = Self.identitySignature(items)
+            // **These four assignments must stay in one synchronous block.**
+            // The sidebar's `.id(treeIdentityVersion)` only protects it if
+            // SwiftUI observes the new tree and the new identity in a single
+            // update; deferring the bump by so much as a runloop hop would let
+            // the new data render under the old identity, which is a diff of a
+            // restructured outline — the thing that crashed. See `MailboxTree`.
             self.tree = items
             self.treeVersion &+= 1
             // Only when the shape actually moved. Hashing 6,699 ids costs
@@ -3128,6 +3207,12 @@ final class AppModel: ObservableObject {
             if shape != self.treeShape {
                 self.treeShape = shape
                 self.treeStructureVersion &+= 1
+            }
+            // Updated inside the `if`, like the shape, so the second walk of a
+            // coalesced pair sees the same identity and doesn't rebuild twice.
+            if identity != self.treeIdentity {
+                self.treeIdentity = identity
+                self.treeIdentityVersion &+= 1
             }
             self.itemsByID = [:]
             self.indexItems(self.tree)

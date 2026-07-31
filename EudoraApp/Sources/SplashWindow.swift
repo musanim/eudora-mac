@@ -179,6 +179,16 @@ enum SplashWindow {
     /// move can't resurrect it.
     private static var hasRun = false
 
+    /// Whether the splash is currently on screen.
+    ///
+    /// Read by `SettingsWindowState.reopenIfItWasOpen`, which must not open a
+    /// window while this is up: the watcher armed in `arm()` treats any new
+    /// titled window as the main one, and would either re-centre the splash over
+    /// Settings or — if the main window hasn't been identified yet — hide
+    /// *Settings* in its place and leave the real main window at alpha 0 for
+    /// good.
+    static var isShowing: Bool { window != nil }
+
     private static func center(_ panel: NSWindow, over main: NSWindow) {
         let size = panel.frame.size
         let frame = main.frame
