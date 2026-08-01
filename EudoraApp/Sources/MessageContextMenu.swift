@@ -322,6 +322,10 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         // what is set here is what shows.
         add("Reply", #selector(reply), enabled: n == 1)
         add("Forward", #selector(forward), enabled: n == 1)
+        // Any number, unlike Reply and Forward above: each selected message
+        // becomes its own attachment on one new mail.
+        add(n == 1 ? "Forward as Attachment" : "Forward \(n) as Attachments",
+            #selector(forwardAsAttachment), enabled: n >= 1)
         // "Send Again" only for a single, successfully-sent message: it opens a
         // fresh editable copy (see `AppModel.sendAgain`). Shown only when it
         // applies rather than greyed out, since it's meaningless on received or
@@ -372,6 +376,9 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
 
     @objc private func reply() { actOnClickedRows { model.reply(all: false) } }
     @objc private func forward() { actOnClickedRows { model.forward() } }
+    @objc private func forwardAsAttachment() {
+        actOnClickedRows { model.forwardAsAttachment() }
+    }
     // Reads the clicked message by index and opens a copy; no need to move the
     // selection first, since it doesn't act on `selectedMessageID`.
     @objc private func sendAgain() {

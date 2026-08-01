@@ -386,8 +386,14 @@ struct ComposeView: View {
                 .font(.callout.weight(.semibold))
             }
             if sending { ProgressView().controlSize(.small) }
+            // **No keyboard shortcut, deliberately.** This was ⌘D ("Eudora's
+            // Send") until ⌘D became Delete in the message list, where Stephen
+            // wants it and where Eudora put it. Send is not merely rebound but
+            // left bare, for the reason he gave for disliking Eudora 7: there
+            // ⌘S sent, his fingers expected Save, and he sent mail by accident.
+            // An irreversible action a keystroke away from a reflex is the thing
+            // to avoid. Send is a click, like Forward is a menu item.
             Button("Send") { send() }
-                .keyboardShortcut("d", modifiers: .command)   // ⌘D, Eudora's Send
                 // `wasSent` as well as `sending`: if delivery succeeded but
                 // writing it to Out failed, the window stays open showing that
                 // error — and Send must not still be live, or the obvious

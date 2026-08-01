@@ -204,6 +204,13 @@ struct EudoraApp: App {
                     .keyboardShortcut("u", modifiers: .command)
             }
             .disabled(!messageCommandsEnabled)
+            // Outside the Group because it acts on the whole selection, like
+            // Delete — Reply and Forward above require exactly one message,
+            // this one takes as many as are selected and attaches each.
+            // No shortcut: a deliberate, occasional act (reporting messages),
+            // not something to fire by reflex.
+            Button("Forward as Attachment") { model.forwardAsAttachment() }
+                .disabled(!deleteCommandEnabled)
             Divider()
             // Outside the Group deliberately: this is a view mode, not an action
             // on a message, so it stays usable with nothing selected — you turn
@@ -214,8 +221,17 @@ struct EudoraApp: App {
             Toggle("Blah Blah Blah (All Headers)", isOn: $model.showAllHeaders)
                 .keyboardShortcut("b", modifiers: [.command, .shift])
             Divider()
+            // ⌘D, which is what Eudora used and what Stephen's hands expect.
+            // ⌘⌫ still works — it is registered by a hidden button in the main
+            // window (see `DeleteBackspaceShortcut`) rather than by a second menu
+            // item, because two Delete entries advertising two keys reads as a
+            // mistake, the same objection recorded against duplicating ⌘N.
+            //
+            // Being a menu shortcut, this is matched before any window's own key
+            // equivalents — so it must stay `.disabled` whenever it shouldn't
+            // act, or it silently eats ⌘D from every other window in the app.
             Button("Delete") { model.deleteSelected() }
-                .keyboardShortcut(.delete, modifiers: .command)
+                .keyboardShortcut("d", modifiers: .command)
                 .disabled(!deleteCommandEnabled)
         }
     }

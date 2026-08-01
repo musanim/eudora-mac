@@ -130,12 +130,33 @@ struct FindView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
 
-            Button(action: runSearch) {
-                Label("Search", systemImage: "magnifyingglass")
+            // Two buttons rather than one with conditional modifiers: the
+            // prominent and bordered styles are different types, so they can't
+            // be swapped on one view.
+            //
+            // The prominent blue is what invites the click; going plain and
+            // saying "Searching…" both reports the state and removes the
+            // invitation, which is what a disabled control should look like.
+            // The spinner earns its place on the long searches — a whole-tree
+            // query over a large index — and is harmless on the quick ones,
+            // where the whole thing is gone before it can draw.
+            if model.isSearching {
+                Button(action: {}) {
+                    HStack(spacing: 5) {
+                        ProgressView().controlSize(.small).scaleEffect(0.7)
+                        Text("Searching…")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(true)
+            } else {
+                Button(action: runSearch) {
+                    Label("Search", systemImage: "magnifyingglass")
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .disabled(model.isIndexing)
             }
-            .keyboardShortcut(.defaultAction)
-            .buttonStyle(.borderedProminent)
-            .disabled(model.isIndexing)
         }
     }
 

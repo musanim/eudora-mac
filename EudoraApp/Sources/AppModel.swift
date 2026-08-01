@@ -727,6 +727,37 @@ final class AppModel: ObservableObject {
 
     @Published var listingSource: String = ""
     @Published var mailboxSummary: String = ""
+
+    /// The selected mailbox as a readable path — "GOVERNMENT ▸ USPTO".
+    ///
+    /// Computed here rather than folded into `mailboxSummary` because that
+    /// string is built by `buildListing`, which runs *off* the main actor and
+    /// has no access to the tree. This needs `itemsByID`, which is main-actor
+    /// state, so it belongs on this side.
+    ///
+    /// **Display names, not the id.** A `MailboxItem.ID` is already a path, but
+    /// of *filenames* — the GOVERNMENT group's is `GOVERNMENT.fol`, and the
+    /// PROJECTS one is `______PROJECTS.fol` — so showing the id would put
+    /// Eudora's on-disk spelling in front of the user. The id's components are
+    /// walked instead, and each successive prefix is resolved back through
+    /// `itemsByID` to the name descmap gives it.
+    ///
+    /// Cheap enough to be a computed property: a split and a handful of
+    /// dictionary lookups, on a path that is two or three deep.
+    var selectedMailboxPath: String {
+        guard let id = selectedMailboxID,
+              let item = itemsByID[id], !item.isFolder else { return "" }
+        var names: [String] = []
+        var prefix = ""
+        for component in id.split(separator: "/") {
+            prefix = prefix.isEmpty ? String(component) : prefix + "/" + component
+            // Falling back to the raw component keeps this honest if a prefix
+            // ever fails to resolve — better an odd-looking filename than a
+            // silently shortened path that names the wrong mailbox.
+            names.append(itemsByID[prefix]?.display ?? String(component))
+        }
+        return names.joined(separator: " ▸ ")
+    }
     @Published var preview: MessagePreview?
 
     /// True while the mailbox's rows are being built (reading and scanning the
@@ -2799,6 +2830,155 @@ final class AppModel: ObservableObject {
             references: refs))
     }
 
+    /// Forward the selected message as an `.eml` attachment rather than as
+    /// quoted text.
+    ///
+    /// What this is for: reporting. Abuse desks, ISPs and fraud reporting
+    /// services all ask for the original *as an attachment*, because an ordinary
+    /// forward keeps only the body — the headers that say where a message
+    /// actually came from are thrown away by the forwarding, and pasted text
+    /// could have been typed by anyone. The attached bytes are the ones that
+    /// arrived.
+    ///
+    /// Nothing is quoted into the body: the recipient is going to open the
+    /// attachment, and a quoted copy above it is just a second, worse version of
+    /// the same evidence. The body is left empty for whatever the user wants to
+    /// say about it.
+    func forwardAsAttachment() {
+        guard let store, let sel = currentSelectionSet() else {
+            showError("Select a message to forward.")
+            return
+        }
+        // Taken from `rows` rather than from the selection set, so the
+        // attachments arrive in the order the user sees them rather than in
+        // whatever order a `Set` iterates.
+        let chosen = rows.filter { selectedMessageIDs.contains($0.id) }
+
+        var attachments: [OutgoingMessage.Attachment] = []
+        var firstSubject = ""
+        var takenNames = Set<String>()
+        for row in chosen {
+            // `row.offset` and `row.size` are the record's own offset and
+            // length, straight from the listing — so this is one seek and one
+            // bounded read per message. Deliberately *not* `message(at:index:)`,
+            // which reads and scans the whole `.mbx` for each call: on Trash
+            // that would be 613 MB per selected message, on the main actor.
+            guard let raw = store.rawMessage(at: sel.item.base,
+                                             offset: row.offset,
+                                             length: row.size) else { continue }
+            // Parsed from the bytes already in hand, not re-read from disk. The
+            // `.toc`'s cached subject would have done for a filename, but it is
+            // Latin-1 and truncated to 63 characters, and this costs no I/O.
+            let subject = HeaderDecoder.decode(
+                MIMEParser.parse([UInt8](raw)).header("Subject") ?? "")
+            if firstSubject.isEmpty { firstSubject = subject }
+            attachments.append(
+                OutgoingMessage.Attachment(
+                    filename: Self.uniqueFilename(Self.emlFilename(for: subject),
+                                                  taken: &takenNames),
+                    // **`application/octet-stream`, not `message/rfc822`, and
+                    // this is deliberate — don't "fix" it.**
+                    //
+                    // `message/rfc822` is the obvious type and it is the wrong
+                    // one here, because `MessageBuilder` base64-encodes every
+                    // attachment. RFC 2046 §5.2.1 permits only 7bit, 8bit or
+                    // binary on a `message/*` part, and parsers enforce that in
+                    // the worst possible way: Python's `email` package — which
+                    // most abuse-desk and ISP intake scripts are built on — sees
+                    // `maintype == "message"` and recursively parses the payload
+                    // *without* applying the transfer encoding. The base64 blob
+                    // becomes a nested "message" of gibberish headers, and the
+                    // report arrives containing nothing usable. Apple Mail
+                    // mishandles it too, showing an attachment that opens empty.
+                    //
+                    // Base64 itself is not negotiable: the store holds LF-only
+                    // and 8-bit messages, and embedding those verbatim invites
+                    // an MTA to rewrite the line endings — corrupting the
+                    // evidence in exactly the way attaching the original was
+                    // meant to prevent.
+                    //
+                    // So: an opaque type, which *requires* base64, so every
+                    // parser decodes it and gets the bytes back octet-for-octet.
+                    // The `.eml` extension is what tells Mail, Thunderbird and
+                    // Outlook to open it as a message. The cost is a file icon
+                    // rather than an inline attached-message preview, which is a
+                    // fair trade for a report that can be read at the other end.
+                    mimeType: "application/octet-stream",
+                    data: raw))
+        }
+        guard !attachments.isEmpty else {
+            showError("Couldn't read "
+                      + (chosen.count == 1 ? "that message" : "those messages")
+                      + " from the mailbox.")
+            return
+        }
+
+        // One message keeps its own subject, which is what makes a single
+        // forward read naturally. Several get a count instead: a subject naming
+        // one of four messages is worse than no subject at all, because it
+        // reads as a report about that one.
+        let subject: String
+        if attachments.count == 1 {
+            subject = firstSubject.lowercased().hasPrefix("fwd:")
+                ? firstSubject : "Fwd: \(firstSubject)"
+        } else {
+            subject = "Fwd: \(attachments.count) messages"
+        }
+        var draft = ComposeDraft(
+            subject: subject,
+            // A line of body rather than nothing. An empty body with a single
+            // binary attachment is a shape spam filters score badly — a poor way
+            // for a report about a scam to be discarded — and it gives the user
+            // somewhere to start typing.
+            body: attachments.count == 1
+                ? "The original message is attached.\n\n"
+                : "The original messages are attached.\n\n")
+        draft.attachments = attachments
+        beginCompose(draft)
+    }
+
+    /// A filename not already used by another attachment on this draft.
+    ///
+    /// Needed because the names come from *subjects*, and the messages worth
+    /// forwarding together are exactly the ones likely to share one — four
+    /// rounds of the same phishing run arrive as four "Your account has been
+    /// suspended". Without this they would all be `Your account…​.eml`, and a
+    /// recipient saving them to a folder would keep one.
+    private static func uniqueFilename(_ name: String, taken: inout Set<String>) -> String {
+        guard taken.contains(name) else {
+            taken.insert(name)
+            return name
+        }
+        let stem = name.hasSuffix(".eml") ? String(name.dropLast(4)) : name
+        var n = 2
+        while taken.contains("\(stem) (\(n)).eml") { n += 1 }
+        let unique = "\(stem) (\(n)).eml"
+        taken.insert(unique)
+        return unique
+    }
+
+    /// A filename for the attached original: the subject, made safe, or a
+    /// fallback. Ends in `.eml`, which is what tells the recipient's client to
+    /// open it as a message — the MIME type deliberately doesn't say so.
+    ///
+    /// **ASCII only**, which matters more here than for a dragged-in file.
+    /// `MessageBuilder` runs filenames through RFC 2047 encoded-word encoding,
+    /// and encoded-words are not legal in a MIME `name=` parameter (RFC 2231 is
+    /// the mechanism for that). Most clients decode them anyway as a
+    /// compatibility hack; a strict one shows the user a literal
+    /// `=?utf-8?B?…?=`. Ordinary attachments rarely have non-ASCII names, but
+    /// this name comes from a *subject line* — and scam subjects are non-ASCII
+    /// more often than not.
+    private static func emlFilename(for subject: String) -> String {
+        let cleaned = subject
+            .components(separatedBy: CharacterSet(charactersIn: "/\\:*?\"<>|\r\n\t"))
+            .joined(separator: " ")
+            .filter { $0.isASCII }
+            .trimmingCharacters(in: .whitespaces)
+        let base = cleaned.isEmpty ? "Forwarded message" : String(cleaned.prefix(60))
+        return base + ".eml"
+    }
+
     /// Build a forward from the selected message.
     ///
     /// The quoted message keeps its formatting — font, size, colour, bold,
@@ -4291,19 +4471,66 @@ final class AppModel: ObservableObject {
     }
 
     /// Run a Find query and publish the hits.
+    /// True while a search is running, so the Find window can say so.
+    ///
+    /// This is only meaningful because the search moved off the main actor. It
+    /// used to run there, synchronously, which meant the window was frozen for
+    /// its duration — a "Searching…" label set beforehand could never be drawn,
+    /// because SwiftUI had no turn in which to draw it. A busy indicator and a
+    /// blocking call are mutually exclusive.
+    @Published private(set) var isSearching = false
+
+    /// Bumped per search, so a slow one finishing after a later one can't
+    /// install its results over the newer ones.
+    private var searchGeneration = 0
+
     func runSearch(_ query: SearchQuery) {
-        guard let searchIndex else {
+        // One at a time. The Search button disables itself while a search runs,
+        // but `FindView` also fires this from `.onSubmit` on the query field, so
+        // Return could otherwise start a second one over the first.
+        //
+        // This isn't only tidiness: `SearchIndex` is `@unchecked Sendable` on
+        // the stated grounds that its one SQLite connection is "never touched
+        // from two threads at once". Two searches in flight would be exactly
+        // that. The running search can't be cancelled — `search` is a blocking
+        // sqlite call — so the honest options are to refuse the new one or to
+        // break that invariant, and refusing is cheap: searches are quick, and
+        // the button visibly says why nothing happened.
+        guard !isSearching else { return }
+        guard let index = searchIndex else {
             searchResults = []
             searchStatus = "No index — open a Eudora folder, or Rebuild Index."
             return
         }
-        do {
-            searchResults = try searchIndex.search(query)
-            let n = searchResults.count
-            searchStatus = n == 0 ? "No results." : "\(n) result\(n == 1 ? "" : "s")."
-        } catch {
-            searchResults = []
-            searchStatus = "Search error: \(error)"
+        searchGeneration += 1
+        let generation = searchGeneration
+        isSearching = true
+        searchStatus = "Searching…"
+
+        Task { @MainActor [weak self] in
+            // The hits, or a message — not a `Result<_, Error>`: `Error` isn't
+            // `Sendable`, and the error is only ever shown as text anyway.
+            //
+            // `index` is captured rather than read back off `self`: the
+            // instance queried must be the one that existed when the search
+            // started, or a Rebuild Index landing mid-search would have this
+            // finish against a different connection.
+            let outcome: ([SearchHit], String?) =
+                await Task.detached(priority: .userInitiated) {
+                    do { return (try index.search(query), nil) }
+                    catch { return ([], "\(error)") }
+                }.value
+
+            guard let self, self.searchGeneration == generation else { return }
+            self.isSearching = false
+            if let failure = outcome.1 {
+                self.searchResults = []
+                self.searchStatus = "Search error: \(failure)"
+                return
+            }
+            self.searchResults = outcome.0
+            let n = outcome.0.count
+            self.searchStatus = n == 0 ? "No results." : "\(n) result\(n == 1 ? "" : "s")."
         }
     }
 

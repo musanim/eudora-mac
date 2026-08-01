@@ -41,6 +41,7 @@ struct ContentView: View {
         }
         // Tells SplashWindow which window is SwiftUI's, so it doesn't have to
         // guess from NSApp.windows (which raced with window placement).
+        .background(DeleteBackspaceShortcut())
         .background(MainWindowAccessor())
         // Strips the now-duplicate ⌘M from Window ▸ Minimize; see the type.
         .background(MinimizeKeyStripper())
@@ -2838,8 +2839,33 @@ struct MessageListView: View {
         VStack(spacing: 0) {
             if !model.mailboxSummary.isEmpty {
                 HStack {
+                    // Which mailbox this is, ahead of how much is in it.
+                    // The sidebar shows the selection, but only while the
+                    // enclosing group is expanded — collapse GOVERNMENT and the
+                    // USPTO messages are still on screen with nothing left
+                    // saying what they are. This is the only always-visible
+                    // answer to "what am I looking at".
+                    //
+                    // Primary against the summary's secondary: the name is the
+                    // thing being read, the counts are reference.
+                    if !model.selectedMailboxPath.isEmpty {
+                        // `.headline`, the same face and size as the subject
+                        // line in the reading pane — this is a heading for what
+                        // is on screen, so it should read like one. Note the
+                        // bar's pinned height below was raised to fit it.
+                        Text(model.selectedMailboxPath)
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            // A deep path truncates in the middle, keeping the
+                            // mailbox's own name — the part that identifies it —
+                            // rather than the groups above it.
+                            .truncationMode(.middle)
+                        Text("·").font(.caption).foregroundStyle(.tertiary)
+                    }
                     Text(model.mailboxSummary)
                         .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize()
                     // The rows are usable while this runs — Who, Date and the
                     // attachment mark are still settling — so this is a quiet
                     // note rather than a blocking indicator. It also explains why
@@ -2865,9 +2891,22 @@ struct MessageListView: View {
                 // below nudged down a couple of pixels mid-veil (caught in a
                 // frame-stepped recording). Pinning the *spinner's* frame
                 // instead triggered AppKit min<=max constraint complaints; the
-                // bar is the right thing to pin. The spinner overdraws the 14 pt
-                // by a hair, invisibly at 0.6 scale.
-                .frame(height: 14)
+                // bar is the right thing to pin.
+                //
+                // 18, raised from 14 when the mailbox path went to `.headline`:
+                // a headline line box doesn't fit in 14 and the descenders
+                // clipped. The extra room incidentally fixes what the old number
+                // fudged — 14 was a hair under the spinner's ~17 pt intrinsic
+                // box, which it "overdrew invisibly at 0.6 scale". It now fits
+                // properly.
+                //
+                // **Whatever this number is, it must stay fixed.** A bar that
+                // sizes to its content changes height when the spinner appears,
+                // and the message list below nudges down mid-veil — caught in a
+                // frame-stepped recording, and now also a trigger for the
+                // stick-to-the-bottom pin, which reads a clip-height change as a
+                // resize.
+                .frame(height: 18)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)
                 Divider()
@@ -3092,6 +3131,37 @@ enum PaneDivider {
 /// value can never put either pane below its minimum however it was arrived at
 /// — dragged on a taller window, restored from an older build, or hand-edited in
 /// the defaults database.
+/// ⌘⌫ for Delete, carried by an invisible button rather than a menu item.
+///
+/// The Message menu advertises **⌘D**, which is Eudora's key and the one to
+/// show. ⌘⌫ is the Mac-native spelling and worth keeping, but a second Delete
+/// item next to the first — same title, different key — reads as a mistake, the
+/// objection already recorded against advertising ⌘N twice.
+///
+/// Living in the main window rather than in `eudoraCommands` also scopes it
+/// correctly for free: a window's own key equivalents only fire while that
+/// window is key, so this cannot reach into a compose window or Settings the way
+/// a menu shortcut would.
+///
+/// Gated on the same condition as the menu item, so the two keys can never
+/// disagree about whether Delete is available.
+struct DeleteBackspaceShortcut: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        Button("Delete") { model.deleteSelected() }
+            .keyboardShortcut(.delete, modifiers: .command)
+            .disabled(!(model.openDrafts.isEmpty && model.canActOnSelection))
+            // One point square and all but transparent, not `.hidden()`: a
+            // hidden view is removed from layout and stops registering its key
+            // equivalent. This is the shape `HiddenSettingsLink` uses, which is
+            // known to work here.
+            .frame(width: 1, height: 1)
+            .opacity(0.01)
+            .accessibilityHidden(true)
+    }
+}
+
 enum PaneLayout {
     /// Enough to see a useful number of rows.
     static let listMinimum: CGFloat = 150

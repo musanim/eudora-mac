@@ -165,6 +165,88 @@ final class RawHeaderBlockTests: XCTestCase {
         XCTAssertFalse(block.contains("Following"))
     }
 
+    // MARK: rawMessage — the bytes "forward as attachment" attaches
+
+    /// Byte-for-byte, headers and body, envelope line stripped. This is
+    /// evidence: anything the store "helpfully" normalises is a header a
+    /// reporting address can no longer trust.
+    func testRawMessageReturnsTheWholeMessageUnaltered() throws {
+        let raw = message(headers: [
+            "Received: from mxa2.tigertech.net (mxa2.tigertech.net [208.80.4.162])",
+            "\tby localhost with ESMTP id 4abc123",
+            "Return-Path: <scammer@example.com>",
+            "From: Them <scammer@example.com>",
+            "Subject: You have won",
+        ])
+        let offset = try deliverAndOffset(raw)
+        let length = try XCTUnwrap(recordLength(atOffset: offset))
+        let got = try XCTUnwrap(store.rawMessage(at: base, offset: offset, length: length))
+
+        // Byte-identical *because the fixture ends in CRLF*. Don't "simplify"
+        // `message(headers:)` to drop that: `Mbox.record` appends a line ending
+        // to any message that lacks one, and this assertion would then fail by
+        // exactly two bytes. The next test pins that behaviour deliberately.
+        XCTAssertEqual(got, raw, "the attached copy must be the bytes that arrived")
+        XCTAssertFalse(String(decoding: got, as: UTF8.self).contains("From ???@???"),
+                       "the Eudora envelope line is storage, not part of the message")
+    }
+
+    /// The one documented way `rawMessage` is *not* byte-identical: a message
+    /// stored without a trailing line ending gets one from `Mbox.record`, since
+    /// the record format needs it. Pinned so the difference stays a known,
+    /// two-byte one rather than a surprise.
+    func testAMessageStoredWithoutATrailingNewlineGainsOne() throws {
+        let raw = Data("From: a@b.com\r\nSubject: Abrupt\r\n\r\nno trailing newline".utf8)
+        let offset = try deliverAndOffset(raw)
+        let length = try XCTUnwrap(recordLength(atOffset: offset))
+        let got = try XCTUnwrap(store.rawMessage(at: base, offset: offset, length: length))
+        XCTAssertEqual(got, raw + Data("\r\n".utf8))
+    }
+
+    func testRawMessageIncludesTheBodyAsWellAsTheHeaders() throws {
+        let offset = try deliverAndOffset(incoming(subject: "Hello"))
+        let length = try XCTUnwrap(recordLength(atOffset: offset))
+        let text = String(decoding: try XCTUnwrap(
+            store.rawMessage(at: base, offset: offset, length: length)), as: UTF8.self)
+        XCTAssertTrue(text.contains("Subject: Hello"))
+        XCTAssertTrue(text.contains("body"))
+    }
+
+    /// Non-UTF8 bytes must survive: scam mail is frequently mis-encoded, and
+    /// that is itself evidence.
+    func testRawMessageSurvivesInvalidUTF8() throws {
+        var raw = Data("From: a@b.com\r\nSubject: caf".utf8)
+        raw.append(0xE9)
+        raw.append(contentsOf: Data("\r\n\r\nbody\r\n".utf8))
+        let offset = try deliverAndOffset(raw)
+        let length = try XCTUnwrap(recordLength(atOffset: offset))
+        XCTAssertEqual(store.rawMessage(at: base, offset: offset, length: length), raw)
+    }
+
+    /// The second message's offset must give the second message, and must not
+    /// run on into anything after it.
+    func testRawMessageStopsAtTheEndOfItsOwnRecord() throws {
+        _ = try deliverAndOffset(incoming(subject: "First"))
+        let second = try deliverAndOffset(incoming(subject: "Second"))
+        _ = try deliverAndOffset(incoming(subject: "Third"))
+        let length = try XCTUnwrap(recordLength(atOffset: second))
+        let text = String(decoding: try XCTUnwrap(
+            store.rawMessage(at: base, offset: second, length: length)), as: UTF8.self)
+        XCTAssertTrue(text.contains("Subject: Second"))
+        XCTAssertFalse(text.contains("First"))
+        XCTAssertFalse(text.contains("Third"))
+    }
+
+    func testRawMessageRefusesAStaleOffset() throws {
+        let offset = try deliverAndOffset(incoming(subject: "Hello"))
+        let length = try XCTUnwrap(recordLength(atOffset: offset))
+        XCTAssertNil(store.rawMessage(at: base, offset: offset + 7, length: length))
+        XCTAssertNil(store.rawMessage(at: base, offset: -1, length: length))
+        XCTAssertNil(store.rawMessage(at: base, offset: offset, length: 0))
+        XCTAssertNil(store.rawMessage(at: root.appendingPathComponent("Nope"),
+                                      offset: 0, length: 100))
+    }
+
     // MARK: fixture
 
     private var store: MailStore { MailStore(root: root) }

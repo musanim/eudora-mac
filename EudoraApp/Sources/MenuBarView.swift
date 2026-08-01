@@ -136,6 +136,10 @@ struct MenuBarView: View {
                 Button("Forward") { model.forward() }
                     .disabled(!model.canActOnMessage)
             }
+            // `canActOnSelection`, not `canActOnMessage`: this one attaches
+            // every selected message, so it works on a multi-selection.
+            Button("Forward as Attachment") { model.forwardAsAttachment() }
+                .disabled(!model.canActOnSelection)
             Divider()
             Button("Mark as Read") { model.markSelected(read: true) }
                 .keyboardShortcut("u", modifiers: [.command, .shift])
@@ -153,7 +157,7 @@ struct MenuBarView: View {
             // Transfer) acts on the whole multi-selection, where Reply/Forward
             // and Mark as Read above require exactly one message.
             Button("Delete") { model.deleteSelected() }
-                .keyboardShortcut(.delete, modifiers: .command)
+                .keyboardShortcut("d", modifiers: .command)
                 .disabled(!model.canActOnSelection)
         }.menuBarItem()
     }

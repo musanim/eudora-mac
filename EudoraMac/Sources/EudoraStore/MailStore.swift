@@ -357,6 +357,43 @@ public struct MailStore: Sendable {
         return (rec, MIMEParser.parse(Mbox.messageBytes(bytes, rec)))
     }
 
+    /// The whole message exactly as it sits on disk, envelope line stripped.
+    ///
+    /// The bytes on disk, unparsed and un-decoded — which is the point. This is
+    /// what "forward as an attachment" attaches, and the reason abuse desks ask
+    /// for an attachment rather than pasted text: a re-typed or re-wrapped copy
+    /// proves nothing, whereas these bytes carry the whole `Received:` chain,
+    /// `Return-Path`, `Message-ID` and any authentication results, in the order
+    /// and spelling the servers wrote them.
+    ///
+    /// **Two honest caveats about "the bytes that arrived".** For mail this app
+    /// delivered they are exactly that — `Delivery.deliverIncoming` writes the
+    /// fetched bytes verbatim. For mail in the older archive they are not:
+    /// Eudora 7 rewrote messages on receipt, flattening MIME structure, wrapping
+    /// HTML in `<x-html>` and detaching attachments to disk, so the *headers*
+    /// are faithful but the body may not be what the sender sent. And
+    /// `Mbox.record` appends a CRLF to any message that didn't end in one, so a
+    /// message stored that way comes back one line ending longer.
+    ///
+    /// Addressed by offset and length for the same reason as `rawHeaderBlock`:
+    /// the index form would read and scan the entire `.mbx` to find the record.
+    /// Unlike that method there is no size bound — the caller asked for the
+    /// message, so it gets all of it — but `length` comes from the record, so
+    /// this reads one message rather than the file. (The *caller* may still have
+    /// paid for a whole-file read to get that offset; `message(at:index:)` does.)
+    public func rawMessage(at base: URL, offset: Int, length: Int) -> Data? {
+        guard offset >= 0, length > 0,
+              let handle = try? FileHandle(forReadingFrom: mbxURL(base)) else { return nil }
+        defer { try? handle.close() }
+        guard (try? handle.seek(toOffset: UInt64(offset))) != nil,
+              let read = try? handle.read(upToCount: length), !read.isEmpty else { return nil }
+        let bytes = [UInt8](read)
+        // Confirm a record starts here rather than trusting the caller — a stale
+        // offset would otherwise attach the middle of some other message.
+        guard bytes.starts(with: Mbox.separator) else { return nil }
+        return Data(Mbox.messageBytes(fromRecord: bytes))
+    }
+
     /// The message's header block exactly as it sits on disk — Eudora 7's
     /// "Blah Blah Blah".
     ///

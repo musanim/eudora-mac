@@ -1,7 +1,11 @@
 import Foundation
 import EudoraStore
 
-public struct SearchHit {
+/// `Sendable` because search runs off the main actor and the hits are returned
+/// across that boundary. Trivially true — every stored property is a value type
+/// — but a `public` struct isn't implicitly `Sendable` outside its own module,
+/// so it has to be said.
+public struct SearchHit: Sendable {
     public let mailbox: String
     public let offset: Int
     public let date: String
