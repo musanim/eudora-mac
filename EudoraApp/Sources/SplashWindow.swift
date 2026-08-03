@@ -219,6 +219,9 @@ enum SplashWindow {
 /// window's move/resize notifications keep the splash centered if SwiftUI
 /// restores a saved frame after the window first appears.
 struct MainWindowAccessor: NSViewRepresentable {
+    /// The main window, once it exists. Weak: it belongs to AppKit.
+    static weak var resolved: NSWindow?
+
     func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
 
     /// Makes the main window's close button quit the app.
@@ -270,6 +273,11 @@ struct MainWindowAccessor: NSViewRepresentable {
     }
 
     private func attach(_ window: NSWindow, context: Context) {
+        // Published for anyone who needs *this* window rather than whichever one
+        // AppKit currently considers main. `NSApp.mainWindow` is nil while the
+        // app is inactive and during parts of launch — which is exactly when the
+        // indexing bar appears and `ContentView` needs to force a relayout.
+        Self.resolved = window
         SplashWindow.mainWindowDidAppear(window)
         installCloseToQuit(window, coordinator: context.coordinator)
 

@@ -35,11 +35,16 @@ public enum TocWriter {
         b[i + 3] = UInt8((v >> 24) & 0xFF)
     }
 
-    /// Latin-1 encode into a fixed-width, NUL-padded field (truncating, leaving
+    /// CP1252 encode into a fixed-width, NUL-padded field (truncating, leaving
     /// at least a terminating NUL when it fits).
+    ///
+    /// CP1252 rather than Latin-1 both because that is what Eudora 7 wrote and
+    /// because Latin-1 has no curly apostrophe, so every `You’ve` in a subject
+    /// line became `You?ve` in the message list. Truncation is safe at any byte:
+    /// the encoding is single-byte throughout.
     static func putString(_ b: inout [UInt8], at start: Int, len: Int, _ s: String) {
-        let bytes = Array(s.unicodeScalars.map { $0.value < 256 ? UInt8($0.value) : UInt8(0x3F) }) // '?'
-        let count = min(bytes.count, len - 1)       // keep a trailing NUL
+        let bytes = CP1252.encode(s)
+        let count = min(bytes.count, max(0, len - 1))   // keep a trailing NUL
         for k in 0..<count { b[start + k] = bytes[k] }
         // remaining bytes stay 0 (already zero-filled)
     }

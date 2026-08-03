@@ -36,12 +36,40 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             MenuBarView()
-            if model.isIndexing { IndexingBar() }
+            // **The indexing bar is a safe-area inset on the split view, not a
+            // third row of this stack. Don't move it back.**
+            //
+            // As a row, its appearing and disappearing changed the height
+            // offered to the `NavigationSplitView`, and the split view kept its
+            // old frame — overlapping upward, so the menu bar was drawn only
+            // across the sidebar's width and Transfer/Special/Tools/Window
+            // vanished behind it. Every indexing run, gone when the run ended,
+            // and cured by dragging the window.
+            //
+            // Three attempts to *recover* from that failed, and are worth
+            // recording so nobody spends the afternoon again:
+            //   1. `layoutSubtreeIfNeeded()` on the content view — too weak.
+            //   2. The same, but the window came from `NSApp.mainWindow`, which
+            //      is nil during launch and while the app is inactive, which is
+            //      exactly when indexing starts. It never ran at all.
+            //   3. A genuine one-point resize of the window, which is the only
+            //      thing a *user* can do that fixes it. Two `setFrame` calls in
+            //      one runloop turn evidently coalesce to nothing.
+            //
+            // A safe-area inset changes nothing about the height the split view
+            // is offered — the inset lives inside it — so the trigger is gone
+            // rather than compensated for. Which is what should have been done
+            // first: this is the mechanism SwiftUI provides for a bar that comes
+            // and goes above content.
             splitView
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    if model.isIndexing { IndexingBar() }
+                }
         }
         // Tells SplashWindow which window is SwiftUI's, so it doesn't have to
         // guess from NSApp.windows (which raced with window placement).
         .background(DeleteBackspaceShortcut())
+        .background(MailboxReorderShortcuts())
         .background(MainWindowAccessor())
         // Strips the now-duplicate ⌘M from Window ▸ Minimize; see the type.
         .background(MinimizeKeyStripper())
@@ -198,6 +226,12 @@ struct ContentView: View {
             // this is where the model is in hand; the closure is main-actor work
             // behind a plain closure type, as `AppDelegate.onQuit` documents.
             AppDelegate.shared?.onQuit = { model.reviewComposeBeforeQuit() }
+            // Same shape, for mailto: links arriving from other apps. Setting
+            // this flushes any URL that came in during launch — the model then
+            // holds it until there is a tree to save the draft into.
+            AppDelegate.shared?.onOpenURLs = { urls in
+                for url in urls { model.handleMailto(url) }
+            }
             // Splash first — the main window exists by now, so it can be
             // centered over it, and the run loop is running, so it paints.
             SplashWindow.show()
@@ -207,6 +241,10 @@ struct ContentView: View {
                 // In box). Starts the timer and, if auto-check is on, fetches once
                 // right away. Reconfigured below when the settings change.
                 model.configureAutoCheck()
+                // A mailto: link that launched the app arrived before any of
+                // this; now there is a tree to save the draft into, open it.
+                // Does nothing in the ordinary case.
+                model.drainPendingMailtos(announcingIfBlocked: true)
             }
         }
         // Auto-check is a live preference: persist it the moment it changes (the
@@ -414,10 +452,18 @@ struct MailboxTree: View, Equatable {
         // collapsing a subtree before moving it — a day's work, and the reason to
         // reach for it is that, not the DisclosureGroups.
         //
-        // The cost, accepted knowingly: every move, new group or deleted group
+        // The cost: a move *between* groups, a new group or a deleted group
         // collapses the sidebar to its default expansion. Annoying exactly when
         // reorganising — but restructuring is occasional, and a crash
         // mid-reorganise is worse than re-expanding a folder.
+        //
+        // Move Up/Down is deliberately *not* in that set. It was at first, and
+        // it made the feature unusable: reordering a mailbox inside a group
+        // closed the group under you every time. A sibling reorder can't
+        // reparent anything (`MailboxTreeMutator.moveEntry` swaps two lines in
+        // one descmap and refuses to cross a group boundary), so it isn't the
+        // shape that crashed and doesn't need the blunt instrument. See
+        // `AppModel.identitySignature`.
         //
         // `treeIdentityVersion`, NOT `treeVersion` and NOT `treeStructureVersion`.
         // `treeVersion` bumps on every tree walk, including after each delivery,
@@ -497,9 +543,20 @@ struct MailboxTree: View, Equatable {
 
     @ViewBuilder
     private func moveItems(for item: MailboxItem) -> some View {
+        // The ⌥↑/⌥↓ hints are decorative here, as everywhere in an in-window
+        // menu — the working keys are `MailboxReorderShortcuts` in the main
+        // window. They earn their place by being the only way anyone would find
+        // out the shortcuts exist, and this menu is where you already are when
+        // you want to reorder something.
+        //
+        // Note the difference in what they act on: these move the row that was
+        // right-clicked, the keystrokes move the sidebar selection. Usually the
+        // same row, because right-clicking selects — but not always.
         Button("Move Up") { onMove(item.id, true) }
+            .keyboardShortcut(.upArrow, modifiers: .option)
             .disabled(!canMove(item.id, true))
         Button("Move Down") { onMove(item.id, false) }
+            .keyboardShortcut(.downArrow, modifiers: .option)
             .disabled(!canMove(item.id, false))
     }
 
@@ -1896,6 +1953,22 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         /// drift apart the way the read and the write just did.
         static func originY(forTopRow row: Int, table: NSTableView,
                             clipView: NSClipView, document: NSView) -> CGFloat {
+            clampOriginY(unclampedTopOriginY(forRow: row, table: table,
+                                             clipView: clipView, document: document),
+                         clipView: clipView, document: document)
+        }
+
+        /// Where the clip view would have to sit to put `row` at the top, with no
+        /// clamping.
+        ///
+        /// Split out because a *centred* origin is this value less half a
+        /// viewport, and the subtraction has to happen before the clamp: taking
+        /// half a viewport off an origin that has already been pinned to the
+        /// bottom of the document scrolls the row clean out of sight — which is
+        /// what the last screenful of every mailbox would have done.
+        private static func unclampedTopOriginY(forRow row: Int, table: NSTableView,
+                                                clipView: NSClipView,
+                                                document: NSView) -> CGFloat {
             // Into the clip view's own bounds space rather than assuming the
             // document sits at its origin. `topVisibleRow` converts clip → table
             // directly, so without this the two would be exact inverses only
@@ -1904,10 +1977,83 @@ struct TableScrollStateSyncer: NSViewRepresentable {
             // rest on, given they exist because a read and a write drifted apart.
             let target = table.convert(table.rect(ofRow: row), to: document)
             let wanted = clipView.convert(target.origin, from: document).y
+            return wanted - clipView.contentInsets.top
+        }
+
+        /// The legal range of clip-view origins. One implementation, because two
+        /// copies of this arithmetic is how a read and a write drift apart.
+        private static func clampOriginY(_ y: CGFloat, clipView: NSClipView,
+                                         document: NSView) -> CGFloat {
             let minY = -clipView.contentInsets.top
             let maxY = max(minY, document.frame.maxY + clipView.contentInsets.bottom
                                     - clipView.bounds.height)
-            return min(max(minY, wanted - clipView.contentInsets.top), maxY)
+            return min(max(minY, y), maxY)
+        }
+
+        /// The clip-view origin that puts a row as near the middle of the visible
+        /// area as the document allows.
+        ///
+        /// Built on `originY(forTopRow:)` rather than beside it, for the reason
+        /// that helper's own comment gives: a read and a write of this geometry
+        /// drifted apart once already, and the 28 pt inset under the column
+        /// header is exactly where that happens. Asking for "the origin that puts
+        /// row R at the top, less half a viewport" keeps one implementation of
+        /// the awkward part, and inherits its clamping — which is what makes a
+        /// row in the first or last screenful settle at the edge instead of
+        /// leaving blank space, i.e. "as close to centred as possible".
+        static func originY(forCenteredRow row: Int, table: NSTableView,
+                            clipView: NSClipView, document: NSView) -> CGFloat {
+            let top = unclampedTopOriginY(forRow: row, table: table,
+                                          clipView: clipView, document: document)
+            let rowHeight = table.rect(ofRow: row).height
+            // Visible area, not bounds: the inset band is covered by the header.
+            // Computed the same way `visibleRows` does, which is the consistency
+            // that matters most here.
+            let viewport = clipView.bounds.height
+                - clipView.contentInsets.top - clipView.contentInsets.bottom
+            let shift = max(0, (viewport - rowHeight) / 2)
+            // Clamped once, at the end. A row in the first or last screenful
+            // settles against the edge, which *is* "as close to centred as the
+            // document allows".
+            return clampOriginY(top - shift, clipView: clipView, document: document)
+        }
+
+        /// Scroll so `row` sits as near the middle as the document allows.
+        static func center(row: Int, table: NSTableView) {
+            guard let scrollView = table.enclosingScrollView,
+                  let document = scrollView.documentView else {
+                table.scrollRowToVisible(row)
+                return
+            }
+            let clip = scrollView.contentView
+            guard table.rect(ofRow: row).height > 0 else {
+                table.scrollRowToVisible(row)
+                return
+            }
+            let y = originY(forCenteredRow: row, table: table,
+                            clipView: clip, document: document)
+            clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: y))
+            // Without this the scroller thumb and the clip view disagree — the
+            // list moves and the scrollbar doesn't.
+            scrollView.reflectScrolledClipView(clip)
+        }
+
+        /// Whether the list is already where a centred reveal of `row` wants it.
+        ///
+        /// Compares clip origin against the target origin rather than measuring
+        /// the row's distance from the geometric middle — the same idiom
+        /// `verifyPendingScroll` uses, and for the same reason. A row in the
+        /// first or last screenful can never *reach* the middle, so a distance
+        /// test would report it permanently wrong and re-scroll forever while
+        /// hiding the real drift this check exists to catch.
+        static func isCentered(row: Int, table: NSTableView) -> Bool {
+            guard let scrollView = table.enclosingScrollView,
+                  let document = scrollView.documentView,
+                  table.rect(ofRow: row).height > 0 else { return true }
+            let clip = scrollView.contentView
+            let wanted = originY(forCenteredRow: row, table: table,
+                                 clipView: clip, document: document)
+            return abs(clip.bounds.origin.y - wanted) <= 0.5
         }
 
         /// One console block per wheel event, reporting every number the monitor
@@ -2145,7 +2291,12 @@ struct TableScrollStateSyncer: NSViewRepresentable {
             guard coordinator.revealGeneration == generation,
                   let table = coordinator.table, table.numberOfRows > row else { return }
             coordinator.isRevealing = true
-            table.scrollRowToVisible(row)
+            let centered = model.pendingRevealCentered
+            if centered {
+                Scrolling.center(row: row, table: table)
+            } else {
+                table.scrollRowToVisible(row)
+            }
             model.clearPendingReveal()
 
             // One confirmation pass, for the reason `verifyPendingScroll` has a
@@ -2170,7 +2321,18 @@ struct TableScrollStateSyncer: NSViewRepresentable {
                 let visible = Scrolling.visibleRows(table: table, clipView: clip)
                 let shown = visible.length > 0
                     && row >= visible.location && row < visible.location + visible.length
-                if !shown { table.scrollRowToVisible(row) }
+                if centered {
+                    // A centred reveal is judged on being centred, not merely on
+                    // being visible: the row-height estimates that shift a plain
+                    // reveal by a row or two shift a centring by the same amount,
+                    // and there the error is plainly visible against the middle
+                    // of the pane.
+                    if !Scrolling.isCentered(row: row, table: table) {
+                        Scrolling.center(row: row, table: table)
+                    }
+                } else if !shown {
+                    table.scrollRowToVisible(row)
+                }
             }
         }
     }
@@ -2274,7 +2436,23 @@ struct TableScrollStateSyncer: NSViewRepresentable {
         // A frame change is a resize and nothing else, so this handler only ever
         // pins — it never records. See `Coordinator.frameObserver` for why a
         // frame change must not reach the recorder.
-        let onFrameChange: @Sendable (Notification) -> Void = {
+        // **Not `@Sendable`** — and passed through `MainQueueHandler` at the
+        // registration below rather than converted implicitly.
+        //
+        // The SDK does import `addObserver(forName:object:queue:using:)` with a
+        // `@Sendable` block, and there is no spelling of this handler that
+        // satisfies it cleanly on a macOS 13 target. Annotating it `@Sendable`
+        // turns every AppKit read in here into "main actor-isolated property …
+        // from a Sendable closure" (eight warnings); leaving it plain moves the
+        // complaint to the conversion (two). Hopping to the main actor to do the
+        // reads would silence both and change when the geometry is sampled,
+        // which is not a trade worth making in code this carefully timed.
+        //
+        // So the requirement is satisfied honestly at the boundary instead: the
+        // block genuinely only ever runs on the main thread, because it is
+        // registered with `queue: .main`, and `MainQueueHandler` is where that
+        // promise is written down.
+        let onFrameChange: (Notification) -> Void = {
             [weak clipView, weak coordinator] note in
             guard let clipView, let coordinator, !coordinator.isRestoring else { return }
             let height = clipView.bounds.height
@@ -2285,7 +2463,9 @@ struct TableScrollStateSyncer: NSViewRepresentable {
             schedulePin(coordinator: coordinator)
         }
 
-        let onBoundsChange: @Sendable (Notification) -> Void = {
+        // Not `@Sendable`, and likewise wrapped at registration — see
+        // `onFrameChange` above.
+        let onBoundsChange: (Notification) -> Void = {
             [weak table, weak clipView, weak coordinator] note in
             guard let table, let clipView, let coordinator,
                   !coordinator.isRestoring else { return }
@@ -2375,18 +2555,18 @@ struct TableScrollStateSyncer: NSViewRepresentable {
                 model.rememberScroll(topRow: top, atBottom: atBottom)
             }
         }
+        let bounds = MainQueueHandler(onBoundsChange)
+        let frame = MainQueueHandler(onFrameChange)
         coordinator.observer = NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification,
             object: clipView,
-            queue: .main,
-            using: onBoundsChange
-        )
+            queue: .main
+        ) { bounds.run($0) }
         coordinator.frameObserver = NotificationCenter.default.addObserver(
             forName: NSView.frameDidChangeNotification,
             object: clipView,
-            queue: .main,
-            using: onFrameChange
-        )
+            queue: .main
+        ) { frame.run($0) }
     }
 
     /// Schedule a pin, and hold the recorder off until its scroll has echoed.
@@ -2396,7 +2576,11 @@ struct TableScrollStateSyncer: NSViewRepresentable {
     /// it would never be in force where it is read. It comes down
     /// unconditionally, outside that method's guards, because a pin that
     /// declines still has to lower it or the recorder stays shut for good.
-    private func schedulePin(coordinator: Coordinator) {
+    /// `nonisolated` because the notification handlers that call it are not
+    /// main-actor isolated. Nothing here needs to be: the flag lives on
+    /// `Coordinator`, which is `@unchecked Sendable`, and the actual work hops
+    /// to the main actor itself.
+    nonisolated private func schedulePin(coordinator: Coordinator) {
         coordinator.isPinningBottom = true
         Task { @MainActor in
             pinToBottom(coordinator: coordinator)
@@ -3131,6 +3315,26 @@ enum PaneDivider {
 /// value can never put either pane below its minimum however it was arrived at
 /// — dragged on a taller window, restored from an older build, or hand-edited in
 /// the defaults database.
+/// Carries a main-thread-only notification handler across the `@Sendable`
+/// requirement of `NotificationCenter.addObserver(forName:object:queue:using:)`.
+///
+/// **The unchecked part is a real assertion, not a shrug.** It is safe only
+/// because every handler wrapped here is registered with `queue: .main`, so the
+/// block is delivered on the main thread and the AppKit reads inside it are
+/// legitimate. If one of these is ever registered on another queue, this box is
+/// the thing that stopped the compiler from saying so.
+///
+/// It exists because there is no clean spelling on a macOS 13 target: marking
+/// the handler `@Sendable` makes every AppKit read inside it a warning, and
+/// leaving it plain makes the conversion one. The third option — hopping to the
+/// main actor before reading — silences both and samples the geometry a runloop
+/// turn later, which in the scroll code is a behavioural change rather than a
+/// tidy-up. So the promise is stated here instead, once, where it can be read.
+private struct MainQueueHandler: @unchecked Sendable {
+    let run: (Notification) -> Void
+    init(_ run: @escaping (Notification) -> Void) { self.run = run }
+}
+
 /// ⌘⌫ for Delete, carried by an invisible button rather than a menu item.
 ///
 /// The Message menu advertises **⌘D**, which is Eudora's key and the one to
@@ -3145,6 +3349,52 @@ enum PaneDivider {
 ///
 /// Gated on the same condition as the menu item, so the two keys can never
 /// disagree about whether Delete is available.
+/// ⌥↑ / ⌥↓ move the selected mailbox within its group.
+///
+/// Reordering is otherwise a right-click and a menu pick *per step*, which is a
+/// poor fit for what the job actually is: nudging something several places and
+/// overshooting once. From the keyboard a repeat is one keystroke and a
+/// correction is instant.
+///
+/// **Scoped to the main window on purpose.** These are window key equivalents,
+/// not menu shortcuts. A menu shortcut is matched before any window's own key
+/// handling, which would take ⌥↑/⌥↓ away from every text field in every compose
+/// window — where they are ordinary paragraph-movement keys. Living here, they
+/// exist only where a sidebar does. Same reasoning as `DeleteBackspaceShortcut`.
+///
+/// They act on the sidebar *selection*, whereas the context menu acts on the row
+/// that was right-clicked. That is the natural reading of each: a keystroke has
+/// no click position to refer to.
+struct MailboxReorderShortcuts: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        Group {
+            Button("Move Mailbox Up") { move(up: true) }
+                .keyboardShortcut(.upArrow, modifiers: .option)
+                .disabled(!canMove(up: true))
+            Button("Move Mailbox Down") { move(up: false) }
+                .keyboardShortcut(.downArrow, modifiers: .option)
+                .disabled(!canMove(up: false))
+        }
+        // Present but effectively invisible — see `DeleteBackspaceShortcut` for
+        // why `.hidden()` won't do.
+        .frame(width: 1, height: 1)
+        .opacity(0.01)
+        .accessibilityHidden(true)
+    }
+
+    private func canMove(up: Bool) -> Bool {
+        guard let id = model.selectedMailboxID else { return false }
+        return model.canMove(id, up: up)
+    }
+
+    private func move(up: Bool) {
+        guard let id = model.selectedMailboxID else { return }
+        model.moveTreeItem(id, up: up)
+    }
+}
+
 struct DeleteBackspaceShortcut: View {
     @EnvironmentObject var model: AppModel
 
@@ -3310,6 +3560,59 @@ struct PreviewView: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var fontSettings: ComposeSettings
 
+    /// Where this pane gets the message it shows.
+    ///
+    /// The main window's pane follows the model's selection; the Find window's
+    /// result pane is handed a message directly. Two sources, one renderer — so
+    /// a search result gets the link-safety checks, "Blah Blah Blah", embedded
+    /// images and everything added later, without a second implementation
+    /// drifting quietly out of step with this one.
+    enum Source {
+        /// Follow `AppModel.preview` and the main window's selection.
+        case mainSelection
+        /// Show exactly this, with this loading state. Used by the Find window.
+        case given(MessagePreview?, isLoading: Bool)
+    }
+
+    var source: Source = .mainSelection
+
+    /// The message to draw, whichever way it arrived.
+    private var shown: MessagePreview? {
+        switch source {
+        case .mainSelection:            return model.preview
+        case .given(let preview, _):    return preview
+        }
+    }
+
+    private var isLoading: Bool {
+        switch source {
+        case .mainSelection:            return model.isLoadingPreview
+        case .given(_, let loading):    return loading
+        }
+    }
+
+    /// A multi-selection message belongs to the main window only — the Find
+    /// window's table is single-select, so this must not consult the main
+    /// window's selection when showing a result.
+    private var multiSelectionCount: Int {
+        switch source {
+        case .mainSelection:            return model.selectedMessageIDs.count
+        case .given:                    return 0
+        }
+    }
+
+    /// Whether the actions in the message body act on what is being shown.
+    ///
+    /// False in the Find window: `model.forward()` forwards the *main window's*
+    /// selected message, which is not the one on screen here. Rather than wire a
+    /// second path through the web view, Forward is simply not offered — the
+    /// context menu's View in Mailbox takes you to the message, where every
+    /// action applies to the message you are looking at.
+    private var actsOnShownMessage: Bool {
+        if case .mainSelection = source { return true }
+        return false
+    }
+
     /// Height of the raw header block, remembered across launches. `@AppStorage`
     /// for the same reason `previewPaneHeight` is: where you like a divider is a
     /// property of the window, not of the tree that happens to be open. Every
@@ -3370,14 +3673,14 @@ struct PreviewView: View {
     }
 
     @ViewBuilder private func content(paneHeight: CGFloat) -> some View {
-        if model.selectedMessageIDs.count > 1 {
+        if multiSelectionCount > 1 {
             // A multi-selection previews nothing (the design decision — Mail's
             // convention). Checked before `preview`: a stale render must not
             // linger under a selection it no longer describes.
-            Text("\(model.selectedMessageIDs.count) messages selected")
+            Text("\(multiSelectionCount) messages selected")
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let p = model.preview {
+        } else if let p = shown {
             let headerHeight = HeaderPaneLayout.height(liveHeaderHeight ?? storedHeaderHeight,
                                                        pane: paneHeight)
             VStack(alignment: .leading, spacing: 0) {
@@ -3419,8 +3722,16 @@ struct PreviewView: View {
                 }
                 if p.isHTML {
                     HTMLMailView(html: p.content, images: p.images,
-                                 onCopyLink: { url in model.showBanner("Link copied: \(url)") },
-                                 onForward: { model.forward() },
+                                 // The banner is drawn by `ContentView`, so from
+                                 // the Find window's pane it would appear behind
+                                 // the window you are looking at. Copy Link still
+                                 // copies; it just doesn't announce itself where
+                                 // the announcement can't be seen.
+                                 onCopyLink: actsOnShownMessage
+                                    ? { url in model.showBanner("Link copied: \(url)") }
+                                    : { _ in },
+                                 onOpenLink: { url in model.openLinkFromMessage(url) },
+                                 onForward: actsOnShownMessage ? { model.forward() } : nil,
                                  fontName: fontSettings.bodyFontName,
                                  fontSize: fontSettings.bodyFontSize,
                                  antialias: fontSettings.bodyAntialiasing.htmlSmoothingOn)
@@ -3457,7 +3768,7 @@ struct PreviewView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 }
             }
-        } else if model.isLoadingPreview {
+        } else if isLoading {
             // `loadMessage` clears `preview` and then reads and renders off the
             // main actor, which on a large mailbox is a noticeable wait. Without
             // this the pane sat on "Select a message" throughout — telling the

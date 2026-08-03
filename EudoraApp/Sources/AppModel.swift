@@ -1,6 +1,9 @@
 import Foundation
 import SwiftUI
 import AppKit
+// For `CGEventSource.secondsSinceLastEventType` — how the overnight rebuild
+// asks whether anyone is at the Mac.
+import CoreGraphics
 import EudoraStore
 import EudoraSearch
 import EudoraNet
@@ -141,6 +144,10 @@ struct MessagePreview: Sendable {
     let isHTML: Bool
     let content: String          // HTML string when isHTML, else plain text
     let images: [String: EmbeddedImage]  // eudora-image:<id> -> bytes (HTML only)
+    /// Links whose visible text names a different destination from their href,
+    /// as URL -> claimed host. Noted at render time because that is the only
+    /// point where both are visible — see `RenderedBody.misleadingLinks`.
+    var misleadingLinks: [String: String] = [:]
     let attachments: [MessageAttachment]
     /// Attachments Eudora detached to disk. Shown after the body, as Eudora did,
     /// rather than as header chips — their bytes aren't in the message.
@@ -433,9 +440,10 @@ final class AppModel: ObservableObject {
     /// Hash of the last published shape, to tell the two apart.
     private var treeShape = 0
 
-    /// Bumped when the tree's *identity graph* changes — ids, folder-ness or
-    /// order. Narrower than `treeStructureVersion`, which also moves on a
-    /// rename.
+    /// Bumped when the tree's *parentage graph* changes — an item added,
+    /// removed, or moved to a different parent. Narrower than
+    /// `treeStructureVersion`, which also moves on a rename, and narrower again
+    /// than the obvious reading: a **reorder among siblings does not bump it**.
     ///
     /// **Do not remove this, and do not widen it.** It is the sidebar `List`'s
     /// `.id()` (see `MailboxTree`), and it is what stops SwiftUI diffing a
@@ -747,16 +755,7 @@ final class AppModel: ObservableObject {
     var selectedMailboxPath: String {
         guard let id = selectedMailboxID,
               let item = itemsByID[id], !item.isFolder else { return "" }
-        var names: [String] = []
-        var prefix = ""
-        for component in id.split(separator: "/") {
-            prefix = prefix.isEmpty ? String(component) : prefix + "/" + component
-            // Falling back to the raw component keeps this honest if a prefix
-            // ever fails to resolve — better an odd-looking filename than a
-            // silently shortened path that names the wrong mailbox.
-            names.append(itemsByID[prefix]?.display ?? String(component))
-        }
-        return names.joined(separator: " ▸ ")
+        return readablePath(of: id)
     }
     @Published var preview: MessagePreview?
 
@@ -910,6 +909,18 @@ final class AppModel: ObservableObject {
     /// select once that mailbox's listing has been rebuilt (see loadListing()).
     private var pendingMessageID: MessageRow.ID?
 
+    /// Whether `pendingMessageID` is an explicit jump — "View in Mailbox" from a
+    /// search result — as opposed to the launch-time restore of the message that
+    /// was selected last time.
+    ///
+    /// The distinction decides what happens to the scroll position, and getting
+    /// it wrong is not a cosmetic matter. A restore must honour the mailbox's
+    /// remembered position, including its at-the-bottom flag; a centred reveal
+    /// instead would scroll somewhere else *and* be recorded, so a mailbox left
+    /// parked at its end would quietly lose that state at the next launch. See
+    /// the reasoning in `loadListing` and `rememberScroll`.
+    private var pendingMessageIsExplicitJump = false
+
     /// Remembered selection for the open tree (see ViewState.swift). Held in
     /// memory and written on every selection change.
     private var viewState = ViewState()
@@ -957,7 +968,49 @@ final class AppModel: ObservableObject {
         // still to be listed, in which case restoreSelection takes it down.
         splashHeldForRestore = false
         defer { hideSplashUnlessRestoring() }
+
+        // Claim the tree before touching it. Two Eudoras writing one tree is a
+        // lost-update hazard, not a cosmetic one — `Outbox.append` reads the
+        // whole `.mbx`, appends and replaces it — and the app-level
+        // single-instance guard doesn't cover a second copy pointed at the same
+        // folder from elsewhere. Declining is a hard stop: the folder is not
+        // opened and nothing is written.
+        var staleNote: String?
+        switch TreeLock.take(root: url) {
+        case .took:
+            break
+        case .tookStale(let previous):
+            // Reported, not asked. The previous holder is provably gone; the
+            // reason to mention it at all is that the run ended without
+            // releasing the lock, so it may have died mid-write.
+            //
+            // Not in DEBUG, though. Xcode's Stop sends SIGKILL, so
+            // `applicationWillTerminate` never runs and *every* debug launch
+            // would find a stale lock and say so. A warning that fires forty
+            // times a week is a warning nobody reads by Thursday — and in that
+            // case it is evidence of nothing at all.
+            #if !DEBUG
+            let when = previous.started == .distantPast
+                ? nil
+                : DateFormatter.localizedString(from: previous.started,
+                                                dateStyle: .short, timeStyle: .short)
+            staleNote = "Recovered a lock left by an earlier run"
+                + (when.map { " (started \($0))" } ?? "")
+                + " — it ended without closing properly."
+            #else
+            _ = previous
+            #endif
+        case .declined:
+            showError("Didn't open \(url.lastPathComponent) — another program has it locked.")
+            return
+        }
         UserDefaults.standard.set(url.path, forKey: Self.lastFolderKey)
+        // `!bannerIsError` because this defer runs *after* the whole function
+        // body: without the check, a real failure below — "Couldn't create the
+        // standard mailboxes" — would be overwritten by this note, and
+        // `showBanner` clears the error styling, so a sticky error would become
+        // a self-dismissing aside and the failure would vanish.
+        defer { if let staleNote, !bannerIsError { showBanner(staleNote) } }
 
         // In/Out/Junk/Trash are load-bearing — receiving needs In, sending
         // needs Out, delete needs Trash — so any that are missing are created
@@ -1002,6 +1055,9 @@ final class AppModel: ObservableObject {
         treeIdentityVersion &+= 1
         itemsByID = [:]
         indexItems(tree)
+        // Per tree, not per launch: the watch needs a root to rebuild, and
+        // opening a different folder should watch that one.
+        startOvernightRebuildWatch()
         // Abandon anything still running against the *previous* tree. Without
         // this, a listing already in flight resumes, finds its generation still
         // current, and installs the old tree's rows into the new one — then runs
@@ -1039,6 +1095,12 @@ final class AppModel: ObservableObject {
         }
 
         restoreSelection(forRoot: url.path)
+
+        // There is now somewhere to save a draft. If a mailto: link has been
+        // waiting — because Eudora was launched by one with no remembered
+        // folder, and the folder has just been chosen by hand — this is what
+        // stops it being stranded. Does nothing in every other case.
+        drainPendingMailtos()
     }
 
     // MARK: remembered selection
@@ -1247,8 +1309,47 @@ final class AppModel: ObservableObject {
     /// worth remembering.
     @Published var pendingRevealRow: Int?
 
+    /// Whether that reveal should *centre* the row rather than scroll the least
+    /// amount that shows it.
+    ///
+    /// Minimal is right when the list is already where the user put it and the
+    /// selection merely needs to stay in sight — after a re-sort, say. Centring
+    /// is right when arriving from somewhere else, which is the Find window's
+    /// "View in Mailbox": the reason for going there is to see what came before
+    /// and after, and a row scrolled to the very bottom edge shows the before and
+    /// none of the after.
+    ///
+    /// A companion flag rather than a value on `pendingRevealRow` so the existing
+    /// call sites keep working unchanged; both are cleared together.
+    @Published var pendingRevealCentered = false
+
     /// Called by the bridge once the row has been revealed.
-    func clearPendingReveal() { pendingRevealRow = nil }
+    func clearPendingReveal() {
+        pendingRevealRow = nil
+        pendingRevealCentered = false
+    }
+
+    /// Bring a row into view with the least scrolling that does it.
+    ///
+    /// Every plain reveal goes through here rather than assigning
+    /// `pendingRevealRow` directly, so the centred flag cannot be left standing
+    /// from an earlier request — the bridge retries a reveal for up to three
+    /// seconds, which is ample time for a re-sort to re-target the row under a
+    /// flag that no longer describes what was asked for.
+    func reveal(row: Int) {
+        pendingRevealCentered = false
+        pendingRevealRow = row
+    }
+
+    /// Bring a row into view, centred. Used when a message is reached from
+    /// outside the list.
+    ///
+    /// The flag is set before the row, and cleared after it, so whichever the
+    /// bridge notices first it never sees a row with a stale companion value.
+    func revealCentered(row: Int) {
+        pendingRevealCentered = true
+        pendingRevealRow = row
+    }
 
     /// Set when a restored selection should also take keyboard focus, so the
     /// highlight is the active (not washed-out) one and the arrow keys move from
@@ -1327,20 +1428,47 @@ final class AppModel: ObservableObject {
     /// A hash of everything the Move menus draw: ids, labels, folder-ness and
     /// nesting. Deliberately excludes `messageCount` and `hasUnread`, which are
     /// the only things our own mutations change.
-    /// A hash of the tree's identity graph: ids, folder-ness and order, but
-    /// **not** display names. Keys the sidebar's `.id()` — see
-    /// `treeIdentityVersion` for why a rename must not move it.
+    /// A hash of the tree's *parentage* graph: which items exist, what kind they
+    /// are, and what each one's parent is. Keys the sidebar's `.id()`.
+    ///
+    /// Three things are deliberately excluded, each for its own reason:
+    ///
+    /// - **Display names**, because a rename leaves every row identity intact
+    ///   (see `treeIdentityVersion`).
+    /// - **Message counts and unread flags**, because mail arriving must not
+    ///   rebuild the sidebar.
+    /// - **Sibling order** — which is why the per-item hashes are XOR-ed rather
+    ///   than fed to a `Hasher` in sequence. `Hasher` is order-sensitive, so
+    ///   walking the tree in order made a Move Up/Down bump the version and
+    ///   collapse the whole sidebar; reordering a mailbox inside a group is
+    ///   *the* most common structural edit, and collapsing on every one of them
+    ///   made the feature unusable.
+    ///
+    /// That last exclusion is safe for a specific, checked reason rather than
+    /// optimism: `MailboxTreeMutator.moveEntry` swaps two adjacent lines within
+    /// one `descmap.pce` and throws `.atBoundary` rather than crossing into
+    /// another group, so a reorder **cannot** change any item's parent. What
+    /// crashed SwiftUI's outline diff was reparenting an *expanded subtree* —
+    /// deleting it from one parent and inserting it under another inside one
+    /// animated batch. A permutation of the same ids under the same parent is
+    /// the ordinary case that diff exists to handle.
+    ///
+    /// XOR is sound here because ids are unique, so no two per-item hashes can
+    /// cancel each other out.
     private static func identitySignature(_ items: [MailboxItem]) -> Int {
-        var hasher = Hasher()
-        func walk(_ items: [MailboxItem]) {
+        var combined = 0
+        func walk(_ items: [MailboxItem], parent: String) {
             for item in items {
+                var hasher = Hasher()
+                hasher.combine(parent)
                 hasher.combine(item.id)
                 hasher.combine(item.isFolder)
-                if let kids = item.children { walk(kids) }
+                combined ^= hasher.finalize()
+                if let kids = item.children { walk(kids, parent: item.id) }
             }
         }
-        walk(items)
-        return hasher.finalize()
+        walk(items, parent: "")
+        return combined
     }
 
     private static func shapeSignature(_ items: [MailboxItem]) -> Int {
@@ -1433,7 +1561,9 @@ final class AppModel: ObservableObject {
         isLoadingPreview = false
 
         let pending = pendingMessageID
+        let pendingIsJump = pendingMessageIsExplicitJump
         pendingMessageID = nil
+        pendingMessageIsExplicitJump = false
         selectMessage(nil)
         // Clear immediately: the old mailbox's rows must not linger under the
         // new mailbox's name while the listing is built.
@@ -1480,10 +1610,24 @@ final class AppModel: ObservableObject {
             // like: `originY` clamps it to the maximum legal origin, so it
             // happens to land correctly today, but only as a side effect of the
             // clamp. `pendingRevealRow` says what is meant.
-            if let mailbox = self.selectedMailboxID, !self.rows.isEmpty,
+            // An explicit jump beats the remembered position, and has to be
+            // checked first. Opening a search hit in a mailbox that was left at
+            // the bottom — or anywhere else — used to select the message and then
+            // immediately scroll somewhere else, so "View in Mailbox" landed on
+            // a mailbox whose selected row was off screen. The remembered
+            // position describes where the user last was; it is not what they
+            // just asked for.
+            //
+            // `pendingIsJump` is what keeps this off the launch path, which sets
+            // `pendingMessageID` too and must still restore the remembered
+            // position rather than centre on it.
+            if pendingIsJump, let pending, let pos = self.rowPositionByID[pending] {
+                self.pendingScrollTopRow = nil
+                self.revealCentered(row: pos)
+            } else if let mailbox = self.selectedMailboxID, !self.rows.isEmpty,
                self.viewState.atBottomByMailbox[mailbox] == true {
                 self.pendingScrollTopRow = nil
-                self.pendingRevealRow = self.rows.count - 1
+                self.reveal(row: self.rows.count - 1)
             } else if let mailbox = self.selectedMailboxID,
                       let top = self.viewState.scrollTopRowByMailbox[mailbox], !self.rows.isEmpty {
                 self.pendingScrollTopRow = min(top, self.rows.count - 1)
@@ -1597,7 +1741,7 @@ final class AppModel: ObservableObject {
                 // the table together — the uncorrected position is never drawn.
                 if wasAtBottom, !self.rows.isEmpty {
                     self.pendingScrollTopRow = nil
-                    self.pendingRevealRow = self.rows.count - 1
+                    self.reveal(row: self.rows.count - 1)
                     // Re-asserted now rather than waiting for the reveal's bounds
                     // change to be observed and recorded. A second delivery
                     // arriving inside that window would otherwise read a flag
@@ -1840,7 +1984,7 @@ final class AppModel: ObservableObject {
     /// distance and does nothing at all when the row is already visible.
     private func keepSelectionVisible() {
         guard let id = primaryMessageID, let pos = rowPositionByID[id] else { return }
-        pendingRevealRow = pos
+        reveal(row: pos)
     }
 
     /// The TOC-only listing. Pure, and runs off the main actor.
@@ -1993,7 +2137,7 @@ final class AppModel: ObservableObject {
                 // the mailbox its bottom-ness.
                 if self.rows.map(\.id) != before {
                     if self.selectedMailboxWasAtBottom, !self.rows.isEmpty {
-                        self.pendingRevealRow = self.rows.count - 1
+                        self.reveal(row: self.rows.count - 1)
                     } else {
                         self.keepSelectionVisible()
                     }
@@ -2158,6 +2302,72 @@ final class AppModel: ObservableObject {
     }
 
 
+    // MARK: - the Find window's own preview
+
+    /// The message shown in the Find window's preview pane.
+    ///
+    /// Deliberately separate from `preview`, which belongs to the main window's
+    /// selection. Sharing one would mean that arrowing through search results
+    /// silently rewrote what the main window was showing — and the reverse, that
+    /// clicking in the main window blanked the result you were reading.
+    @Published var findPreview: MessagePreview?
+    @Published var isLoadingFindPreview = false
+    private var findPreviewTask: Task<Void, Never>?
+
+    /// Render a search hit for the Find window's pane, without touching the main
+    /// window's selection, listing or preview.
+    ///
+    /// Addressed by byte offset rather than by row index: a search hit carries an
+    /// offset, and resolving it to an index means scanning the mailbox — the
+    /// expensive step `openHit` has to take because it must *select* the row.
+    /// Reading for display needs no index at all.
+    func loadFindPreview(for hit: SearchHit) {
+        findPreviewTask?.cancel()
+
+        guard let store, let item = itemsByID[hit.mailbox], !item.isFolder else {
+            findPreview = nil
+            isLoadingFindPreview = false
+            return
+        }
+
+        findPreview = nil
+        isLoadingFindPreview = true
+
+        let base = item.base
+        let root = store.root
+        let offset = hit.offset
+
+        findPreviewTask = Task { [weak self] in
+            // The same settle delay the main preview uses, and for the same
+            // reason: holding an arrow key down the results list must not queue
+            // one full message read per row.
+            try? await Task.sleep(nanoseconds: selectionSettleDelay)
+            guard !Task.isCancelled else { return }
+
+            let rendered = await Task.detached(priority: .userInitiated) { () -> MessagePreview? in
+                guard let msg = store.message(at: base, offset: offset) else { return nil }
+                var preview = AppModel.render(msg.part,
+                                              sourceNote: "search",
+                                              locator: AttachmentLocator(mailRoot: root))
+                preview.rawHeaders = store.rawHeaderBlock(at: base,
+                                                          offset: msg.record.offset,
+                                                          length: msg.record.length) ?? ""
+                return preview
+            }.value
+
+            guard !Task.isCancelled, let self else { return }
+            self.findPreview = rendered
+            self.isLoadingFindPreview = false
+        }
+    }
+
+    /// Nothing selected in the results table.
+    func clearFindPreview() {
+        findPreviewTask?.cancel()
+        findPreview = nil
+        isLoadingFindPreview = false
+    }
+
     /// Choose the best displayable body (prefer text/html, else text/plain),
     /// decode it tolerantly, and collect attachment filenames.
     nonisolated static func render(_ part: MIMEPart,
@@ -2200,6 +2410,7 @@ final class AppModel: ObservableObject {
             return MessagePreview(subject: subject, from: from, to: to, date: date,
                                   isHTML: true, content: rendered.html,
                                   images: rendered.images,
+                                  misleadingLinks: rendered.misleadingLinks,
                                   attachments: attachments, detached: detached,
                                   indexSourceNote: sourceNote)
         }
@@ -2242,6 +2453,131 @@ final class AppModel: ObservableObject {
         beginCompose(ComposeDraft())
     }
 
+    // MARK: mailto: links from outside the app
+
+    /// A `mailto:` that arrived before the app was ready to compose one.
+    ///
+    /// Clicking a `mailto:` while Eudora is closed launches it *with* the URL,
+    /// and the URL is delivered well before the mailbox tree is open — so
+    /// `beginCompose` would have nowhere to pre-save the draft and the window
+    /// would open carrying an error about Out. Holding it for a moment and
+    /// letting the normal launch sequence drain it costs nothing and makes the
+    /// cold-launch case behave exactly like the warm one.
+    /// An array rather than one optional: two links can arrive together (a
+    /// `mailto:` clicked twice, or several handed over at launch), and the
+    /// second silently replacing the first would be a message the user asked
+    /// for and never saw.
+    private var pendingMailtos: [MailtoLink] = []
+
+    /// Whether a draft can be opened *and* saved right now. `rootURL` is set by
+    /// `open(_:)`, so this is false through the whole of launch until a tree is
+    /// actually open — which is the case the pending list exists for.
+    private var canCompose: Bool { presentDraftWindow != nil && rootURL != nil }
+
+    /// A `mailto:` link, from a browser or any other app.
+    func handleMailto(_ url: URL) {
+        guard let link = MailtoLink.parse(url) else { return }
+        pendingMailtos.append(link)
+        drainPendingMailtos()
+    }
+
+    /// Open a composer for every link that has been waiting.
+    ///
+    /// Called from three places, all of which are "something just became true":
+    /// a link arrived, the tree finished opening at launch, and a folder was
+    /// opened by hand. The last is what stops a link being stranded forever when
+    /// Eudora launches with no remembered folder — `openDefaultIfAvailable` can
+    /// leave `rootURL` nil, and without that third call the click would do
+    /// nothing, say nothing, and never come back.
+    func drainPendingMailtos(announcingIfBlocked: Bool = false) {
+        guard !pendingMailtos.isEmpty else { return }
+        guard canCompose else {
+            // Only the launch drain announces. Everywhere else this is the
+            // ordinary "not yet" and saying so would be noise — but a link that
+            // arrives when there is no folder to save a draft into, and no
+            // prospect of one, would otherwise vanish without a word.
+            if announcingIfBlocked {
+                showBanner("A mailto: link is waiting — open a Eudora folder and "
+                           + "the message will open.")
+            }
+            return
+        }
+        // The splash is a floating panel and sits above everything, including a
+        // new compose window, so it has to come down first.
+        //
+        // The cost is deliberate and worth naming: on a cold launch driven by a
+        // mailto, this clears `splashHeldForRestore`, so the main window is
+        // revealed with an empty message list under the restored mailbox for as
+        // long as that listing takes. That flag exists precisely to hide that
+        // moment. Showing it is the lesser evil — the alternative is a compose
+        // window the user asked for, sitting invisibly behind the splash.
+        if SplashWindow.isShowing {
+            splashHeldForRestore = false
+            SplashWindow.hide()
+        }
+        // A window opened into a hidden app appears nowhere, so activate.
+        //
+        // Deliberately *not* `AppDelegate.revealWindows()`, which also
+        // un-minimises every window it can find. That is right for a Dock click,
+        // which means "show me Eudora"; clicking a link in a browser means
+        // "write this one message", and should not restore windows the user
+        // minimised on purpose. The new compose window arrives on its own.
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        let links = pendingMailtos
+        pendingMailtos = []
+        for link in links { beginCompose(draft(from: link)) }
+    }
+
+    private func draft(from link: MailtoLink) -> ComposeDraft {
+        var draft = ComposeDraft()
+        draft.to = recipientField(link.to)
+        draft.cc = recipientField(link.cc)
+        draft.subject = link.subject
+        draft.body = link.body
+        // Say what was dropped rather than dropping it silently. A link asking
+        // for a Bcc is the case that matters: the composer doesn't show that
+        // field prominently, so a recipient added this way could go out unseen.
+        if !link.ignoredFields.isEmpty {
+            let fields = link.ignoredFields.sorted().joined(separator: ", ")
+            draft.openError = "This link also tried to set: \(fields). "
+                + "Eudora ignored those — a link from a web page may not choose "
+                + "who a message is secretly copied to, or who it claims to be from."
+        }
+        return draft
+    }
+
+    /// Join parsed recipients into the comma-separated string the composer's To
+    /// and Cc fields hold.
+    ///
+    /// A display name containing a comma — `"Doe, Jane" <j@x>` — is reduced to
+    /// its bare address on the way in. The parser goes to some trouble to keep
+    /// such a name intact (the comma is percent-encoded precisely so it is not a
+    /// separator), but `splitAddresses` re-splits this field on every comma
+    /// without regard for quoting, so preserving the name here would hand the
+    /// composer two broken recipients instead of one good one. Losing a display
+    /// name is cosmetic; losing the address is not.
+    ///
+    /// Only rescues the `Name <addr>` form. A bare `Doe, Jane` with no address
+    /// at all is malformed input the parser deliberately admits rather than
+    /// swallows, and it still splits in two — visibly, in a field the user reads
+    /// before sending.
+    private func recipientField(_ addresses: [String]) -> String {
+        addresses.map { address -> String in
+            guard address.contains(","),
+                  let open = address.lastIndex(of: "<"),
+                  let close = address.lastIndex(of: ">"),
+                  open < close else { return address }
+            return String(address[address.index(after: open)..<close])
+                .trimmingCharacters(in: .whitespaces)
+        }
+        .joined(separator: ", ")
+    }
+
     /// The single funnel every new message goes through — new, reply, forward.
     ///
     /// Writes the message into Out as unsent *before* showing it, so it exists
@@ -2273,9 +2609,13 @@ final class AppModel: ObservableObject {
         do {
             draft.outOffset = try appendDraftRecord(draft)
         } catch {
-            draft.openError = "Couldn't put this message in Out: "
+            // Appended, not assigned: a draft built from a mailto: link may
+            // already carry a note about fields the link tried to set, and that
+            // is exactly the case where losing it would matter most.
+            let note = "Couldn't put this message in Out: "
                 + describe(error)
                 + " It can still be written and sent; it just isn't saved yet."
+            draft.openError = draft.openError.map { $0 + " " + note } ?? note
         }
         openDrafts[draft.id] = draft
         presentDraftWindow?(draft.id)
@@ -2830,6 +3170,294 @@ final class AppModel: ObservableObject {
             references: refs))
     }
 
+    /// Offer a clicked link to the default browser, after showing where it
+    /// really goes.
+    ///
+    /// Design decision 1 said links display but never navigate, and the reason
+    /// was that deceptive link text is the classic phishing move. That reason
+    /// still holds — which is why this shows the **true destination**, host
+    /// first, every time, rather than trusting a check to decide for you. A
+    /// dialog you only see when something is wrong is a dialog you will click
+    /// through on the day something is wrong.
+    ///
+    /// Reputation is deliberately not checked here. Handing the URL to the
+    /// browser *is* the reputation check: Safari and Chrome both consult Safe
+    /// Browsing before rendering, and Safari proxies it through Apple so the
+    /// address never reaches Google. Doing it in-app would be worse on privacy,
+    /// add a network dependency to a client that has none, and duplicate work
+    /// that is already in the path. What this does instead is the part a browser
+    /// cannot do, because it never sees the message: judge whether the URL is
+    /// built to deceive.
+    func openLinkFromMessage(_ raw: String) {
+        let assessment = LinkSafety.assess(raw, familiarDomains: familiarDomains())
+
+        if let refusal = assessment.refusal {
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "Eudora won't open this link."
+            switch refusal {
+            case .unsupportedScheme(let scheme):
+                // Naming the application is far more use than naming the
+                // scheme: "this would open Terminal" is a sentence anyone can
+                // act on, and this is the one category where a click can do
+                // something to the Mac rather than show a page.
+                let app = NSWorkspace.shared
+                    .urlForApplication(toOpen: URL(string: raw) ?? URL(fileURLWithPath: "/"))
+                    .map { FileManager.default.displayName(atPath: $0.path) }
+                alert.informativeText = "It uses the “\(scheme)” scheme"
+                    + (app.map { ", which would open \($0)" } ?? "")
+                    + ". Only web and mail links are opened from a message.\n\n\(raw)"
+            case .deceptiveCredentials:
+                alert.informativeText = "The part before the “@” in this address is not "
+                    + "the site it goes to — it's decoration, and the real destination is "
+                    + "after it. That has no honest use in mail.\n\n\(raw)"
+            case .malformed:
+                alert.informativeText = "It isn't a usable address.\n\n\(raw)"
+            }
+            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: "Copy Link")
+            if alert.runModal() == .alertSecondButtonReturn { copyToPasteboard(raw) }
+            return
+        }
+
+        // The mismatch between what the link *said* and where it goes. Noted at
+        // render time (`RenderedBody.misleadingLinks`) because that is the only
+        // moment both are visible, and put first here because it is the
+        // strongest signal in the dialog: everything else describes the URL,
+        // this one describes an intent to mislead.
+        var notes: [String] = []
+        if let claimed = preview?.misleadingLinks[raw] {
+            notes.append("This link's text says it goes to “\(claimed)”, "
+                         + "but it goes to “\(assessment.host)”.")
+        }
+        notes += assessment.warnings.map(Self.describe)
+
+        let alert = NSAlert()
+        alert.alertStyle = notes.isEmpty ? .informational : .critical
+        alert.messageText = notes.isEmpty
+            ? "Open \(assessment.host)?"
+            : "This link may not be what it looks like."
+        var body = notes.joined(separator: "\n\n")
+        if !body.isEmpty { body += "\n\n" }
+        body += raw
+        alert.informativeText = body
+        // "Open" is not the default button. Return should not open a link.
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Open in Browser")
+        alert.addButton(withTitle: "Copy Link")
+        switch alert.runModal() {
+        case .alertSecondButtonReturn:
+            if let url = URL(string: raw) { NSWorkspace.shared.open(url) }
+        case .alertThirdButtonReturn:
+            copyToPasteboard(raw)
+        default:
+            break
+        }
+    }
+
+    private func copyToPasteboard(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        showBanner("Link copied: \(text)")
+    }
+
+    private static func describe(_ warning: LinkSafety.Warning) -> String {
+        switch warning {
+        case .credentialsInURL:
+            return "The address hides its real destination behind an “@”."
+        case .punycodeHost:
+            return "The site's name is encoded, which is how a name that *looks* "
+                + "like a familiar one is written when it uses letters from another "
+                + "alphabet."
+        case .mixedScriptHost:
+            return "The site's name mixes alphabets — letters that look like ordinary "
+                + "ones but aren't."
+        case .ipAddressHost:
+            return "It goes to a numeric address rather than a named site."
+        case .familiarNameAsLabel(let known):
+            return "It contains “\(known)”, but that is not where it goes — the real "
+                + "site is the end of the name, not the beginning."
+        case .lookAlike(let known):
+            return "The name is one or two characters away from “\(known)”, which you "
+                + "do correspond with. This one is not it."
+        }
+    }
+
+    /// Domains the user demonstrably deals with, for the look-alike test.
+    ///
+    /// Taken from the recently-used recipients, which is a real record of who
+    /// Stephen writes to and costs nothing to read. Deliberately *not* derived
+    /// from the whole archive: the search index stores sender and recipient
+    /// header values as text, so building a domain histogram would mean parsing
+    /// 232,000 rows on a link click.
+    ///
+    /// The consequence, and it is a real gap: this knows the domains he *writes
+    /// to*, not the ones that write to him — so a look-alike of a bank he has
+    /// never emailed won't be caught. Closing it properly means a `domains`
+    /// column in the index, populated at rebuild.
+    private func familiarDomains() -> Set<String> {
+        var out = Set<String>()
+        func add(_ address: String) {
+            guard let bare = EmailAddress.bareAddress(address),
+                  let at = bare.lastIndex(of: "@") else { return }
+            let host = String(bare[bare.index(after: at)...])
+            if !host.isEmpty { out.insert(LinkSafety.registrableDomain(host)) }
+        }
+        // Entries are "Name <addr>" as typed, so they go through the same
+        // address parser the Who column uses rather than being split by hand.
+        for entry in recentRecipients.entries.prefix(200) { add(entry) }
+        for address in me.addresses { add(address) }
+        for domain in me.domains { out.insert(LinkSafety.registrableDomain(domain)) }
+        return out
+    }
+
+    /// A mailbox this correspondent's mail has been filed into before.
+    struct FilingSuggestion: Identifiable, Equatable {
+        let id: MailboxItem.ID
+        /// The readable path — "PEOPLE ▸ G ▸ Greg Sandow".
+        let path: String
+        let count: Int
+    }
+
+    /// Where the selected messages' correspondents have been filed before, most
+    /// used first.
+    ///
+    /// The point of this is that a Transfer menu over a real Eudora tree is
+    /// thousands of mailboxes deep, and the answer is almost always one of two
+    /// or three. Filing is by *person*, so the useful question isn't "where do
+    /// you want this" but "where does this person's mail go" — and the archive
+    /// has answered that thousands of times already.
+    ///
+    /// Addresses from all selected messages are merged into one query and the
+    /// counts summed, so a mixed selection yields a single ranking rather than
+    /// several competing ones.
+    ///
+    /// Costs one bounded read per selected message (offset and length come from
+    /// the listing) plus one indexed query. Nothing here reads a whole `.mbx`.
+    func filingSuggestions() -> [FilingSuggestion] {
+        // Not while a Find is running. `SearchIndex` is `@unchecked Sendable` on
+        // the stated grounds that its one SQLite connection is never used from
+        // two threads at once, and `runSearch` moved the search to a detached
+        // task — so querying here at the same time is exactly what that
+        // invariant forbids. It would also block the main thread for the length
+        // of the search, with a menu half-open.
+        guard !isSearching, let index = searchIndex,
+              let sel = currentSelectionSet() else { return [] }
+        // Sampled, not surveyed. This runs synchronously while the menu is
+        // opening, and every extra message costs a file read plus a parse; a
+        // 500-message selection would hold the menu shut for a visible moment to
+        // refine a ranking that the first twenty already settle.
+        let chosen = rows.filter { selectedMessageIDs.contains($0.id) }.prefix(20)
+        guard !chosen.isEmpty, let store else { return [] }
+
+        // Every address in From/To/Cc that isn't me. Not `CorrespondentResolver`,
+        // which answers "whose name goes in the Who column" — one party, for
+        // display. Here every counterparty is a legitimate filing hint, and a
+        // message addressed to two people may well belong in either's mailbox.
+        var addresses = Set<String>()
+        /// The raw bytes, kept so the body can be scanned if the headers turn
+        /// out to name nobody but the user. Read once either way.
+        var bodies: [String] = []
+        for row in chosen {
+            // 32 KB, not `row.size`. Only the headers are wanted, and reading
+            // the record whole means a message with a 20 MB attachment costs
+            // tens of megabytes of reading, copying and MIME-parsing to extract
+            // three header lines. `MIMEParser.splitHeaderBody` is internal to
+            // EudoraStore and can't be reached from here, so bounding the read
+            // is the available way to bound the work.
+            guard let raw = store.rawMessage(at: sel.item.base, offset: row.offset,
+                                             length: min(row.size, 32_768)) else { continue }
+            let part = MIMEParser.parse([UInt8](raw))
+            // Latin-1, which cannot fail: this is only ever scanned for
+            // addresses, which are ASCII, and a message whose encoding we
+            // guessed wrong should still give up the addresses inside it.
+            bodies.append(String(raw.map { Character(UnicodeScalar($0)) }))
+            for field in ["From", "To", "Cc"] {
+                // `addresses(in:)` already returns bare addresses — it is
+                // `splitList` followed by `bareAddress` — so no second pass.
+                for address in EmailAddress.addresses(in: part.header(field) ?? "") {
+                    if me.matches(headerValue: address) { continue }
+                    addresses.insert(address)
+                }
+            }
+        }
+        // Capped for the same reason as the message count above: query cost
+        // grows with the number of OR'd phrases, and a wide selection can reach
+        // hundreds of addresses. It also limits the damage from a *stale* "me"
+        // — an old address of Stephen's that isn't in the identity set yet gets
+        // treated as a correspondent, and it matches a large fraction of the
+        // archive, which would otherwise turn the ranking into "every mailbox,
+        // biggest first".
+        func query(_ set: Set<String>) -> [SearchIndex.FilingCount] {
+            guard !set.isEmpty else { return [] }
+            return (try? index.mailboxesFiledInto(addresses: Array(set.prefix(25)))) ?? []
+        }
+
+        var counts = query(addresses)
+
+        // Fall back to addresses found in the *body* when the headers got us
+        // nowhere.
+        //
+        // The case this exists for: a message where every header party is the
+        // user. A forward to yourself, or a note to self — `From: stephen@…`,
+        // `To: stephen@…` — leaves nothing after the "me" filter, so nothing is
+        // asked and no suggestions appear at all. But the person such a message
+        // is *about* is usually right there in the quoted headers a forward
+        // carries in its body.
+        //
+        // A fallback rather than an addition, and the asymmetry is deliberate.
+        // The index side stays filtered to `sender`/`recipients`, so a hit
+        // always means "correspondence with this person lives here". Matching
+        // bodies there would make it mean "some message here mentions this
+        // person", and every quoted thread, mailing-list footer and signature
+        // block names people who have nothing to do with where that mail
+        // belongs — noise that would systematically favour big mailboxes full
+        // of long threads. Asking about a body address is fine; *answering*
+        // from one is not.
+        //
+        // Only when the header attempt produced nothing, so a case that works
+        // today cannot be made worse by it.
+        if counts.isEmpty {
+            var fromBody = Set<String>()
+            for body in bodies {
+                for address in EmailAddress.scan(inText: body) {
+                    if me.matches(headerValue: address) { continue }
+                    fromBody.insert(address)
+                }
+            }
+            counts = query(fromBody)
+        }
+        return counts.compactMap { hit in
+            // Dropped rather than shown when the mailbox no longer exists: the
+            // index is a snapshot and a mailbox may have been renamed or deleted
+            // since. Also drops the mailbox the messages are already in — moving
+            // something to where it already is isn't a suggestion.
+            guard hit.mailbox != selectedMailboxID,
+                  let item = itemsByID[hit.mailbox], !item.isFolder else { return nil }
+            return FilingSuggestion(id: hit.mailbox,
+                                    path: readablePath(of: hit.mailbox),
+                                    count: hit.count)
+        }
+    }
+
+    /// A mailbox id rendered as its display path, for a menu label.
+    ///
+    /// Shares `selectedMailboxPath`'s reasoning — ids are filename paths, and
+    /// `_GOVERNMENT.fol` is not what to put in front of someone — but takes an
+    /// arbitrary id rather than the selection.
+    private func readablePath(of id: MailboxItem.ID) -> String {
+        var names: [String] = []
+        var prefix = ""
+        for component in id.split(separator: "/") {
+            prefix = prefix.isEmpty ? String(component) : prefix + "/" + component
+            // Falling back to the raw component keeps this honest if a prefix
+            // ever fails to resolve — better an odd-looking filename than a
+            // silently shortened path that names the wrong mailbox.
+            names.append(itemsByID[prefix]?.display ?? String(component))
+        }
+        return names.joined(separator: " ▸ ")
+    }
+
     /// Forward the selected message as an `.eml` attachment rather than as
     /// quoted text.
     ///
@@ -3147,13 +3775,20 @@ final class AppModel: ObservableObject {
             else { return text }
         }
         guard let h = html else { return "" }
-        var out = ""; var inTag = false
-        for ch in h {
-            if ch == "<" { inTag = true; continue }
-            if ch == ">" { inTag = false; out.append(" "); continue }
-            if !inTag { out.append(ch) }
-        }
-        return out
+        // `RichTextHTML.parse`, not a tag stripper.
+        //
+        // This used to walk the HTML dropping anything between `<` and `>`,
+        // which removes the tags and leaves everything else exactly as written —
+        // so a quoted reply came out full of `that&#39;s` and `&amp;` and
+        // `&nbsp;`. Entities are not tags; nothing here was decoding them.
+        //
+        // The parser that does it properly was already in the project and
+        // already used by Forward, which is why forwarding an HTML message read
+        // correctly and replying to the same message did not. It also gets the
+        // line structure right — `<br>` and `<p>` become real breaks instead of
+        // the single space the stripper substituted for every tag, which is what
+        // made long quotes arrive as one unbroken paragraph.
+        return RichTextHTML.parse(h).plainText
     }
 
     /// The styled body of a draft record, or nil when it carries no styling.
@@ -3169,7 +3804,7 @@ final class AppModel: ObservableObject {
     /// Eudora flattened into a lone `text/html` leaf (the `<x-html>` form) is
     /// somebody else's mail being forwarded/edited, not a draft of ours, and its
     /// arbitrary markup is not something the composer should try to round-trip —
-    /// `plainText(of:)` handles that the way it always has.
+    /// `plainText(of:)` flattens it instead.
     static func styledBody(of part: MIMEPart) -> RichText? {
         // A styled draft that also carries attachments is multipart/mixed with the
         // alternative nested one level down — descend to it, so reopening such a
@@ -4435,31 +5070,134 @@ final class AppModel: ObservableObject {
             self.isIndexing = true
             self.indexProgress = IndexProgress(done: 0, total: 0)
             self.searchStatus = "Indexing…"
-            self.searchIndex = nil
+            // **The existing index stays open and queryable.** It used to be
+            // dropped here, and `rebuild` begins with `DELETE FROM messages`, so
+            // between the two there was no index at all for the length of a
+            // rebuild — Find returned nothing and Move To offered no filing
+            // suggestions, silently. Worse, interrupting a rebuild (a crash, or
+            // quitting while it ran) left the index *destroyed* rather than
+            // stale, with nothing to say so.
+            //
+            // So the new one is built beside it and swapped in at the end. This
+            // is the same discipline the mail files already follow — backup,
+            // write to a temp, atomically replace — and the search index was the
+            // last place still writing destructively in place.
+
+            let scratch = path + ".new"
+            // A leftover from a build that died: harmless, but starting from it
+            // would mean appending to a half-finished index.
+            try? FileManager.default.removeItem(atPath: scratch)
 
             // Heavy work off the main thread; awaiting keeps the UI responsive.
-            let outcome = await Task.detached(priority: .userInitiated) { () -> (SearchIndex?, String) in
+            let outcome = await Task.detached(priority: .userInitiated) { () -> (Int?, String) in
                 do {
-                    let idx = try SearchIndex(path: path)
+                    let idx = try SearchIndex(path: scratch)
                     try idx.rebuild(from: store) { done, total in
                         Task { @MainActor [weak self] in
                             guard let self, self.indexGeneration == gen else { return }
                             self.indexProgress = IndexProgress(done: done, total: total)
                         }
                     }
-                    return (idx, "Indexed \(try idx.count()) messages.")
+                    // The count, not the index itself: the connection has to be
+                    // closed before the file can be moved into place, and
+                    // letting it die at the end of this scope is how that
+                    // happens (`SQLiteDB.deinit` closes the handle).
+                    return (try idx.count(), "Indexed \(try idx.count()) messages.")
                 } catch {
                     return (nil, "Index error: \(error)")
                 }
             }.value
 
             // Apply only if this build wasn't superseded by a newer one.
-            guard self.indexGeneration == gen else { return }
-            self.searchIndex = outcome.0
-            self.searchStatus = outcome.1
+            guard self.indexGeneration == gen else {
+                try? FileManager.default.removeItem(atPath: scratch)
+                return
+            }
+
+            if outcome.0 != nil {
+                // Close ours before replacing the file underneath it, then
+                // reopen. The gap is a few milliseconds, against the minutes the
+                // old code spent with no index at all.
+                self.searchIndex = nil
+                do {
+                    _ = try FileManager.default.replaceItemAt(URL(fileURLWithPath: path),
+                                                              withItemAt: URL(fileURLWithPath: scratch))
+                    self.searchIndex = try SearchIndex(path: path)
+                    self.searchStatus = outcome.1
+                } catch {
+                    // The old index is gone from memory but still on disk —
+                    // reopening it is better than leaving the app with none.
+                    self.searchIndex = try? SearchIndex(path: path)
+                    self.searchStatus = "Index built but couldn't be installed: \(error)"
+                }
+            } else {
+                // The build failed. The previous index was never touched, which
+                // is the whole point of building beside it.
+                try? FileManager.default.removeItem(atPath: scratch)
+                self.searchStatus = outcome.1
+            }
             self.isIndexing = false
             self.indexingPath = nil
+            self.lastIndexBuilt = Date()
         }
+    }
+
+    // MARK: - Overnight rebuild
+
+    /// Rebuild the index in the small hours, if the Mac has been left alone.
+    ///
+    /// The index is a snapshot: mail delivered since the last build isn't in it,
+    /// so Find misses recent messages and a new correspondent gets no filing
+    /// suggestions. Rebuilding is minutes of disk work on a 12 GB tree, which is
+    /// why it isn't done on every delivery — but it is exactly the sort of thing
+    /// that should happen while nobody is watching.
+    @Published var autoRebuildIndex: Bool =
+        UserDefaults.standard.bool(forKey: AppModel.autoRebuildKey) {
+        didSet {
+            guard autoRebuildIndex != oldValue else { return }
+            UserDefaults.standard.set(autoRebuildIndex, forKey: Self.autoRebuildKey)
+        }
+    }
+    private static let autoRebuildKey = "autoRebuildIndexOvernight"
+
+    /// When the index was last built, so the overnight run happens once a night
+    /// rather than every time the check fires during the small hours.
+    private var lastIndexBuilt: Date?
+
+    private var overnightTimer: Timer?
+
+    /// The hour (local) to rebuild in, and how long the Mac must have been idle.
+    private static let overnightHour = 3
+    private static let requiredIdle: TimeInterval = 60 * 60
+
+    /// Start watching for the overnight window. Called when a tree is opened.
+    func startOvernightRebuildWatch() {
+        overnightTimer?.invalidate()
+        // Five minutes: the window is an hour wide, so nothing is missed, and an
+        // idle check this cheap costs nothing.
+        overnightTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) {
+            [weak self] _ in
+            Task { @MainActor in self?.considerOvernightRebuild() }
+        }
+    }
+
+    private func considerOvernightRebuild() {
+        guard autoRebuildIndex, !isIndexing, !isSearching, let root = rootURL else { return }
+        guard Calendar.current.component(.hour, from: Date()) == Self.overnightHour else { return }
+        // Once a night. Without this the check would fire twelve times during
+        // the 3 a.m. hour and start a rebuild each time the previous finished.
+        if let last = lastIndexBuilt,
+           Calendar.current.isDate(last, inSameDayAs: Date()) { return }
+
+        // System-wide idle, not "idle in Eudora". The question is whether anyone
+        // is at the Mac — someone working in another app at 3 a.m. would not
+        // thank us for spending the disk on this. `secondsSinceLastEventType`
+        // answers exactly that and needs no accessibility permission.
+        let idle = CGEventSource.secondsSinceLastEventType(
+            .hidSystemState, eventType: CGEventType(rawValue: ~0)!)
+        guard idle >= Self.requiredIdle else { return }
+
+        startIndexing(for: root)
     }
 
     /// Menu/command "Rebuild Search Index".
@@ -4543,13 +5281,38 @@ final class AppModel: ObservableObject {
             return
         }
         NSApp.activate(ignoringOtherApps: true)
+        // Bring the main window forward, not just the app. The Find window is
+        // usually sitting on top of it — that is where the click came from — so
+        // without this, "View in Mailbox" selects a message the user cannot see.
+        // `MainWindowAccessor.resolved` is the window SwiftUI actually used,
+        // recorded when it appeared; never guessed at by scanning `NSApp.windows`
+        // or matching a title, both of which this codebase has been burned by.
+        MainWindowAccessor.resolved?.makeKeyAndOrderFront(nil)
         if selectedMailboxID == hit.mailbox {
             // Mailbox already listed; just move the selection (onChange renders it).
             selectMessage(index)
+            // And bring it to the middle of the list. `keepSelectionVisible`
+            // would do the minimum, which is right when the list is where the
+            // user left it — but arriving from a search means the messages
+            // around this one are the reason for coming, and a row pinned to the
+            // bottom edge shows only the ones before it.
+            if let pos = rowPositionByID[index] {
+                revealCentered(row: pos)
+            } else {
+                // The mailbox is listed but its rows aren't on screen yet — a
+                // listing still in flight leaves `rowPositionByID` empty. Go
+                // through the pending-jump path instead, which runs after the
+                // rows land, rather than selecting a message and leaving the
+                // list wherever it happened to be.
+                pendingMessageID = index
+                pendingMessageIsExplicitJump = true
+                loadListing(force: true)
+            }
         } else {
             // Jumping into In from a search hit also dismisses its badge.
             if inboxHasNewMail, hit.mailbox == inboxID { inboxHasNewMail = false }
             pendingMessageID = index
+            pendingMessageIsExplicitJump = true
             selectedMailboxID = hit.mailbox   // onChange → loadListing() applies pending
         }
     }

@@ -490,6 +490,15 @@ struct SettingsView: View {
     @State private var newCorrectionTrigger = ""
     @State private var newCorrectionReplacement = ""
 
+    /// Which app macOS opens `mailto:` links with, re-read whenever the pane
+    /// appears and after the button is pressed.
+    @State private var mailHandler = DefaultMailClient.Current(
+        url: nil, isThisBuild: false, isAnotherEudora: false)
+    @State private var mailHandlerNote: String?
+    /// True while macOS's own confirmation is up, so the button can't stack
+    /// alerts behind it.
+    @State private var isSettingMailHandler = false
+
     /// Installed font families, resolved once for the composing-face picker.
     private static let families: [String] = NSFontManager.shared.availableFontFamilies
 
@@ -880,6 +889,74 @@ struct SettingsView: View {
                         + "you're viewing right away.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            Section("Search index") {
+                Toggle("Rebuild overnight when the Mac is idle",
+                       isOn: $model.autoRebuildIndex)
+                Text("The index is a snapshot: mail that has arrived since it was "
+                        + "built isn't found by Find, and a new correspondent gets no "
+                        + "filing suggestions in Move To. Rebuilding takes minutes on a "
+                        + "large folder, so this waits for 3 a.m. and for the Mac to "
+                        + "have been untouched for an hour. Once a night, and never "
+                        + "while you're using it — searching stays available "
+                        + "throughout, because the new index is built alongside the "
+                        + "old one and swapped in when it's finished.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section("Default email app") {
+                HStack {
+                    Text(mailHandler.isThisBuild
+                         ? "This copy of Eudora opens mailto: links."
+                         : "mailto: links open \(mailHandler.name).")
+                    Spacer()
+                    // A plain Button — note `SettingsButton` in this file is not
+                    // a general-purpose button, it is the control that *opens*
+                    // the Settings window.
+                    //
+                    // Only offered on macOS 14+, where there is an API for it.
+                    // On 13 the caption below says where the setting lives
+                    // instead: a button whose only possible outcome is "you
+                    // can't do this here" is worse than no button.
+                    //
+                    // Gone entirely once Eudora *is* the default, rather than
+                    // greyed out. A disabled "Make Eudora the default" implies
+                    // an action that is currently blocked and might be unblocked
+                    // — but there is nothing to unblock and nothing to want:
+                    // undoing this means going to another mail app and making
+                    // *it* the default. The sentence to the left already says
+                    // the true thing, and the button had nothing to add.
+                    if #available(macOS 14.0, *), !mailHandler.isThisBuild {
+                        Button("Make Eudora the default") { makeEudoraDefault() }
+                            .disabled(isSettingMailHandler)
+                            .help("Ask macOS to send mailto: links to Eudora.")
+                    }
+                }
+                // The path, not just the name — LaunchServices identifies an app
+                // by where it is, so a build in DerivedData and a copy elsewhere
+                // are two different apps to it despite sharing an identifier.
+                // When a link doesn't reach the running Eudora, this line is
+                // usually the reason, and it is otherwise invisible.
+                if !mailHandler.path.isEmpty {
+                    Text(mailHandler.path)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(2).truncationMode(.middle)
+                }
+                if let note = mailHandlerNote {
+                    Text(note).font(.caption).foregroundStyle(.secondary)
+                }
+                if #available(macOS 14.0, *) {
+                    Text("Clicking an email address in a browser or another app "
+                            + "opens a new message here. macOS may ask you to "
+                            + "confirm the change.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("On this version of macOS the setting lives in "
+                            + "Mail ▸ Settings ▸ General ▸ Default email reader.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
             Section("Mailboxes") {
                 Toggle("Show Junk mailbox", isOn: $model.showJunkMailbox)
                 Text("Off hides the Junk mailbox from the sidebar and the move/search "
@@ -932,6 +1009,47 @@ struct SettingsView: View {
         // Greedy, so the footer below is pinned to the bottom of the window
         // rather than floating under the last section on a tall window.
         .frame(maxHeight: .infinity)
+        .onAppear { mailHandler = DefaultMailClient.current() }
+        // `onAppear` alone is not enough, and the reason is documented at the
+        // top of this file: the Settings scene keeps its window and hosting view
+        // alive after a close, so the view never disappears and `onAppear` never
+        // fires again. The handler can be changed from outside Eudora entirely —
+        // Mail's own settings — and a stale line here would send you hunting for
+        // a bug that isn't there. Re-reading on activation covers it.
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification)) { _ in
+            mailHandler = DefaultMailClient.current()
+        }
+    }
+
+    /// Ask macOS to send `mailto:` links here.
+    private func makeEudoraDefault() {
+        mailHandlerNote = nil
+        isSettingMailHandler = true
+        DefaultMailClient.makeDefault { outcome in
+            isSettingMailHandler = false
+            mailHandler = DefaultMailClient.current()
+            switch outcome {
+            case .succeeded:
+                // The registration is not reliably visible to this process the
+                // instant the completion fires, so a successful change can read
+                // back as "still Mail" — which looks exactly like failure. Look
+                // again a moment later, and only then say something.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    let now = DefaultMailClient.current()
+                    mailHandler = now
+                    mailHandlerNote = now.isThisBuild
+                        ? nil
+                        : "macOS accepted the change but still lists "
+                          + "\(now.name). Reopen Settings to check."
+                }
+            case .failed(let message):
+                mailHandlerNote = "macOS didn't make the change: \(message)"
+            case .needsMailApp:
+                mailHandlerNote = "This macOS version can only change it from "
+                    + "Mail ▸ Settings ▸ General ▸ Default email reader."
+            }
+        }
     }
 
     /// The identity set as displayable rows: exact addresses, then domain rules

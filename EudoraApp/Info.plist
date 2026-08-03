@@ -10,6 +10,17 @@
 	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+	<!-- The Dock/Finder/⌘-Tab icon. BOTH halves are needed and neither is
+	     enough: ASSETCATALOG_COMPILER_APPICON_NAME in project.yml is what
+	     compiles AppIcon.appiconset into Assets.car, and this key is what makes
+	     the bundle point at it. Xcode normally injects this itself, but only
+	     when it is generating the Info.plist — this target sets
+	     GENERATE_INFOPLIST_FILE: NO and supplies this file by hand, so nothing
+	     adds it. Without it the build succeeds, the icon is compiled and
+	     shipped inside the app, and the app still shows the blank generic
+	     icon with no warning anywhere. -->
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
 	<key>CFBundleName</key>
 	<string>Eudora</string>
 	<key>CFBundleDisplayName</key>
@@ -24,6 +35,28 @@
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
+	<!-- Registers Eudora as a handler for mailto: links, which is what makes it
+	     appear in Mail.app's Settings > General > "Default email reader" list.
+	     Declaring it is not the same as being chosen: macOS still routes every
+	     mailto: to whichever app is *set* as the default, and that setting lives
+	     in Mail's own settings, not in System Settings and not in the browser.
+	     LaunchServices caches this, so after the first build carrying it, run
+	         /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /path/to/Eudora.app
+	     if Eudora doesn't show up in that list. Same lesson as CFBundleIconName
+	     above: the build succeeds and nothing warns when this is missing. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Email Address</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>mailto</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSHighResolutionCapable</key>

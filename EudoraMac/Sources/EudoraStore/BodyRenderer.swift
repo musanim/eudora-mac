@@ -25,9 +25,24 @@ public struct RenderedBody {
     public let html: String
     public let images: [String: EmbeddedImage]
 
-    public init(html: String, images: [String: EmbeddedImage]) {
+    /// Links whose visible text claims a different destination from their
+    /// `href`, as destination URL → the host the text claimed.
+    ///
+    /// Collected here because here is the only place it can be. It is the
+    /// strongest phishing signal there is — text reading `paypal.com` over an
+    /// href going elsewhere — and neither of the two parties that could act on
+    /// it can see it: the browser is only ever handed the destination, and
+    /// WKWebView's navigation delegate isn't given the anchor text (and JS,
+    /// which could fetch it, is off by design). The renderer has the HTML in
+    /// front of it, so it notes the mismatch on the way past and the click path
+    /// looks it up.
+    public let misleadingLinks: [String: String]
+
+    public init(html: String, images: [String: EmbeddedImage],
+                misleadingLinks: [String: String] = [:]) {
         self.html = html
         self.images = images
+        self.misleadingLinks = misleadingLinks
     }
 }
 
@@ -87,7 +102,76 @@ public enum BodyRenderer {
         }
         out += ns.substring(from: cursor)
 
-        return RenderedBody(html: out, images: resources)
+        return RenderedBody(html: out, images: resources,
+                            misleadingLinks: misleadingLinks(in: out))
+    }
+
+    /// Every `<a href="…">text</a>` whose text names a different destination
+    /// from its href, as href → the claimed host.
+    ///
+    /// Scanned over the *rewritten* HTML, so the image boxes this file has just
+    /// inserted are included — and they should be: a "blocked remote image" box
+    /// is an `<a href>` to the real remote URL, and its visible text is
+    /// Eudora's own wording, which claims no host and is therefore ignored.
+    ///
+    /// Tag-stripped before comparing, because the visible text of a styled link
+    /// is `<b>paypal.com</b>` as often as it is bare. Entities are decoded for
+    /// the same reason: `&#112;aypal.com` renders as `paypal.com` and would
+    /// otherwise sail past.
+    static func misleadingLinks(in html: String) -> [String: String] {
+        var out: [String: String] = [:]
+        let lower = html.lowercased()
+        var index = lower.startIndex
+
+        while let anchor = lower.range(of: "<a ", range: index..<lower.endIndex) {
+            guard let openEnd = lower.range(of: ">", range: anchor.upperBound..<lower.endIndex),
+                  let close = lower.range(of: "</a", range: openEnd.upperBound..<lower.endIndex)
+            else { break }
+            index = openEnd.upperBound
+
+            let tag = String(html[anchor.lowerBound..<openEnd.upperBound])
+            let text = String(html[openEnd.upperBound..<close.lowerBound])
+            if let href = attribute("href", in: tag),
+               let claimed = LinkSafety.textMisleads(anchorText: decodeEntities(stripTags(text)),
+                                                     href: href) {
+                out[href] = claimed
+            }
+            index = close.upperBound
+        }
+        return out
+    }
+
+    private static func stripTags(_ s: String) -> String {
+        var out = ""
+        var depth = 0
+        for ch in s {
+            if ch == "<" { depth += 1 }
+            else if ch == ">" { if depth > 0 { depth -= 1 } }
+            else if depth == 0 { out.append(ch) }
+        }
+        return out
+    }
+
+    /// The handful of entities that matter for this comparison: the ones that
+    /// can spell a hostname. Not a general decoder — anything unrecognised is
+    /// left alone, which can only cause a mismatch to be *missed*, never
+    /// invented.
+    private static func decodeEntities(_ s: String) -> String {
+        guard s.contains("&") else { return s }
+        var out = s
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&#46;", with: ".")
+            .replacingOccurrences(of: "&period;", with: ".")
+        // Numeric character references for plain letters and digits, which is
+        // how a hostname gets obfuscated without looking obfuscated.
+        while let start = out.range(of: "&#"),
+              let end = out.range(of: ";", range: start.upperBound..<out.endIndex) {
+            let digits = out[start.upperBound..<end.lowerBound]
+            guard let code = UInt32(digits), let scalar = Unicode.Scalar(code) else { break }
+            out.replaceSubrange(start.lowerBound..<end.upperBound, with: String(Character(scalar)))
+        }
+        return out
     }
 
     // MARK: - per-<img> transformation

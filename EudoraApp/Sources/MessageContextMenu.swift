@@ -164,6 +164,14 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
     /// time its submenu opened, and the submenu would come up empty.
     private var moveBuilders: [MailboxMenuBuilder] = []
 
+    /// Prints where the menu was asked to appear, for when it doesn't.
+    ///
+    /// Off, intact, in the manner of the other diagnostics here. It exists
+    /// because two rounds of reasoning about flipped coordinates produced two
+    /// identically-wrong answers, and the thing that would have settled it in
+    /// one build was reading the numbers.
+    static let diagnosePlacement = false
+
     /// The row the right-click landed on, captured by the event monitor.
     ///
     /// Needed because we pop the menu ourselves: AppKit sets `clickedRow` inside
@@ -215,7 +223,67 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             guard row >= 0 else { return event }
 
             self.pendingRow = row
-            NSMenu.popUpContextMenu(self.menu, with: event, for: table)
+            // Below the row, not at the pointer.
+            //
+            // A context menu at the click point covers the message it is about —
+            // and the one time that matters most is "Move to ▸ New…", where you
+            // are naming a mailbox *after* the message you are looking at, and
+            // the menu is sitting on top of it. Hanging the menu off the row's
+            // bottom edge keeps the row visible whatever part of it was clicked.
+            //
+            // **In screen coordinates, deliberately.** Passing the row rect's
+            // `maxY` in the table's own (flipped) space put the menu's top at
+            // the row's *midpoint* — so the view-relative form does not mean
+            // what it reads like here, and rather than nudge it by an
+            // experimentally-derived half a row, this converts all the way out
+            // to the screen, where there is only one convention and no flipping
+            // to reason about.
+            //
+            // The chain: the row rect is in the table's flipped space, so its
+            // visual bottom is `maxY` there; converting the *rect* to window
+            // coordinates (unflipped, origin bottom-left) turns that edge into
+            // the rect's `minY`; `convertPoint(toScreen:)` finishes the job.
+            // `popUp(positioning:at:in:)` with a nil view takes screen
+            // coordinates and places the menu's top-left at the point.
+            //
+            // `minX` rather than the click's x, so the menu lines up with the
+            // row instead of wherever the pointer happened to be — otherwise it
+            // still wanders horizontally, which is half the same complaint.
+            //
+            // Not `popUpContextMenu(_:with:for:)`, which positions from the
+            // event and offers no say. AppKit may still slide the menu up when
+            // it won't fit below — the same behaviour that had the Transfer menu
+            // riding over the menu bar — but on a menu this short that needs a
+            // row almost at the screen's edge.
+            let rowInWindow = table.convert(table.rect(ofRow: row), to: nil)
+
+            // **A measured correction, not a derived one.** `popUp` does not put
+            // the menu's top-left at the point it is given: it sits the menu
+            // somewhat higher, by an inset AppKit doesn't expose. Asking for the
+            // row's bottom edge — first in the table's flipped space, then in
+            // screen coordinates, which produced pixel-identical results and so
+            // ruled out the coordinate maths — left the menu's top at the row's
+            // *midpoint* both times.
+            //
+            // So the compensation is half a row, because that is what was
+            // observed. It is expressed against `rowInWindow.height` rather than
+            // as a number so it stays right if the row height changes, and the
+            // row height here is pinned (see `TableScrollStateSyncer.pinRowHeight`),
+            // so it is stable in practice.
+            //
+            // If this ever drifts, it is because AppKit's inset changed, and the
+            // way to fix it is to measure again — not to reason about it. Set
+            // `diagnosePlacement` and read the numbers.
+            let correction = rowInWindow.height / 2
+            let anchor = NSPoint(x: rowInWindow.minX, y: rowInWindow.minY - correction)
+            if Self.diagnosePlacement {
+                print("ctx menu diag: row \(row) rect(table) \(table.rect(ofRow: row))"
+                      + "  rect(window) \(rowInWindow)  correction \(correction)"
+                      + "  anchor(screen) \(window.convertPoint(toScreen: anchor))")
+            }
+            self.menu.popUp(positioning: nil,
+                            at: window.convertPoint(toScreen: anchor),
+                            in: nil)
             return nil          // consumed; AppKit must not also handle it
         }
     }
@@ -287,6 +355,14 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             return
         }
 
+        // Select the clicked rows now, up front, rather than when an item is
+        // chosen. `actOnClickedRows` still does it on action — it has to, since
+        // the menu can be dismissed and re-opened — but "Move to" needs the
+        // selection *while it builds*, because its filing suggestions are
+        // computed from it. Selecting on right-click is the platform
+        // convention anyway.
+        model.applyMessageSelection(clickedIDs, primary: clickedPrimary)
+
         // Move first: it's the reason this menu exists in AppKit at all, and the
         // one action used often enough to want under the pointer. Mark as
         // Read/Unread are deliberately absent — Stephen doesn't use them, and
@@ -308,6 +384,22 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             onNew: { [weak self] parent in
                 guard let self else { return }
                 self.actOnClickedRows { self.model.createMailboxAndMoveSelection(under: parent) }
+            },
+            // A pure read. Suggestions come from the *selection*, and the
+            // right-click has already made the clicked rows the selection — see
+            // `menuNeedsUpdate`.
+            //
+            // It deliberately does not select here. An earlier version did,
+            // because `actOnClickedRows` only selects when an item is chosen and
+            // that is too late for a menu that must already show the right
+            // suggestions. But selecting from inside `menuNeedsUpdate` meant
+            // merely *hovering* "Move to" until its submenu opened and then
+            // pressing Escape left the selection moved and the preview pane
+            // loading a message nobody picked — and AppKit is free to call
+            // `menuNeedsUpdate:` more than once, which a side-effecting closure
+            // must not rely on.
+            suggestions: { [weak self] in
+                self?.model.filingSuggestions() ?? []
             })
         submenu.delegate = builder
         moveBuilders.append(builder)

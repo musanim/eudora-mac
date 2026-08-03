@@ -71,6 +71,18 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
     /// offered (a caller that only moves, never creates).
     private let onNew: ((MailboxItem.ID?) -> Void)?
 
+    /// Where this correspondent's mail has been filed before, asked for at the
+    /// moment the menu opens. Root level only; nil in child builders, and in
+    /// callers that don't want it.
+    ///
+    /// This is the point of the whole feature: a Transfer menu over a real tree
+    /// is thousands of mailboxes deep, and the answer is nearly always one of
+    /// two or three that the archive already knows. Asked lazily, like
+    /// everything else here, because computing it costs a read per selected
+    /// message and an index query — fine when the menu opens, wasteful on every
+    /// selection change.
+    private let suggestions: (() -> [AppModel.FilingSuggestion])?
+
     /// Child builders, retained because `NSMenu.delegate` is a **weak**
     /// reference: a builder that nothing else held would be gone by the time its
     /// submenu opened, and the submenu would come up empty. Whoever owns the
@@ -81,11 +93,13 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
     init(items: [MailboxItem],
          folderID: MailboxItem.ID? = nil,
          onPick: @escaping (MailboxItem.ID) -> Void,
-         onNew: ((MailboxItem.ID?) -> Void)? = nil) {
+         onNew: ((MailboxItem.ID?) -> Void)? = nil,
+         suggestions: (() -> [AppModel.FilingSuggestion])? = nil) {
         self.items = items
         self.folderID = folderID
         self.onPick = onPick
         self.onNew = onNew
+        self.suggestions = suggestions
         super.init()
     }
 
@@ -96,6 +110,67 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
         // negligible cost of redoing it.
         menu.removeAllItems()
         children.removeAll()
+
+        // Where this person's mail already goes, ahead of everything else.
+        //
+        // When there are suggestions the root menu becomes a short answer plus a
+        // way to the long one, instead of the tree: the two or three mailboxes
+        // this correspondent has been filed into, then "Other ▸" holding exactly
+        // the menu that used to be here — hierarchy, "New…" at every level and
+        // all. So nothing is lost and the common case stops being a hunt.
+        //
+        // A new correspondent produces no suggestions and this whole branch is
+        // skipped, leaving the old menu untouched. The feature can only make
+        // things better or leave them alone.
+        // The root of a *suggesting* menu is always short: New…, however many
+        // suggestions there are, and Other. Even with none, which is why this
+        // branch is entered on `suggestions != nil` rather than on the list
+        // being non-empty.
+        //
+        // Shortness is the point, and not only for reading. An `NSMenu` that
+        // doesn't fit below the point it was popped at gets slid *upwards* by
+        // AppKit until it fits on screen — so the old root, 83 items of
+        // top-level tree, came up overlapping the menu bar it hung from, while
+        // every short menu beside it hung neatly below. Nothing positions it
+        // wrongly; it is too tall to be positioned rightly. Three items always
+        // fit, so Transfer now sits where File and Message do.
+        let suggested = suggestions?() ?? []
+        if suggestions != nil {
+            // "New…" stays at the root, above the suggestions, because Stephen
+            // asked for three things at this level — the short list, Other, and
+            // New — and burying New inside Other would make creating a mailbox
+            // one level deeper than it is today.
+            if onNew != nil {
+                let entry = NSMenuItem(title: "New…", action: #selector(newHere),
+                                       keyEquivalent: "")
+                entry.target = self
+                menu.addItem(entry)
+                menu.addItem(.separator())
+            }
+            for suggestion in suggested {
+                let entry = NSMenuItem(title: "\(suggestion.path)  (\(suggestion.count))",
+                                       action: #selector(pick(_:)), keyEquivalent: "")
+                entry.target = self
+                entry.representedObject = suggestion.id
+                menu.addItem(entry)
+            }
+            if !suggested.isEmpty { menu.addItem(.separator()) }
+
+            // The full tree, one level down. Built by a *child* builder with no
+            // suggestions closure, so the suggestions appear once at the top
+            // rather than again inside.
+            let other = NSMenu(title: "Other")
+            other.autoenablesItems = false
+            let child = MailboxMenuBuilder(items: items, folderID: nil,
+                                           onPick: onPick, onNew: onNew)
+            other.delegate = child
+            children.append(child)
+
+            let otherEntry = NSMenuItem(title: "Other", action: nil, keyEquivalent: "")
+            otherEntry.submenu = other
+            menu.addItem(otherEntry)
+            return
+        }
 
         // "New…" first, above a separator — where Eudora 7 put it, at every
         // level of the hierarchy.
@@ -196,8 +271,10 @@ final class MoveToMenuController: ObservableObject {
     /// never show a tree older than the button press.
     func popUp(tree: [MailboxItem],
                onPick: @escaping (MailboxItem.ID) -> Void,
-               onNew: ((MailboxItem.ID?) -> Void)? = nil) {
-        let builder = MailboxMenuBuilder(items: tree, onPick: onPick, onNew: onNew)
+               onNew: ((MailboxItem.ID?) -> Void)? = nil,
+               suggestions: (() -> [AppModel.FilingSuggestion])? = nil) {
+        let builder = MailboxMenuBuilder(items: tree, onPick: onPick, onNew: onNew,
+                                         suggestions: suggestions)
         rootBuilder = builder
         menu.delegate = builder      // popUp asks the delegate to fill it
 
@@ -345,13 +422,17 @@ struct MoveToMenuButton<Label: View>: View {
     let onPick: (MailboxItem.ID) -> Void
     /// Optional "New…" handler, per level; nil leaves the item out.
     var onNew: ((MailboxItem.ID?) -> Void)? = nil
+    /// Optional filing history for the current selection; nil leaves the short
+    /// list out and the menu is the plain hierarchy.
+    var suggestions: (() -> [AppModel.FilingSuggestion])? = nil
     @ViewBuilder let label: () -> Label
 
     @StateObject private var controller = MoveToMenuController()
 
     var body: some View {
         Button {
-            controller.popUp(tree: tree(), onPick: onPick, onNew: onNew)
+            controller.popUp(tree: tree(), onPick: onPick, onNew: onNew,
+                             suggestions: suggestions)
         } label: {
             label().background(
                 // Made to fill deliberately. The menu is positioned from this

@@ -246,7 +246,11 @@ public enum MIMEParser {
         // in <x-html>…</x-html> (and, for format=flowed, plain text in
         // <x-flowed>…), with the MIME parts removed even though the Content-Type
         // header still claims multipart. Recover it as the correct text leaf.
-        if let eudora = EudoraBody.detect(bodyBytes) {
+        if let eudora = EudoraBody.detect(
+            bodyBytes,
+            // No `Content-Type` at all is Eudora 7's composed-message
+            // signature; see `EudoraBody.detect`.
+            declaresContentType: part.header("Content-Type") != nil) {
             part.eudoraContentType = eudora.contentType
             part.body = eudora.body
             part.eudoraTrailer = eudora.trailer
@@ -411,14 +415,44 @@ public enum MIMEParser {
 /// `<x-html>…</x-html>` and format=flowed plain text as `<x-flowed>…</x-flowed>`.
 /// The bytes between the markers are the real content.
 enum EudoraBody {
-    static func detect(_ body: [UInt8]) -> (contentType: String, body: [UInt8], trailer: [UInt8])? {
+    static func detect(_ body: [UInt8],
+                       declaresContentType: Bool = true)
+        -> (contentType: String, body: [UInt8], trailer: [UInt8])? {
         if let r = between(body, "<x-html>", "</x-html>") {
             return ("text/html", r.inner, r.trailer)
         }
         if let r = between(body, "<x-flowed>", "</x-flowed>") {
             return ("text/plain", r.inner, r.trailer)
         }
+        // Mail Eudora 7 *composed*, as opposed to mail it received.
+        //
+        // The wrappers above are what it puts on incoming mail. Its own
+        // outgoing messages are stored differently: a bare `<html>…</html>`
+        // body, full of Eudora's private `<x-tab>` markup, and **no
+        // `Content-Type` header at all**. With nothing declared the parser fell
+        // back to text/plain and the reader showed the HTML source — which is
+        // what the whole of Out looks like for anything composed before the
+        // cut-over, and what forwarded HTML looks like for ever.
+        //
+        // Gated on there being no declared type, which is the signature of this
+        // form. A message that genuinely says `text/plain` and happens to begin
+        // with `<html>` is someone sending markup as text, and is left alone.
+        if !declaresContentType, startsWithHTML(body) {
+            return ("text/html", body, [])
+        }
         return nil
+    }
+
+    /// Whether the body opens with an HTML document, ignoring leading blank
+    /// space. Not a search: `<html>` further in is quoted markup inside a
+    /// plain-text message, which is a different thing entirely.
+    private static func startsWithHTML(_ body: [UInt8]) -> Bool {
+        var i = 0
+        while i < body.count, body[i] == 0x20 || body[i] == 0x09
+                || body[i] == 0x0d || body[i] == 0x0a { i += 1 }
+        let head = String(decoding: body[i..<min(i + 20, body.count)], as: UTF8.self)
+            .lowercased()
+        return head.hasPrefix("<html") || head.hasPrefix("<!doctype html")
     }
 
     /// The bytes between the markers, plus everything after the closing one.

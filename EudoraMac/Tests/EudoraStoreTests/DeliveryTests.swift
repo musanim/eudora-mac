@@ -69,13 +69,12 @@ final class DeliveryTests: XCTestCase {
         XCTAssertTrue(row.who.contains("them@example.com"), "got \(row.who)")
     }
 
-    /// NOTE for anyone extending this: ö and é are not arbitrary choices. The
-    /// TOC's cached fields are written and read as **Latin-1**
-    /// (`TocWriter.putString` maps any scalar ≥ 256 to `?`), so these two
-    /// round-trip exactly while a Cyrillic, CJK or em-dash name would come back
-    /// as question marks. That is the format's limit, not a bug — Windows
-    /// Eudora 7 reads the same bytes — so a test using such a name would fail
-    /// for a reason that has nothing to do with decoding.
+    /// NOTE for anyone extending this: the TOC's cached fields are written and
+    /// read as **CP1252** (see `CP1252.swift`), so ö and é round-trip exactly,
+    /// as do the curly quotes, dashes and ellipsis Windows Eudora 7 stored
+    /// there. A Cyrillic or CJK name still comes back as question marks — that
+    /// is the format's limit, not a bug — so a test using one would fail for a
+    /// reason that has nothing to do with decoding.
     func testEncodedWordHeadersAreDecodedBeforeCaching() throws {
         let raw = Data([
             "From: =?utf-8?Q?Bj=C3=B6rn?= <bjorn@example.com>",

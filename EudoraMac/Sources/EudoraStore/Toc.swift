@@ -67,6 +67,10 @@ public enum Toc {
         let endBound = min(start + len, b.count)
         var slice = Array(b[start..<endBound])
         if let z = slice.firstIndex(of: 0) { slice = Array(slice[0..<z]) }
-        return String(bytes: slice, encoding: .isoLatin1) ?? ""
+        // CP1252, not Latin-1: Eudora 7 is a Windows program, and the two differ
+        // exactly where mail lives — 0x91-0x97 are the curly quotes and dashes,
+        // 0x85 the ellipsis, 0x99 the trademark sign. Latin-1 renders those as
+        // invisible C1 controls. See CP1252.swift.
+        return CP1252.decode(slice)
     }
 }

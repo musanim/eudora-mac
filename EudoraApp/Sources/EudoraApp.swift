@@ -38,6 +38,10 @@ struct EudoraApp: App {
                 // there is a window for it to come up in front of. Does nothing
                 // when Settings was closed. See `SettingsWindowState`.
                 .onAppear { SettingsWindowState.reopenIfItWasOpen() }
+                // NB: mailto: links are *not* handled with `.onOpenURL` here.
+                // See `AppDelegate.application(_:open:)` — and note that
+                // implementing that delegate method silently stops `.onOpenURL`
+                // firing, so the two must never both be present.
         }
         .commands { eudoraCommands }
 
@@ -69,7 +73,12 @@ struct EudoraApp: App {
             FindView()
                 .environmentObject(model)
                 .environmentObject(accounts)
-                .frame(minWidth: 720, minHeight: 460)
+                // The results pane now renders messages with `PreviewView`, the
+                // same reader the main window uses, and that reads the body font
+                // from here. Without it the window traps at launch on the
+                // missing environment object.
+                .environmentObject(composeSettings)
+                .frame(minWidth: 720, minHeight: 620)
         }
 
         Settings {
@@ -258,13 +267,212 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// unobstructed.
     var onQuit: () -> NSApplication.TerminateReply = { .terminateNow }
 
+    /// Where incoming `mailto:` URLs go once there is a model to take them.
+    /// Installed by `ContentView.onAppear`, alongside `onQuit`.
+    ///
+    /// Setting it flushes whatever arrived first — see `openURLs`.
+    var onOpenURLs: (([URL]) -> Void)? {
+        didSet { flushOpenURLs() }
+    }
+
+    /// URLs delivered before `onOpenURLs` was installed.
+    ///
+    /// A `mailto:` clicked while Eudora is closed launches it *with* the URL,
+    /// and that arrives during launch — before `ContentView` exists, let alone
+    /// the mailbox tree. The delegate, by contrast, is constructed in
+    /// `App.init` via `@NSApplicationDelegateAdaptor`, so it is guaranteed to be
+    /// there first. That guarantee is the reason this is an AppKit delegate
+    /// method rather than SwiftUI's `.onOpenURL`, whose replay of a launch URL
+    /// depends on which view registers first.
+    private var openURLs: [URL] = []
+
+    /// Every URL macOS hands the app. Only `mailto:` is declared in Info.plist,
+    /// so in practice that is all that arrives; the model checks the scheme
+    /// again regardless.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let handler = onOpenURLs else {
+            openURLs += urls
+            return
+        }
+        handler(urls)
+    }
+
+    private func flushOpenURLs() {
+        guard !openURLs.isEmpty, let handler = onOpenURLs else { return }
+        let urls = openURLs
+        openURLs = []
+        handler(urls)
+    }
+
+    /// Set when this process is quitting because another Eudora already had the
+    /// field. It exists to keep the loser quiet: `applicationWillTerminate`
+    /// records whether Settings was open, and a duplicate instance — which has
+    /// no windows at all — would record `false` over the surviving instance's
+    /// state, so opening Settings and then accidentally launching a second copy
+    /// would lose the setting.
+    private var isDuplicateInstance = false
+
+    /// Sent by a duplicate instance on its way out, asking the survivor to make
+    /// itself visible. Scoped by the bundle id so it can't be confused with
+    /// anything else on the machine.
+    static let showYourselfNotification =
+        Notification.Name("com.stephen.eudora.app.showYourself")
+
     override init() {
         super.init()
         Self.shared = self
     }
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Only the survivor listens; a duplicate has already exited by here.
+        DistributedNotificationCenter.default().addObserver(
+            forName: Self.showYourselfNotification, object: nil, queue: .main
+        ) { _ in
+            Task { @MainActor in AppDelegate.revealWindows() }
+        }
+    }
+
+    /// Un-minimise and raise, for a user who tried to start a second copy.
+    ///
+    /// `deminiaturize` per window rather than `NSApp.unhide`: hidden and
+    /// minimised are different states, and it was the minimised one that left
+    /// the Dock icon highlighted with nothing on screen.
+    @MainActor
+    static func revealWindows() {
+        for window in NSApp.windows where window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        // Deliberately no attempt to pick out "the main window" and order it
+        // front. The obvious way is to match on the window title, which means
+        // depending on `.navigationTitle("Eudora")` from a file that has no idea
+        // this exists — and the failure would be silent, since a title that no
+        // longer matches simply selects nothing. Deminiaturising every minimised
+        // window and activating is enough: AppKit restores the window that was
+        // key, which is the right one by construction.
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    /// Clicking the Dock icon with every window minimised.
+    ///
+    /// Same problem, arrived at by the ordinary route rather than by launching a
+    /// second copy — and worth fixing here because it is the same one line. The
+    /// system asks this before deciding what a reopen means; answering it by
+    /// restoring the windows is what makes a Dock click behave the way every
+    /// other Mac app does.
+    func applicationShouldHandleReopen(_ sender: NSApplication,
+                                       hasVisibleWindows: Bool) -> Bool {
+        if !hasVisibleWindows { Self.revealWindows() }
+        return true
+    }
+
+    /// One Eudora at a time: if another is already running, bring *it* forward
+    /// and quit.
+    ///
+    /// Two copies were running on 2026aug02 — one launched by Xcode, one from
+    /// the Dock — on different Spaces, with new mail arriving in the invisible
+    /// one. That is more than confusing. `Outbox.append` reads the whole `.mbx`,
+    /// appends, and atomically replaces it, so two processes appending
+    /// concurrently is a lost update: both read 191 messages, both write 192,
+    /// and the second write silently discards the first's. The same shape
+    /// applies to `.toc` rewrites, `descmap.pce`, the downloaded-UID sets and
+    /// the search index. The Message-ID guard catches some duplicate
+    /// *deliveries*; nothing catches a lost *send*.
+    ///
+    /// Why macOS didn't prevent it by itself: Xcode launches the binary
+    /// directly rather than through LaunchServices, so LaunchServices doesn't
+    /// count that process as the running instance of the bundle and will happily
+    /// start another from the Dock. The bundle identifier is stable across
+    /// versions, so it is a sound key — two builds of different vintage still
+    /// recognise each other.
+    ///
+    /// `willFinishLaunching`, the earliest hook there is: before any window,
+    /// before the tree is opened, before a lock could be taken.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // An escape hatch, in the spirit of `EUDORA_ROOT`: two instances are
+        // occasionally wanted deliberately (comparing builds, testing the tree
+        // lock). Without it the only way to get a second copy is to edit this.
+        guard ProcessInfo.processInfo.environment["EUDORA_ALLOW_SECOND_INSTANCE"] == nil,
+              let mine = Bundle.main.bundleIdentifier else { return }
+
+        let us = ProcessInfo.processInfo.processIdentifier
+        let other = NSRunningApplication
+            .runningApplications(withBundleIdentifier: mine)
+            .first {
+                // Compared by *pid*, not by object identity. `!=` on
+                // NSRunningApplication is `isEqual:`, which does compare
+                // processes — but these are freshly vended objects, and if that
+                // ever failed to match, this app would find itself, activate
+                // itself and quit, on every launch, by every route, with no way
+                // in. The pid comparison cannot fail that way.
+                $0.processIdentifier != us
+                    && !$0.isTerminated
+                    // LaunchServices drops a dead process from this list
+                    // asynchronously, so an entry can outlive its process by a
+                    // moment — exactly the moment an Xcode Run or a quick
+                    // relaunch after ⌘Q lands in. Asking the kernel settles it;
+                    // signal 0 tests for existence without delivering anything.
+                    && kill($0.processIdentifier, 0) == 0
+            }
+        guard let other else { return }
+
+        isDuplicateInstance = true
+        // Says why, because otherwise an Xcode Run that instantly exits reads as
+        // "the build did nothing". stdout survives the scheme's
+        // OS_ACTIVITY_MODE=disable.
+        print("Eudora: another instance (pid \(other.processIdentifier)) is already "
+              + "running; bringing it forward and exiting. Set "
+              + "EUDORA_ALLOW_SECOND_INSTANCE=1 to override.")
+
+        // Ask the survivor to show itself, *then* activate it.
+        //
+        // Activation alone isn't enough when the survivor's window is
+        // minimised: `NSRunningApplication.activate` makes an app frontmost, and
+        // deliberately does not touch its windows — one app cannot deminiaturise
+        // another's. So the survivor has to do it, and this is how it is told.
+        // Without this the duplicate quits, the Dock icon highlights, and no
+        // window appears — which from the user's side is indistinguishable from
+        // the bug this whole guard exists to fix.
+        //
+        // `deliverImmediately: true` because this process is about to `exit(0)`.
+        // A queued notification would be discarded with it.
+        DistributedNotificationCenter.default().postNotificationName(
+            AppDelegate.showYourselfNotification,
+            object: mine, userInfo: nil, deliverImmediately: true)
+
+        // Bring the survivor forward rather than dying silently — the whole
+        // failure mode was a window the user couldn't see, on another Space.
+        //
+        // **`activate(from:)` on macOS 14+ is the load-bearing part.** Activation
+        // became cooperative in 14: an app can only raise another if it is
+        // itself active, or by explicitly handing over its own activation. At
+        // `willFinishLaunching` this process is not yet active, so a plain
+        // `activate(options:)` is precisely the call the new model ignores — the
+        // duplicate would quit and the survivor would stay invisible, which is
+        // the original bug with extra steps.
+        if #available(macOS 14.0, *) {
+            other.activate(from: .current, options: [.activateAllWindows])
+        } else {
+            other.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        }
+
+        // `exit`, not `NSApp.terminate`. `terminate:` is documented as possibly
+        // *returning* rather than terminating when the app hasn't finished
+        // launching — in which case this duplicate would carry on, build a
+        // window and open the tree. Nothing here needs the polite path:
+        // `applicationShouldTerminate` is hard-wired to `.terminateNow` for a
+        // duplicate and `applicationWillTerminate` is a deliberate no-op for it.
+        exit(0)
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        onQuit()
+        // The duplicate leaves at once: `onQuit` reviews unsaved drafts, and
+        // this instance has none — it never got as far as a window.
+        if isDuplicateInstance { return .terminateNow }
+        return onQuit()
     }
 
     /// Note whether Settings was open, so the next launch can bring it back.
@@ -278,7 +486,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// latter can be answered `.terminateCancel` by the unsaved-draft review, and
     /// recording there would file "quitting" state for a quit that didn't happen.
     func applicationWillTerminate(_ notification: Notification) {
+        // Nothing from a duplicate instance: it has no windows, so it would
+        // record "Settings was closed" over the surviving instance's state.
+        guard !isDuplicateInstance else { return }
         SettingsWindowState.recordWhetherOpen()
+        TreeLock.releaseIfHeld()
     }
 }
 

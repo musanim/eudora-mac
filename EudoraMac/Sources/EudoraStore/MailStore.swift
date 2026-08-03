@@ -357,6 +357,82 @@ public struct MailStore: Sendable {
         return (rec, MIMEParser.parse(Mbox.messageBytes(bytes, rec)))
     }
 
+    /// A single message addressed by *byte offset*, parsed for display.
+    ///
+    /// The point is what it avoids. `message(at:index:)` reads the entire `.mbx`
+    /// and scans it for record boundaries, because an index is a position in
+    /// that list and there is no other way to find it. A search hit already
+    /// carries the offset, so none of that is necessary: seek there, read
+    /// forward until the *next* record begins, and parse what was read. On the
+    /// 612 MB Trash mailbox that is the difference between a whole-file read per
+    /// arrow key and a few kilobytes.
+    ///
+    /// Reads in growing chunks rather than one guess: most messages are a few KB,
+    /// so the first read almost always contains the whole record, but a message
+    /// with a large attachment must not come back truncated.
+    ///
+    /// Returns nil when no record starts at `offset` — a stale index would
+    /// otherwise render the middle of some other message as though it were the
+    /// hit.
+    public func message(at base: URL, offset: Int) -> (record: MboxRecord, part: MIMEPart)? {
+        guard offset >= 0, let handle = try? FileHandle(forReadingFrom: mbxURL(base)) else {
+            return nil
+        }
+        defer { try? handle.close() }
+        guard (try? handle.seek(toOffset: UInt64(offset))) != nil else { return nil }
+
+        var bytes: [UInt8] = []
+        var chunk = 64 * 1024
+        // 64 MB: past any message this format sanely holds, and a bound on what a
+        // corrupt offset can make us read.
+        let ceiling = 64 * 1024 * 1024
+
+        while bytes.count < ceiling {
+            guard let more = try? handle.read(upToCount: chunk), !more.isEmpty else { break }
+            let previousCount = bytes.count
+            bytes.append(contentsOf: more)
+
+            // The record must begin here, or the offset is stale.
+            if previousCount == 0, !bytes.starts(with: Mbox.separator) { return nil }
+
+            // Look for the next record's separator, starting one byte in so the
+            // record's own separator isn't found. Overlap the seam by the
+            // separator's length so a boundary split across two reads is seen.
+            //
+            // The acceptance test is `findRecords`' test, deliberately, not a
+            // better one: a separator at a line start counts, and one elsewhere
+            // counts only if a genuine envelope date follows. The real tree has
+            // separators inside quoted and forwarded bodies that `findRecords`
+            // treats as boundaries (26 of them in In.mbx alone), so a smarter
+            // rule here would make this pane disagree with the main window about
+            // where the same message ends. Consistency is worth more than being
+            // right in isolation.
+            // The overlap has to cover more than a separator split across the
+            // seam. A separator can arrive *whole* in the previous chunk while
+            // the envelope date that qualifies it runs past the end — the date
+            // test then reads off the end, fails, and the loop steps past a
+            // boundary it will never look at again, because the next pass starts
+            // beyond it. So the overlap is the separator *plus* the date.
+            var searchFrom = max(1, previousCount - (Mbox.separator.count + Mbox.envelopeDateLength))
+            while let next = Bytes.find(Mbox.separator, in: bytes, from: searchFrom) {
+                let atLineStart = bytes[next - 1] == 0x0a || bytes[next - 1] == 0x0d
+                if atLineStart
+                    || Mbox.looksLikeEnvelopeDate(bytes, at: next + Mbox.separator.count) {
+                    let record = MboxRecord(offset: offset, length: next)
+                    return (record,
+                            MIMEParser.parse(Mbox.messageBytes(fromRecord: Array(bytes[0..<next]))))
+                }
+                searchFrom = next + 1
+            }
+            chunk = min(chunk * 4, 8 * 1024 * 1024)
+        }
+
+        guard !bytes.isEmpty, bytes.starts(with: Mbox.separator) else { return nil }
+        // Ran to the end of the file (or the ceiling): this is the last record.
+        let record = MboxRecord(offset: offset, length: bytes.count)
+        return (record, MIMEParser.parse(Mbox.messageBytes(fromRecord: bytes)))
+    }
+
     /// The whole message exactly as it sits on disk, envelope line stripped.
     ///
     /// The bytes on disk, unparsed and un-decoded — which is the point. This is

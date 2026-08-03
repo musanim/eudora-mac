@@ -21,9 +21,17 @@ struct HTMLMailView: NSViewRepresentable {
     /// Called (on the main thread) when a link's URL is copied, so the app can
     /// show a brief confirmation.
     var onCopyLink: (String) -> Void = { _ in }
+    /// A deliberate click on a link. The reader still never navigates; this
+    /// hands the true destination to the app, which confirms it and passes it
+    /// to the default browser.
+    var onOpenLink: (String) -> Void = { _ in }
     /// Forward the message being shown — the body's right-click menu offers it,
     /// since that is where the eye is when the urge strikes.
-    var onForward: () -> Void = {}
+    ///
+    /// Optional: nil means the menu item isn't offered at all. The Find window's
+    /// preview pane passes nil, because Forward there would act on the main
+    /// window's selection rather than the result being read.
+    var onForward: (() -> Void)?
 
     /// The default reading font — the same one the composer uses. Sets the
     /// document's base font, which the message's own styling overrides where it
@@ -48,6 +56,7 @@ struct HTMLMailView: NSViewRepresentable {
     func updateNSView(_ view: WKWebView, context: Context) {
         context.coordinator.images = images
         context.coordinator.onCopyLink = onCopyLink
+        context.coordinator.onOpenLink = onOpenLink
         (view as? TrimmedMenuWebView)?.onForward = onForward
         // Reload when the document *or* the reading font changes — the font is
         // baked into the wrapper's CSS, so a settings change while a message is
@@ -60,19 +69,23 @@ struct HTMLMailView: NSViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(images: images, onCopyLink: onCopyLink)
+        Coordinator(images: images, onCopyLink: onCopyLink, onOpenLink: onOpenLink)
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
         var images: [String: EmbeddedImage]
         var onCopyLink: (String) -> Void
+        var onOpenLink: (String) -> Void
         /// The last document actually loaded — the *wrapped* HTML, so a change to
         /// either the body or the reading font triggers a reload.
         var loadedDoc: String?
 
-        init(images: [String: EmbeddedImage], onCopyLink: @escaping (String) -> Void) {
+        init(images: [String: EmbeddedImage],
+             onCopyLink: @escaping (String) -> Void,
+             onOpenLink: @escaping (String) -> Void) {
             self.images = images
             self.onCopyLink = onCopyLink
+            self.onOpenLink = onOpenLink
         }
 
         func webView(_ webView: WKWebView,
@@ -101,9 +114,21 @@ struct HTMLMailView: NSViewRepresentable {
                         Task { @MainActor in ImageViewerController.shared.show(resource) }
                     }
                 } else {
-                    // Any link (http/https/mailto/… and the skull box): copy its
-                    // true destination rather than navigating.
-                    copyLink(url.absoluteString)
+                    // A deliberate click on a link. Still never navigated *here*
+                    // — the reader has JS off and a strict CSP, and that stays
+                    // true — but the URL is now offered to the default browser
+                    // after a confirmation that shows where it really goes.
+                    //
+                    // The handoff is itself the reputation check: Safari and
+                    // Chrome both consult Safe Browsing before rendering, and
+                    // Safari proxies that through Apple so Google never sees the
+                    // address. Doing it here would be worse on privacy and would
+                    // put a network dependency in a client that has none.
+                    //
+                    // `url.absoluteString` — the true destination, never the
+                    // anchor text. That was already the rule for Copy Link and
+                    // it matters more now that clicking can go somewhere.
+                    openLink(url.absoluteString)
                 }
                 decisionHandler(.cancel)
                 return
@@ -111,6 +136,11 @@ struct HTMLMailView: NSViewRepresentable {
 
             // Refuse everything else.
             decisionHandler(.cancel)
+        }
+
+        private func openLink(_ url: String) {
+            let target = url
+            Task { @MainActor in onOpenLink(target) }
         }
 
         private func copyLink(_ url: String) {
@@ -280,11 +310,19 @@ private final class TrimmedMenuWebView: WKWebView {
 
         // Forward at the top, then a separator before whatever survived (Copy,
         // Copy Link, Look Up…). No separator when nothing else is left.
-        let forward = NSMenuItem(title: "Forward",
-                                 action: #selector(forwardMessage), keyEquivalent: "")
-        forward.target = self
-        if !menu.items.isEmpty { menu.insertItem(.separator(), at: 0) }
-        menu.insertItem(forward, at: 0)
+        //
+        // Offered only when a handler was supplied. The Find window's preview
+        // pane supplies none, because Forward there would act on the *main*
+        // window's selected message rather than the search result on screen —
+        // and a menu item that silently forwards the wrong message is worse than
+        // one that isn't there.
+        if onForward != nil {
+            let forward = NSMenuItem(title: "Forward",
+                                     action: #selector(forwardMessage), keyEquivalent: "")
+            forward.target = self
+            if !menu.items.isEmpty { menu.insertItem(.separator(), at: 0) }
+            menu.insertItem(forward, at: 0)
+        }
 
         super.willOpenMenu(menu, with: event)
     }

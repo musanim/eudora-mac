@@ -206,6 +206,127 @@ public final class SearchIndex: @unchecked Sendable {
         return hits
     }
 
+    /// Insert one row directly. **Tests only** — `rebuild` is how the index is
+    /// really filled.
+    ///
+    /// It exists because the filing-history query is worth testing against a
+    /// real FTS5 index rather than a mock: the whole question is whether a
+    /// tokenised address matches the way it was stored, and a fake that didn't
+    /// tokenise would prove nothing at all. `internal`, so it is reachable via
+    /// `@testable` and cannot be called from the app.
+    func add(mailbox: String, sender: String, recipients: String,
+             subject: String = "", body: String = "", date: String = "",
+             epoch: Int = 0, offset: Int = 0) throws {
+        let insert = try db.prepare("""
+        INSERT INTO messages
+            (mailbox, offset, date, epoch, headers, sender, recipients, subject, body, attachments)
+        VALUES (?,?,?,?,?,?,?,?,?,?);
+        """)
+        insert.bind(1, mailbox)
+        insert.bind(2, offset)
+        insert.bind(3, date)
+        insert.bind(4, epoch)
+        insert.bind(5, "From: \(sender)\nTo: \(recipients)")
+        insert.bind(6, sender)
+        insert.bind(7, recipients)
+        insert.bind(8, subject)
+        insert.bind(9, body)
+        insert.bind(10, "")
+        try insert.execute()
+    }
+
+    // MARK: - Filing history
+
+    /// How many messages involving a given correspondent already live in a
+    /// mailbox.
+    public struct FilingCount: Sendable, Equatable {
+        /// The mailbox's path key — the same string `SearchHit.mailbox` carries,
+        /// which is `MailboxItem.ID` (see `MailStore.allMailboxes`).
+        public let mailbox: String
+        public let count: Int
+        public init(mailbox: String, count: Int) {
+            self.mailbox = mailbox
+            self.count = count
+        }
+    }
+
+    /// Where messages involving these addresses have been filed before, most
+    /// used first.
+    ///
+    /// This is the whole of "smart move-to": rather than presenting the tree and
+    /// making the user find the right mailbox among thousands, ask where this
+    /// person's mail has gone every other time. For an archive of any age the
+    /// answer is nearly always right, and it needs no new index — every message
+    /// in the tree is already recorded here with its mailbox, sender and
+    /// recipients, because the Find window needed exactly that.
+    ///
+    /// Counts are summed across addresses, so a multi-message selection with
+    /// several correspondents produces one merged ranking.
+    ///
+    /// Freshness: this reflects the index, which is rebuilt wholesale rather
+    /// than updated per delivery. For filing *history* that hardly matters — the
+    /// signal is decades of precedent, not this morning — but a brand-new
+    /// correspondent stays unsuggested until the next rebuild.
+    public func mailboxesFiledInto(addresses: [String], limit: Int = 50) throws -> [FilingCount] {
+        let clauses = addresses.compactMap(Self.addressPhrase).map {
+            "({sender recipients} : \($0))"
+        }
+        guard !clauses.isEmpty else { return [] }
+
+        // `LIMIT` is a guard on the *work*, not a view preference — how many to
+        // show is the caller's business. A correspondent of thirty years turns
+        // up in dozens of mailboxes (CCs on threads, mixed archive boxes,
+        // mailing lists), and there is no sense materialising all of them to
+        // display a few.
+        let stmt = try db.prepare("""
+        SELECT mailbox, COUNT(*) AS n
+        FROM messages
+        WHERE messages MATCH ?
+        GROUP BY mailbox
+        ORDER BY n DESC
+        LIMIT ?;
+        """)
+        stmt.bind(1, clauses.joined(separator: " OR "))
+        stmt.bind(2, limit)
+
+        var out: [FilingCount] = []
+        while stmt.step() {
+            out.append(FilingCount(mailbox: stmt.text(0), count: stmt.int(1)))
+        }
+        return out
+    }
+
+    /// An address as an FTS5 phrase.
+    ///
+    /// **It is an injection guard first.** FTS5 runs the table's own tokenizer
+    /// over the contents of a quoted string, so `"greg@gregsandow.com"` would in
+    /// fact match the same rows as `"greg gregsandow com"` — splitting it here
+    /// is not what makes matching work. What it does do is guarantee the string
+    /// handed to `MATCH` contains nothing but tokens and spaces: an address
+    /// carrying a `"` would otherwise close the quoted phrase and let the rest
+    /// be parsed as query syntax.
+    ///
+    /// A phrase, not loose terms: adjacency is what makes this the *address*
+    /// rather than three words scattered through a message. Loose terms would
+    /// match anything merely mentioning the domain.
+    ///
+    /// Two false positives are known, measured, and left alone because both are
+    /// near-neighbours that file to the same place in practice: `a@b.com` also
+    /// matches `j.a@b.com` (any local part ending `.a` at that domain), and
+    /// `x@b.com` also matches `x@b.com.au`. Counts are approximate, not wrong.
+    ///
+    /// Nil for anything that can't make a usable phrase — including a **single**
+    /// token, which is the important case: `EmailAddress.bareAddress` accepts a
+    /// malformed `someone@`, and the phrase `"someone"` would match every
+    /// message with that word anywhere in a sender or recipient.
+    static func addressPhrase(_ address: String) -> String? {
+        let tokens = address.lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+        guard tokens.count >= 2 else { return nil }
+        return "\"" + tokens.joined(separator: " ") + "\""
+    }
+
     // MARK: - Structured search (the Find window)
 
     private enum Bind { case text(String); case int(Int) }

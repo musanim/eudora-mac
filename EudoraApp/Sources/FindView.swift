@@ -45,7 +45,9 @@ struct FindView: View {
             tabs
         }
         .padding(12)
-        .frame(minWidth: 720, minHeight: 460)
+        // Matches the scene's minimum in `EudoraApp.swift`, raised when the
+        // preview pane was added. The two have to agree.
+        .frame(minWidth: 720, minHeight: 620)
         // Escape closes the window, as it did in Eudora.
         //
         // `.onExitCommand` rather than a zero-sized Button carrying
@@ -56,6 +58,17 @@ struct FindView: View {
         // wherever focus happens to be.
         .onExitCommand { dismiss() }
         .onAppear(perform: initScopeIfNeeded)
+        // A rendered message can hold a few MB of embedded images. The window
+        // closing is the natural point to let that go — and it means reopening
+        // Find shows an empty pane rather than a message from a search two days
+        // ago, which would look like a result that isn't there.
+        // The selection is cleared alongside the preview: `onChange` fires only
+        // on a *change*, so a row left highlighted over an empty pane could not
+        // be brought back by clicking it again.
+        .onDisappear {
+            resultSelection = nil
+            model.clearFindPreview()
+        }
         // A newly opened tree resets the scope to "all selected".
         .onChange(of: model.tree.count) { _ in
             scopeInitialized = false
@@ -236,23 +249,61 @@ struct FindView: View {
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            Table(sortedRows, selection: $resultSelection, sortOrder: $sortOrder) {
-                TableColumn("Mailbox", value: \.mailbox) { Text($0.mailbox) }
-                    .width(min: 90, ideal: 130)
-                TableColumn("Date", value: \.dateSort) { Text($0.dateText) }
-                    .width(min: 90, ideal: 130)
-                TableColumn("Subject", value: \.subject) { Text($0.subject) }
-                // Given a `value:` like the rest so every column carries the same
-                // `KeyPathComparator<ResultRow>` — mixing a value-less column in
-                // makes the builder's comparator type ambiguous. Sorting by a
-                // snippet is rarely useful, but harmless, and keeps this uniform.
-                TableColumn("Snippet", value: \.snippet) {
-                    Text($0.snippet).foregroundStyle(.secondary)
+            // Results above, the message below. A split rather than a fixed
+            // divider so the balance is the user's: some searches are read from
+            // the list, some from the messages.
+            VSplitView {
+                Table(sortedRows, selection: $resultSelection, sortOrder: $sortOrder) {
+                    TableColumn("Mailbox", value: \.mailbox) { Text($0.mailbox) }
+                        .width(min: 90, ideal: 130)
+                    TableColumn("Date", value: \.dateSort) { Text($0.dateText) }
+                        .width(min: 90, ideal: 130)
+                    TableColumn("Subject", value: \.subject) { Text($0.subject) }
+                    // Given a `value:` like the rest so every column carries the
+                    // same `KeyPathComparator<ResultRow>` — mixing a value-less
+                    // column in makes the builder's comparator type ambiguous.
+                    // Sorting by a snippet is rarely useful, but harmless, and
+                    // keeps this uniform.
+                    TableColumn("Snippet", value: \.snippet) {
+                        Text($0.snippet).foregroundStyle(.secondary)
+                    }
                 }
+                // Right-click a result. `forSelectionType:` hands over the rows
+                // under the click — which is *not* necessarily the selection:
+                // right-clicking an unselected row leaves the selection where it
+                // was. So the command moves the selection itself, or the pane
+                // would go on showing one message while View in Mailbox jumped
+                // to another. Applied directly to the Table, before the frame,
+                // since the modifier only works on a container that has a
+                // selection.
+                .contextMenu(forSelectionType: ResultRow.ID.self) { ids in
+                    if let id = ids.first,
+                       let rr = sortedRows.first(where: { $0.id == id }) {
+                        Button("View in Mailbox") {
+                            resultSelection = id
+                            model.openHit(rr.hit)
+                        }
+                    }
+                }
+                .frame(minHeight: 120)
+
+                // The same renderer as the main window's reading pane, handed a
+                // message instead of following the selection. See
+                // `PreviewView.Source`.
+                PreviewView(source: .given(model.findPreview,
+                                           isLoading: model.isLoadingFindPreview))
+                    .frame(minHeight: 140)
             }
+            // Selection *only* previews. Opening the message in its mailbox is
+            // the right-click item above — Stephen's call, and the right one:
+            // jumping the main window on every arrow key re-listed a mailbox per
+            // keystroke, which on a large one is a whole-file read.
             .onChange(of: resultSelection) { sel in
-                guard let sel, let rr = resultRows.first(where: { $0.id == sel }) else { return }
-                model.openHit(rr.hit)
+                guard let sel, let rr = resultRows.first(where: { $0.id == sel }) else {
+                    model.clearFindPreview()
+                    return
+                }
+                model.loadFindPreview(for: rr.hit)
             }
         }
     }
@@ -312,6 +363,14 @@ struct FindView: View {
     }
 
     private func runSearch() {
+        // A new search invalidates whatever was being read. Cleared here rather
+        // than reacting to the results arriving: row ids are array positions, so
+        // a surviving selection would point at a different message the moment
+        // the new results land — the preview would change under you without the
+        // selection appearing to move.
+        resultSelection = nil
+        model.clearFindPreview()
+
         let all = model.allLeafMailboxIDs
         guard !scope.isEmpty else {
             model.searchResults = []

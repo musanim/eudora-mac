@@ -46,9 +46,15 @@ public enum Mbox {
     /// `From ???@??? ` separator. Used by `findRecords` to accept a separator
     /// that isn't at a line start without ever mistaking body text for a
     /// boundary. Byte-level and allocation-free; the day may be space-padded.
+    /// Bytes in "AAA AAA D HH:MM:SS YYYY". Named because a chunked reader has to
+    /// know how far past a separator this test looks — see
+    /// `MailStore.message(at:offset:)`, where too small an overlap silently
+    /// loses a record boundary.
+    static let envelopeDateLength = 24
+
     static func looksLikeEnvelopeDate(_ bytes: [UInt8], at i: Int) -> Bool {
         // "AAA AAA D HH:MM:SS YYYY" — 24 bytes.
-        guard i >= 0, i + 24 <= bytes.count else { return false }
+        guard i >= 0, i + envelopeDateLength <= bytes.count else { return false }
         func alpha(_ b: UInt8) -> Bool { let l = b | 0x20; return l >= 0x61 && l <= 0x7a }
         func digit(_ b: UInt8) -> Bool { b >= 0x30 && b <= 0x39 }
         func sp(_ b: UInt8) -> Bool { b == 0x20 }

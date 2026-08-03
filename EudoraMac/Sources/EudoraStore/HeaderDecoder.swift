@@ -8,9 +8,23 @@ public enum HeaderDecoder {
 
         var result = ""
         var remaining = Substring(value)
+        // RFC 2047 §6.2: whitespace *separating two adjacent encoded-words* is
+        // an artefact of header folding and must be discarded when displaying.
+        // A long subject gets split mid-word — `...respo?= =?UTF-8?Q?nse...` —
+        // and keeping the space renders it "developer respo nse".
+        var previousWasEncodedWord = false
 
         while let start = remaining.range(of: "=?") {
-            result += remaining[remaining.startIndex..<start.lowerBound]
+            let gap = remaining[remaining.startIndex..<start.lowerBound]
+            let isFoldArtefact = previousWasEncodedWord
+                && !gap.isEmpty
+                // Scalars, not Characters: "\r\n" is a *single* Character in
+                // Swift, so a Character-wise comparison against "\r" and "\n"
+                // silently fails on exactly the CRLF fold this exists to handle.
+                && gap.unicodeScalars.allSatisfy {
+                    $0 == " " || $0 == "\t" || $0 == "\r" || $0 == "\n"
+                }
+            if !isFoldArtefact { result += gap }
             let afterStart = remaining[start.upperBound...]
 
             guard let end = afterStart.range(of: "?=") else {
@@ -26,8 +40,12 @@ public enum HeaderDecoder {
                                         enc: String(comps[1]).uppercased(),
                                         text: String(comps[2])) {
                 result += decoded
+                previousWasEncodedWord = true
             } else {
+                // Left verbatim, so it is ordinary text and the whitespace after
+                // it is real.
                 result += "=?\(token)?="
+                previousWasEncodedWord = false
             }
             remaining = afterStart[end.upperBound...]
         }

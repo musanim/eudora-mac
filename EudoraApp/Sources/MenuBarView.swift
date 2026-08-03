@@ -179,7 +179,11 @@ struct MenuBarView: View {
     private var transferMenu: some View {
         MoveToMenuButton(tree: { model.visibleTree },
                          onPick: { model.moveSelected(to: $0) },
-                         onNew: { model.createMailboxAndMoveSelection(under: $0) }) {
+                         onNew: { model.createMailboxAndMoveSelection(under: $0) },
+                         // Asked when the menu opens. This one acts on the
+                         // current selection, unlike the right-click menu, which
+                         // has clicked rows to consider first.
+                         suggestions: { model.filingSuggestions() }) {
             Text("Transfer")
         }
         .buttonStyle(.plain)

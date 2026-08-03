@@ -52,6 +52,11 @@ targets:
       base:
         PRODUCT_NAME: Eudora
         PRODUCT_BUNDLE_IDENTIFIER: com.stephen.eudora.app
+        # The Dock/Finder icon: the gold 8 lifted out of the splash art. Named
+        # rather than defaulted — without this, Xcode compiles the appiconset
+        # into Assets.car and then doesn't reference it, so the build succeeds
+        # and the app still shows the blank generic icon.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: EudoraApp/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         MARKETING_VERSION: "0.3.0"
