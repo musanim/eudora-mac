@@ -11,6 +11,11 @@ question, including the ones that would otherwise be a natural fit for it:
 clarifying scope, choosing between approaches, confirming a design decision.
 Write the options out as ordinary text and let him answer however he likes.
 
+**Anything he needs to know before running a command goes before the command.**
+He reads and acts in order, so a caveat, a question, or an offer placed after a
+block of shell arrives too late — he has already run it. Put the question first
+and the commands last, or don't ask.
+
 Housekeeping Claude may do without asking: commit Stephen's moves of old
 handoffs into `handoffs/archive/`.
 
@@ -30,6 +35,18 @@ Claude cannot compile: there is no Swift toolchain in the sandbox. The loop is
 - After adding a file to `EudoraApp/Sources/`, run `xcodegen generate` — and run
   it *after* writing the file, not before. Files in `EudoraMac/` and new
   imagesets inside `Assets.xcassets` are picked up automatically.
+
+## Git
+
+**Claude must not run git.** The sandbox cannot unlink files in `.git`, so every
+git command — even `git status` — strands a lock file that then blocks Stephen's
+own git. Write the commit message to a file and let him run the commit.
+
+Recovery when one has already been stranded, and it is safe once no git process
+is running: `rm -f .git/index.lock` (or whichever `.lock` the error names).
+
+`reference/` is gitignored, so it is the place to leave a commit message for him
+to pass to `git commit -F` without it turning up in the commit.
 
 ## Diagnosing
 
