@@ -469,7 +469,12 @@ final class AppModel: ObservableObject {
     @Published var selectedMailboxID: MailboxItem.ID?
 
     /// The selected messages. Usually one; ⌘-click and ⇧-click grow it.
-    @Published var selectedMessageIDs: Set<MessageRow.ID> = []
+    /// `private(set)` so "one owner" is a compile error to violate rather than a
+    /// convention. `applyMessageSelection` is the only writer, and the getter of
+    /// `messageSelection` now stands in for this while a write is deferred — a
+    /// direct assignment from anywhere else would leave that stand-in reporting
+    /// a set that no longer matches, which is worse than the bug it fixed.
+    @Published private(set) var selectedMessageIDs: Set<MessageRow.ID> = []
 
     /// The **primary** selected message — the last row the user actually
     /// clicked, as against the rest of a multi-selection. This is the one the
@@ -562,15 +567,81 @@ final class AppModel: ObservableObject {
         PerfLog.mark("cleared for switch")
     }
 
+    /// What the Table has been *told* is selected, before the deferred write to
+    /// `selectedMessageIDs` has landed.
+    ///
+    /// **This exists because holding ⇧ and auto-repeating ↓ skipped rows.**
+    ///
+    /// The setter below must defer its work by a runloop turn (see the note on
+    /// `mailboxSelection` — writing an `@Published` during SwiftUI's update pass
+    /// is what produces "Publishing changes from within view updates is not
+    /// allowed"). That leaves the getter a turn behind, and the getter is not
+    /// merely an answer: SwiftUI *pushes* it back into the table whenever the
+    /// table reconciles.
+    ///
+    /// Note what does **not** happen, because it is the tempting explanation and
+    /// it is wrong. The ⇧-extension is AppKit's, computed inside `NSTableView`
+    /// from its own `selectedRowIndexes` and its own anchor; nothing here is
+    /// consulted to work out which row comes next. The damage is done on the way
+    /// back:
+    ///
+    /// 1. ⇧↓ extends AppKit's selection to {5, 6} and the setter fires; the
+    ///    published write is deferred.
+    /// 2. An enrichment batch republishes `rows`, so `ContentView` re-renders and
+    ///    SwiftUI reads this binding — which still says {5} — and *resets* the
+    ///    table's selection to {5}, taking the anchor back with it.
+    /// 3. The next auto-repeat extends from {5} again. The rows in between were
+    ///    never selected.
+    ///
+    /// So the skip needs an intervening re-render, which is why it is
+    /// intermittent and worse in big mailboxes: enrichment re-diffs the whole
+    /// table on the main actor, far slower than the key-repeat interval, and it
+    /// is exactly the condition documented on the `changed` check below.
+    ///
+    /// The getter therefore answers from here the moment a set arrives, so a
+    /// reconciliation mid-repeat pushes back what the table already believes
+    /// rather than a stale set. The async block still owns the published write.
+    /// Cleared by `applyMessageSelection`, which every path — deferred or
+    /// programmatic — goes through, so this cannot outlive the truth it stands
+    /// in for.
+    private var pendingMessageSelection: Set<MessageRow.ID>?
+
+    /// Guards against a superseded keystroke's deferred block applying after a
+    /// newer one. Each `set` bumps this and its block refuses unless it is still
+    /// the newest, so an auto-repeat burst applies once, with the final set,
+    /// instead of once per keystroke.
+    ///
+    /// Without it the unconditional clear in `applyMessageSelection` could wipe a
+    /// stand-in that a *newer* setter had already written, regressing the getter
+    /// to an older set — the very thing this pair exists to prevent. Today the
+    /// main queue drains the whole burst in one pass so nothing could read
+    /// between them, but that is an implementation detail to depend on rather
+    /// than a guarantee, and this file is full of things that spin the runloop.
+    ///
+    /// It also removes the intermediate published writes, each of which
+    /// re-rendered everything observing `AppModel` and kicked off a preview load
+    /// — main-actor congestion of the same kind that made the bug visible.
+    private var messageSelectionEpoch = 0
+
     var messageSelection: Binding<Set<MessageRow.ID>> {
-        Binding(get: { [weak self] in self?.selectedMessageIDs ?? [] },
+        Binding(get: { [weak self] in
+                    guard let self else { return [] }
+                    return self.pendingMessageSelection ?? self.selectedMessageIDs
+                },
                 set: { [weak self] new in
-                    DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.pendingMessageSelection = new
+                    self.messageSelectionEpoch &+= 1
+                    let epoch = self.messageSelectionEpoch
+                    DispatchQueue.main.async { [weak self] in
                         // A user selection in In counts as engaging with it, so it
                         // dismisses the new-mail badge. Programmatic selection goes
                         // through `applyMessageSelection` directly, not this
                         // binding, so a delivery re-list can't trip this.
-                        guard let self else { return }
+                        //
+                        // Superseded keystrokes drop out here — see
+                        // `messageSelectionEpoch`.
+                        guard let self, self.messageSelectionEpoch == epoch else { return }
                         self.clearInboxNewMailBadge()
                         // Whether this is a real change, decided *before*
                         // applying it. SwiftUI writes a selection binding back
@@ -631,11 +702,20 @@ final class AppModel: ObservableObject {
     /// binding doesn't) passes it as `primary` and overrides the inference.
     func applyMessageSelection(_ new: Set<MessageRow.ID>,
                                primary preferred: MessageRow.ID? = nil) {
+        // The stand-in the binding's getter reads has now been overtaken —
+        // either by this call applying it, or by a programmatic selection that
+        // supersedes it. Cleared before the veil guard below, deliberately: if
+        // that guard refuses the selection, the stand-in must not be left
+        // reporting a set that was never applied.
+        pendingMessageSelection = nil
+
         // While the removal veil is up the rows are a stale picture, so a
         // non-empty selection arriving through the Table binding (arrow keys —
         // the veil's overlay already swallows clicks) would select by an index
         // that names a different message after the re-list. Ignore it; clears
-        // still pass, and the binding's `get` keeps the Table showing none.
+        // still pass, and the binding's `get` keeps the Table showing none —
+        // from the next turn on, now that the getter answers from the stand-in
+        // first.
         if removalVeil != nil, !new.isEmpty { return }
         if new != selectedMessageIDs {
             let added = new.subtracting(selectedMessageIDs)

@@ -246,9 +246,22 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             // `popUp(positioning:at:in:)` with a nil view takes screen
             // coordinates and places the menu's top-left at the point.
             //
-            // `minX` rather than the click's x, so the menu lines up with the
-            // row instead of wherever the pointer happened to be — otherwise it
-            // still wanders horizontally, which is half the same complaint.
+            // Horizontally, CENTRED ON THE POINTER. This used to use the row's
+            // `minX`, on the reasoning that lining the menu up with the row was
+            // tidier than letting it wander with the pointer. On Stephen's
+            // display a row is thirteen inches wide, so right-clicking the Date
+            // column threw the menu a foot to the left of his hand. Tidiness
+            // measured against the row is the wrong axis; what matters is the
+            // distance the eye and the hand have to travel.
+            //
+            // Centring needs the menu's width, and a menu has no width until it
+            // has items — ours are built by `menuNeedsUpdate`, which AppKit
+            // doesn't call until `popUp`. So we call it ourselves first. That is
+            // safe precisely because it starts with `removeAllItems()`: AppKit
+            // then calls it again during `popUp` and rebuilds the same menu.
+            // (`menuNeedsUpdate` being idempotent is already load-bearing — see
+            // the note in `MailboxMenuBuilder` about AppKit calling it more than
+            // once.)
             //
             // Not `popUpContextMenu(_:with:for:)`, which positions from the
             // event and offers no say. AppKit may still slide the menu up when
@@ -275,10 +288,23 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             // way to fix it is to measure again — not to reason about it. Set
             // `diagnosePlacement` and read the numbers.
             let correction = rowInWindow.height / 2
-            let anchor = NSPoint(x: rowInWindow.minX, y: rowInWindow.minY - correction)
+
+            // Build now, so `size` is real. A zero width would mean AppKit
+            // declined to measure it, and centring on nothing would put the menu
+            // under the pointer's left edge — so fall back to the old row-aligned
+            // behaviour rather than produce something worse than either.
+            self.menuNeedsUpdate(self.menu)
+            let menuWidth = self.menu.size.width
+            let x = menuWidth > 1
+                ? event.locationInWindow.x - menuWidth / 2
+                : rowInWindow.minX
+
+            let anchor = NSPoint(x: x, y: rowInWindow.minY - correction)
             if Self.diagnosePlacement {
                 print("ctx menu diag: row \(row) rect(table) \(table.rect(ofRow: row))"
                       + "  rect(window) \(rowInWindow)  correction \(correction)"
+                      + "  clickX(window) \(event.locationInWindow.x)"
+                      + "  menuWidth \(menuWidth)"
                       + "  anchor(screen) \(window.convertPoint(toScreen: anchor))")
             }
             self.menu.popUp(positioning: nil,
