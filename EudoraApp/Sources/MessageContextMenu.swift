@@ -427,10 +427,39 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+        add("Delete", #selector(deleteMessage))
+
         // Blacklist a sender — a single *received* message (never one you sent,
         // which would blacklist yourself). Auto-sends and can't be undone, so the
         // action itself also gates hard behind a confirmation.
+        //
+        // Last, behind its own separator. It used to sit directly above Delete,
+        // which put the menu's one irreversible, mail-sending action adjacent to
+        // its most-used one. Isolating it costs nothing — the separator is the
+        // whole safeguard at this level — and the confirmation still stands
+        // behind it.
+        //
+        // The separators are added inside the `if`, so a menu without the item
+        // doesn't end in stray dividers.
+        //
+        // The GAP is deliberate and is not a bug for a later reader to tidy away.
+        // Stephen asked for real distance between the menu's most-used action and
+        // its only irreversible one, so a slightly-off click lands on dead space
+        // rather than on a thing that sends mail on his behalf. He also finds it
+        // funny, which is a perfectly good second reason.
+        //
+        // **Consecutive separators do not work.** Three `.separator()` in a row
+        // coalesce into a single line — tried 2026aug03, and the menu looked
+        // exactly as it did before. AppKit needs something between them, so the
+        // gap is separator / blank item / separator. The blank carries a space
+        // rather than an empty string, which is what guarantees it a full-height
+        // row, and it is disabled so it can't be "chosen".
         if n == 1, let id = clickedPrimary, !model.isSentMessage(id) {
+            menu.addItem(.separator())
+            let spacer = NSMenuItem(title: " ", action: nil, keyEquivalent: "")
+            spacer.isEnabled = false
+            menu.addItem(spacer)
+            menu.addItem(.separator())
             let item = NSMenuItem(title: "Add to BLACKLIST", action: #selector(blacklist),
                                   keyEquivalent: "")
             item.target = self
@@ -443,7 +472,6 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             item.attributedTitle = title
             menu.addItem(item)
         }
-        add("Delete", #selector(deleteMessage))
     }
 
     private func add(_ title: String, _ action: Selector, enabled: Bool = true) {
@@ -488,9 +516,18 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             let alert = NSAlert()
             alert.alertStyle = .critical
             alert.messageText = "Add \(address) to your blacklist?"
+            // The list has to match what actually happens — a confirmation that
+            // under-reports its own consequences is worse than none. Hence the
+            // last clause: blacklisting reuses the menu's own Delete, so in
+            // Trash it removes rather than moves, and "delete" everywhere else
+            // in this app means "to Trash".
+            let fate = model.selectionIsInTrash
+                ? "and delete the message permanently, since it is already in Trash."
+                : "and move the message to Trash."
             alert.informativeText =
                 "This can't be undone. It will reply to this message telling the sender "
-                + "they've been blacklisted, add \(address) to ~/email_blacklist.txt, and open that file."
+                + "they've been blacklisted, add \(address) to ~/email_blacklist.txt, open that "
+                + "file, " + fate
             let yes = alert.addButton(withTitle: "Yes, I'm totally sure")
             let cancel = alert.addButton(withTitle: "Cancel")
             yes.keyEquivalent = ""          // Return must not fire the destructive action

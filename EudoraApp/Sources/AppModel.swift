@@ -3657,8 +3657,8 @@ final class AppModel: ObservableObject {
 
     /// Blacklist the selected message's sender. The caller has already confirmed
     /// (this is the point of no return): send the notice reply, append the address
-    /// to `~/email_blacklist.txt`, and open that file in TextEdit. The ISP-side
-    /// blacklisting Stephen does by hand.
+    /// to `~/email_blacklist.txt`, open that file in TextEdit, and delete the
+    /// message. The ISP-side blacklisting Stephen does by hand.
     func blacklistSelectedSender() {
         guard let part = selectedPart() else { return }
         let origFrom = part.header("From") ?? ""
@@ -3667,6 +3667,33 @@ final class AppModel: ObservableObject {
         guard !addr.isEmpty else { return }
 
         sendBlacklistNotice(to: origFrom, address: addr, about: part)
+
+        // Then bin it. Blacklisting a sender and keeping their message is not a
+        // combination Stephen has ever wanted, so this saves the second gesture.
+        //
+        // **After the notice, and that order is load-bearing.**
+        // `sendBlacklistNotice` lifts the headers, assembles the reply and quotes
+        // the body *before* its `Task` suspends — it never captures `part` at all
+        // — so the send holds a finished message and cannot be disturbed by the
+        // row going away. Deleting first would build the notice from a message
+        // that no longer sits where the selection says it does.
+        //
+        // **Before opening the blacklist file**, which is the other half of the
+        // ordering. `appendToBlacklistFileAndOpen` takes only a `String` and
+        // never touches the message, so it is free to come last — and last is
+        // where it belongs, because it brings TextEdit to the front. Deleting
+        // first means the veil, the relist and the scroll restore all run while
+        // Eudora is still frontmost.
+        //
+        // **Unconditional, even if the notice failed to send.** The mail is
+        // unwanted either way, the address is on the list either way, and the
+        // error banner still says what went wrong. This is the same
+        // `deleteSelected` the menu's Delete calls, so the message goes to Trash
+        // — and, exactly as with Delete, blacklisting something already *in*
+        // Trash removes it for good. That consistency is the point; a special
+        // case here would be the surprise. The confirmation says so.
+        deleteSelected()
+
         appendToBlacklistFileAndOpen(addr)
     }
 
@@ -3674,7 +3701,8 @@ final class AppModel: ObservableObject {
     private func sendBlacklistNotice(to origFrom: String, address: String, about part: MIMEPart) {
         guard let accounts, accounts.account.isConfigured, !accounts.password.isEmpty else {
             showError("Couldn't send the blacklist notice — set up your SMTP account in Settings first. "
-                      + "The address was still added to your blacklist file.")
+                      + "The address was still added to your blacklist file, and the message "
+                      + "was still deleted.")
             return
         }
         let subject = HeaderDecoder.decode(part.header("Subject") ?? "")
@@ -3705,7 +3733,8 @@ final class AppModel: ObservableObject {
                 showBanner("Blacklist notice sent to \(address).")
             } catch {
                 showError("The blacklist notice to \(address) didn't send: " + describe(error)
-                          + " (The address was still added to your blacklist file.)")
+                          + " (The address was still added to your blacklist file, and the "
+                          + "message was still deleted.)")
             }
         }
     }
@@ -3726,7 +3755,24 @@ final class AppModel: ObservableObject {
     }
 
     /// Re-list Trash if it's the mailbox on screen (mirrors `refreshOutIfShowing`).
+    ///
+    /// **Does nothing while a removal veil is up**, and that guard is not
+    /// optional politeness. Blacklisting now deletes the message too, so this
+    /// arrives seconds later, in the middle of the delete's own relist. Without
+    /// the guard, `loadListing` drops the veil and clears the rows — so the list
+    /// goes blank exactly when the veil exists to stop that, the in-flight
+    /// listing task is cancelled, and with it the completion that restores the
+    /// scroll position. On a 22,000-row Trash that is a blank several seconds
+    /// long ending somewhere other than where you were.
+    ///
+    /// Skipping the refresh costs nothing: the veil's own relist is already
+    /// re-reading this mailbox, and the notice copy is a disposable message that
+    /// can wait for the next listing. The unconditional `reloadTree()` is inside
+    /// the guard for the same reason — republishing 6,699 sidebar nodes on the
+    /// main actor while a listing's continuation is queued behind it is the
+    /// contention `afterRemoval` measured at four seconds.
     private func refreshTrashIfShowing() {
+        guard removalVeil == nil else { return }
         reloadTree()
         if let id = selectedMailboxID, itemsByID[id]?.type == .trash {
             loadListing(force: true)
@@ -4055,6 +4101,15 @@ final class AppModel: ObservableObject {
               !selectedMessageIDs.isEmpty else { return nil }
         return (item, Array(selectedMessageIDs))
     }
+
+    /// Whether the selection sits in Trash, where `deleteSelected` removes for
+    /// good rather than moving.
+    ///
+    /// Exists so the blacklist confirmation can name the actual fate of the
+    /// message instead of saying "delete" and meaning two different things. Reads
+    /// the same `currentSelectionSet` the delete itself will read, so the two
+    /// can't disagree about which branch is coming.
+    var selectionIsInTrash: Bool { currentSelectionSet()?.item.type == .trash }
 
     /// Whether anywhere exists to move a message to.
     ///
