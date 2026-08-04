@@ -36,6 +36,21 @@ Claude cannot compile: there is no Swift toolchain in the sandbox. The loop is
   it *after* writing the file, not before. Files in `EudoraMac/` and new
   imagesets inside `Assets.xcassets` are picked up automatically.
 
+## Releasing
+
+`scripts/release.sh` builds, signs, notarizes, staples and packages a
+distributable app. Stephen runs it; Claude cannot (no toolchain, and it talks to
+Apple). It fails loudly at each gate rather than producing a half-signed app.
+
+Signing lives in `project.yml` and its comments are load-bearing — the
+Developer ID fingerprint, the deliberately empty `DEVELOPMENT_TEAM`, and two
+**Release-only** settings that exist because notarization rejected the build
+without them. Don't move those into `base`.
+
+`EudoraDevelopmentNotes.txt` has the full account, including three separate
+Apple certificate types that are easy to confuse and four failures that each
+looked like something else.
+
 ## Git
 
 **Claude must not run git.** The sandbox cannot unlink files in `.git`, so every

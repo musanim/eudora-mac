@@ -63,30 +63,57 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "5.7"
         MACOSX_DEPLOYMENT_TARGET: "13.0"
-        # Personal, locally-run build: no team, no hardened runtime or sandbox.
-        # This app reads a Eudora tree in place from an arbitrary path in your
-        # home directory; sandboxing it later means adding the user-selected-file
-        # entitlement + security-scoped bookmarks.
+        # Not sandboxed: this app reads a Eudora tree in place from an arbitrary
+        # path in your home directory; sandboxing it later means adding the
+        # user-selected-file entitlement + security-scoped bookmarks.
         #
         # Signed with a stable identity, NOT ad-hoc ("-"). Ad-hoc gives the binary
         # a new signature every build, so the Keychain's "Always Allow" grant for
         # the SMTP password never sticks and re-prompts on each launch. A stable
         # identity fixes that.
         #
-        # We reference the existing "Apple Development: stephen@musanim.com" cert
-        # by its SHA-1 fingerprint (from `security find-identity -v -p codesigning`)
-        # rather than by name+team. That skips Xcode's team/account validation —
-        # this account isn't signed into Xcode ▸ Accounts, which broke both manual
-        # (name+team) and automatic signing. Direct-by-fingerprint needs no Apple
-        # account and no provisioning profile for a no-sandbox local Mac app.
+        # **Developer ID, so the app can be given to other people.** It used to be
+        # signed with an "Apple Development" cert, which is a LOCAL identity: the
+        # app ran here and was refused on anyone else's Mac, reported to them as
+        # "unsigned". Distribution outside the App Store needs a Developer ID
+        # Application certificate (team S59385AX28) plus notarization, which is a
+        # different credential from the Apple Distribution cert the iOS apps use —
+        # same membership, different purpose. See scripts/release.sh.
+        #
+        # Still referenced by SHA-1 fingerprint (from
+        # `security find-identity -v -p codesigning`) rather than by name+team,
+        # and DEVELOPMENT_TEAM is still deliberately empty. Naming the team broke
+        # both manual and automatic signing before, because this account isn't
+        # signed into Xcode ▸ Accounts; by-fingerprint needs no Apple account and
+        # no provisioning profile for a no-sandbox Mac app. Changing that is not
+        # an improvement waiting to be made.
         # If the cert is ever renewed the fingerprint changes; re-run the command
         # above and paste the new hash here.
+        #
+        # Hardened runtime is ON because notarization requires it. No entitlements
+        # are needed: nothing here loads third-party dylibs, and network, Keychain
+        # and unsandboxed file access are all unaffected by it.
         CODE_SIGN_STYLE: Manual
-        CODE_SIGN_IDENTITY: "D493F1004F5E3E7A3C1A3912E00D9922C411A402"
+        CODE_SIGN_IDENTITY: "104FFC817F2CD3D913D2D3E2C2ABAFBBEBDBC116"
         DEVELOPMENT_TEAM: ""
         PROVISIONING_PROFILE_SPECIFIER: ""
-        ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_HARDENED_RUNTIME: YES
         ENABLE_APP_SANDBOX: NO
+      configs:
+        # Release-only, and both are here because Apple's notary service rejected
+        # the first submission for exactly these two things. They are Release-only
+        # on purpose — see the reason attached to each.
+        Release:
+          # Xcode passes --timestamp for archive/export but not for a plain
+          # `xcodebuild build`, and notarization requires a secure timestamp.
+          # Not in Debug: timestamping contacts Apple's server on every signing,
+          # so it would put a network round trip in every incremental build.
+          OTHER_CODE_SIGN_FLAGS: "--timestamp"
+          # Xcode injects com.apple.security.get-task-allow — the entitlement
+          # that lets a debugger attach — into ordinary builds, and notarization
+          # refuses any binary carrying it. Must stay YES for Debug or the
+          # debugger can no longer attach to your own app.
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
 
 # A shared scheme so `xcodegen generate` always emits the app scheme and Xcode
 # keeps it selected (rather than defaulting to the eudora-spike CLI target).

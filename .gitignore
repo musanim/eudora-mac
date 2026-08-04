@@ -22,3 +22,6 @@ Eudora_*.zip
 
 # Personal scratchpad — not tracked
 EudoraDevelopmentNotes.txt
+
+# Release output — built app, zips, notarization logs
+dist/
