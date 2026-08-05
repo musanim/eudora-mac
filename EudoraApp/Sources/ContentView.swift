@@ -457,18 +457,55 @@ struct MailboxTree: View, Equatable {
 
     private var expandedIDs: Set<String> { liveExpansion ?? savedExpansion() }
 
-    /// One `Bool` binding per folder, over the shared set.
-    private func isExpanded(_ id: MailboxItem.ID) -> Binding<Bool> {
-        Binding(
-            get: { expandedIDs.contains(id) },
-            set: { open in
-                var next = expandedIDs
-                if open { next.insert(id) } else { next.remove(id) }
-                guard next != expandedIDs else { return }
-                liveExpansion = next
-                onExpansionChanged(next)
-            }
-        )
+    /// `expandedIDs`, reported once per actual change on the way past.
+    ///
+    /// A side effect in a getter, which is normally not on — but this is the only
+    /// point where the value the rows will be built from is in hand, and one line
+    /// per real change is what distinguishes "the write was dropped" from "the
+    /// outline view ignored a collapse". Both look identical on screen. Reverts to
+    /// plain `expandedIDs` when `SidebarExpansionProbe` goes off.
+    private var renderExpandedIDs: Set<String> {
+        let ids = expandedIDs
+        SidebarExpansionProbe.rendered(ids)
+        return ids
+    }
+
+    /// Open or close one folder.
+    ///
+    /// **This must be called through a closure made in `body`, and that is not a
+    /// style preference.** The first version handed `OutlineRows` the whole
+    /// `MailboxTree` and let it build its disclosure bindings from that stored
+    /// copy. Writing `@State` through a view struct a *child* is holding updates
+    /// the value but does **not invalidate the view**, so nothing re-renders.
+    ///
+    /// **The visible effect of a click was arbitrary; the stored state was always
+    /// right.** Both halves of that matter. Two sequences were observed on the same
+    /// build: clicking a closed group's chevron sometimes opened it and sometimes
+    /// left it shut, and a group that had been opened would not close — and in
+    /// every case a quit and relaunch showed the state had been recorded correctly
+    /// all along. What decided the appearance was only whether the outline view
+    /// happened to act on the click locally before a reconciliation it never got.
+    ///
+    /// The reason the state stayed right is that the write-through to `AppModel` is
+    /// a separate path, so persistence never broke. Clicking any other row changed
+    /// `selected`, which *is* in `==`, forcing the first genuine re-render — which
+    /// is why the tree would suddenly agree with itself after an unrelated click.
+    ///
+    /// (An earlier version of this comment said the write was dropped and predicted
+    /// a group would come back closed after a quit. It came back open. The
+    /// distinction is worth the words: a missing invalidation is invisible to
+    /// anything that inspects state, and a test asserting on the model cannot
+    /// catch it.)
+    ///
+    /// Passing `expandedIDs` down as a plain value and this as a closure keeps both
+    /// halves in the generation SwiftUI is actually tracking.
+    private func setExpanded(_ id: MailboxItem.ID, _ isExpanded: Bool) {
+        var next = expandedIDs
+        if isExpanded { next.insert(id) } else { next.remove(id) }
+        SidebarExpansionProbe.set(id, isExpanded, resulting: next)
+        guard next != expandedIDs else { return }
+        liveExpansion = next
+        onExpansionChanged(next)
     }
 
     var body: some View {
@@ -504,7 +541,8 @@ struct MailboxTree: View, Equatable {
                 // `NSOutlineView` with no public accessor, so it could neither be
                 // saved across launches nor restored after the `.id()` rebuild
                 // below — see `SidebarExpansion`.
-                OutlineRows(items: otherMailboxes, owner: self)
+                OutlineRows(items: otherMailboxes, owner: self,
+                            expanded: renderExpandedIDs, setExpanded: setExpanded)
             }
             .environment(\.defaultMinListRowHeight, SidebarRowMetrics.rowHeight)
         }
@@ -756,12 +794,22 @@ struct MailboxTree: View, Equatable {
     private struct OutlineRows: View {
         let items: [MailboxItem]
         let owner: MailboxTree
+        /// The expansion **as a plain value**, resolved by `owner`'s `body` for
+        /// this render. Not read back out of `owner`: that is what broke collapsing
+        /// (see `setExpanded`). `owner` is still carried, but only for `row(for:)`
+        /// and the context menu, neither of which touches `@State`.
+        let expanded: Set<String>
+        let setExpanded: (MailboxItem.ID, Bool) -> Void
 
         var body: some View {
             ForEach(items) { item in
                 if let children = item.children {
-                    DisclosureGroup(isExpanded: owner.isExpanded(item.id)) {
-                        OutlineRows(items: children, owner: owner)
+                    DisclosureGroup(
+                        isExpanded: Binding(get: { expanded.contains(item.id) },
+                                            set: { setExpanded(item.id, $0) })
+                    ) {
+                        OutlineRows(items: children, owner: owner,
+                                    expanded: expanded, setExpanded: setExpanded)
                     } label: {
                         owner.row(for: item)
                     }
@@ -1444,6 +1492,40 @@ enum SidebarOutlineFinder {
 /// left.
 enum SidebarRowMetrics {
     static let rowHeight: CGFloat = 21
+}
+
+/// Traces the sidebar's disclosure state: every toggle, and every change to the
+/// set the rows are actually built from.
+///
+/// Off, and intact. It was written for a nested group that would open but not
+/// close, whose candidate causes were indistinguishable on screen; in the end the
+/// bug was settled by a quit-and-reopen test instead (see `setExpanded`), which
+/// showed the state had been correct all along and only the redraw was missing.
+///
+/// Still the right tool if a disclosure ever misbehaves again, because it
+/// separates the three cases that look the same from outside:
+///
+/// - `set` then a `render` line, and the row still wrong → the state moved and the
+///   outline view ignored it.
+/// - `set` with no `render` line → the write isn't invalidating the view. This was
+///   the actual bug.
+/// - no `set` line at all → the click never reached the disclosure, and the label's
+///   `.tag`/`.contextMenu` are the suspects.
+enum SidebarExpansionProbe {
+    static let enabled = false
+    private static var lastRendered: Set<String>?
+
+    static func set(_ id: String, _ isExpanded: Bool, resulting: Set<String>) {
+        guard enabled else { return }
+        print("[sbexp] set \(id) -> \(isExpanded)  resulting \(resulting.sorted())")
+    }
+
+    /// Prints only when the set changes, so a render storm doesn't bury the trace.
+    static func rendered(_ ids: Set<String>) {
+        guard enabled, ids != lastRendered else { return }
+        lastRendered = ids
+        print("[sbexp] render \(ids.sorted())")
+    }
 }
 
 /// One-shot readout of the sidebar's real row geometry.

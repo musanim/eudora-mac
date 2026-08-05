@@ -94,6 +94,13 @@ instrumentation reports an idle main thread while the app is visibly stalling.
   `.listRowInsets` were each measured inert on the sidebar — SwiftUI answers
   `heightOfRowByItem` there — and KVO-pinning the height the way the *message
   table* legitimately does will stack-overflow. See `SidebarRowMetrics`.
+- **Passing `self` into a child view is fine for `@ViewBuilder` methods and not
+  fine for `@State`.** A write through a view struct a child is holding updates the
+  value but doesn't invalidate anything, so the state is correct and the screen
+  isn't — a bug no assertion about the model can catch. It cost a sidebar
+  disclosure that would open but not close. Resolve state in the owning view's
+  `body` and pass plain values down, with a closure made in `body` for writes. See
+  `MailboxTree.setExpanded`.
 - **Prefer deriving a badge to remembering one.** The In new-mail flag was
   session state cleared by "user engagement" and produced two bugs — cleared by a
   delivery's own selection echo, and lost on quit. Recomputing it from the mail on
