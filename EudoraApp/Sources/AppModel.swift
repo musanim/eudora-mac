@@ -553,12 +553,6 @@ final class AppModel: ObservableObject {
                         // cancel live work for no reason.
                         if let new, new != self.selectedMailboxID {
                             self.beginMailboxSwitch()
-                            // Selecting In dismisses its new-mail badge. Guarded on
-                            // a real switch, so the List writing the current
-                            // selection back during reconciliation doesn't clear it.
-                            if self.inboxHasNewMail, new == self.inboxID {
-                                self.inboxHasNewMail = false
-                            }
                         }
                         // Refuse a nil the List writes because the selected row
                         // isn't among the ones it has realized.
@@ -703,7 +697,6 @@ final class AppModel: ObservableObject {
                         // Superseded keystrokes drop out here — see
                         // `messageSelectionEpoch`.
                         guard let self, self.messageSelectionEpoch == epoch else { return }
-                        self.clearInboxNewMailBadge()
                         // Whether this is a real change, decided *before*
                         // applying it. SwiftUI writes a selection binding back
                         // when a control reconciles against changed contents —
@@ -896,15 +889,19 @@ final class AppModel: ObservableObject {
     /// remembered across launches (see `ViewState.sortByMailbox`).
     @Published private(set) var sort: MessageSort?
 
-    /// Lit when Check Mail has delivered new messages to In that the user hasn't
-    /// looked at yet — the sidebar then draws the unread glyph next to "In", the
-    /// way it draws the unsent glyph next to Out. Set on delivery (`receiveMail`)
-    /// and cleared the moment the user engages with In: selecting it, or — if In
-    /// was already selected when the mail arrived — the next message selection or
-    /// scroll. The clears live on the user-input paths (the SwiftUI bindings and
-    /// the guarded user-scroll site), not the shared model methods, so the
-    /// programmatic re-list that delivery triggers can't dismiss it. See
-    /// `clearInboxNewMailBadge`.
+    /// Whether In's **newest** message is unread — the green badge next to "In",
+    /// the counterpart of the unsent glyph next to Out.
+    ///
+    /// **Derived, and assigned in exactly two places**: the initial open and
+    /// `startTreeReload`, each in the same synchronous block as the `tree` it was
+    /// computed from. See `inboxNewestIsUnread` for the rule and for the two bugs
+    /// that produced it. Nothing else may set this — if the badge is ever wrong,
+    /// the question is which tree walk was missing, not which clear misfired.
+    ///
+    /// Not the same signal as the bold row name, which is `MailboxItem.hasUnread`
+    /// and means "In holds unread mail anywhere". This one narrows that to the most
+    /// recent arrival, so working back through a backlog turns the badge off as
+    /// soon as the newest is read, while leaving the bold name alone.
     @Published private(set) var inboxHasNewMail = false
 
     /// The message list's Who and Date column widths, adjustable by dragging the
@@ -1250,6 +1247,11 @@ final class AppModel: ObservableObject {
         // Out is always small enough that the extra TOC read costs nothing.
         tree = Self.buildItems(nodes, prefix: "",
                                outboxUnsent: Self.outboxHasUnsent(in: nodes, store: s))
+        // Same reasoning for In's new-mail badge, and cheaper still — one
+        // 218-byte record rather than a listing. This is what makes the badge
+        // correct on a cold launch, which is where it was previously always wrong:
+        // the flag it replaced started every process as false.
+        inboxHasNewMail = Self.inboxNewestIsUnread(in: nodes, store: s)
         treeVersion &+= 1
         // Seeded in the same turn as the tree itself, for both halves of the
         // invariant `startTreeReload` keeps.
@@ -1591,6 +1593,49 @@ final class AppModel: ObservableObject {
         ViewStateStore.save(viewState, forRoot: root)
     }
 
+    // MARK: - Sidebar expansion
+
+    /// Which sidebar folders were open when this Eudora folder was last used.
+    ///
+    /// Deliberately **not** `@Published`, and read rather than observed. The
+    /// sidebar owns the live value for as long as it is on screen (see
+    /// `MailboxTree`); publishing from here would invalidate every view
+    /// observing this model on each click of a disclosure triangle, which is the
+    /// cost `MailboxTree.==` exists to avoid.
+    var savedSidebarExpansion: Set<String> { viewState.sidebarExpansion.expandedIDs }
+
+    /// Record the sidebar's expansion, pruned to folders that still exist.
+    ///
+    /// Pruning here rather than at each delete, rename and move site: all three
+    /// either retire a path-derived id or change it, so one intersection applied
+    /// on save covers all three without four call sites having to remember. The
+    /// non-empty guard is load-bearing — `retain` with nothing present empties
+    /// the set (there is a test named for it), and a save that landed while the
+    /// tree was between reloads would otherwise forget every open folder.
+    func recordSidebarExpansion(_ ids: Set<String>) {
+        var next = SidebarExpansion(expandedIDs: ids)
+        if !tree.isEmpty { next.retain(idsIn: Self.folderIDs(in: tree)) }
+        guard next != viewState.sidebarExpansion else { return }
+        viewState.sidebarExpansion = next
+        if let root = rootURL?.path { ViewStateStore.save(viewState, forRoot: root) }
+    }
+
+    /// Every folder id in the tree. Folders are exactly the items with non-nil
+    /// `children` (a mailbox gets nil, an empty folder gets `[]` — see the tree
+    /// build), and only a folder can be expanded.
+    private static func folderIDs(in items: [MailboxItem]) -> Set<String> {
+        var ids: Set<String> = []
+        func walk(_ items: [MailboxItem]) {
+            for item in items {
+                guard let children = item.children else { continue }
+                ids.insert(item.id)
+                walk(children)
+            }
+        }
+        walk(items)
+        return ids
+    }
+
     /// The first mailbox of a given type, from the tree already in memory.
     ///
     /// **Never call `MailStore.mailboxBase(ofType:)` from here.** It looks like
@@ -1626,14 +1671,6 @@ final class AppModel: ObservableObject {
     /// The In box's tree id, or nil when the tree has none. Cheap enough to walk
     /// on demand at the (user-paced) points that need it.
     var inboxID: MailboxItem.ID? { item(ofType: .inbox)?.id }
-
-    /// Dismiss the In box's new-mail badge when the user engages with In on
-    /// screen. A no-op unless the badge is lit and In is the selected mailbox, so
-    /// it's safe to call from the message-selection and scroll input paths.
-    func clearInboxNewMailBadge() {
-        guard inboxHasNewMail, selectedMailboxID == inboxID else { return }
-        inboxHasNewMail = false
-    }
 
     /// Where sent and unsent mail lives, from the in-memory tree.
     var outboxBase: URL? { base(ofType: .outbox) }
@@ -1741,6 +1778,43 @@ final class AppModel: ObservableObject {
         guard let outbox = firstOutbox(in: nodes),
               let listing = store.list(at: outbox.base) else { return false }
         return listing.rows.contains { $0.status == MailboxMutator.statusUnsent }
+    }
+
+    /// The In mailbox in a freshly-walked tree, if there is one. The counterpart
+    /// of `firstOutbox`, and separate from `item(ofType:)` for the same reason
+    /// that one is: this runs against the walk's own nodes, before `tree` exists.
+    nonisolated private static func firstInbox(in nodes: [MailboxNode]) -> MailboxNode? {
+        for n in nodes {
+            if n.entry.type == .inbox { return n }
+            if let found = firstInbox(in: n.children) { return found }
+        }
+        return nil
+    }
+
+    /// Whether In's newest message is still unread — the sidebar's green badge.
+    ///
+    /// **Derived, not remembered, and that is the point.** The badge used to be a
+    /// published flag set on delivery and cleared by whichever user action was
+    /// judged to count as "engaging with In", which took two bugs to expose as the
+    /// wrong shape: a delivery re-list echoed the selection binding and put it out
+    /// with nobody touching anything, and it didn't survive a quit at all because
+    /// nothing persisted it. Persisting it would have been a third patch on the
+    /// same mistake.
+    ///
+    /// The rule it replaces all that with is Stephen's, and it needs no state:
+    /// *if the most recent message in In is unread, the pass through In is
+    /// unfinished.* That is a fact about the mail on disk, so it can simply be
+    /// recomputed — here, on every tree walk, which already happens at launch, on
+    /// delivery, and at the end of `markSelected` ("unread badge may change").
+    /// Reading the newest message therefore puts the badge out by itself, and
+    /// reading an older one leaves it lit, which is the intended reading of
+    /// "perusal still incomplete".
+    ///
+    /// Costs one 218-byte read — see `MailStore.newestStatus`.
+    nonisolated private static func inboxNewestIsUnread(in nodes: [MailboxNode],
+                                                       store: MailStore) -> Bool {
+        guard let inbox = firstInbox(in: nodes) else { return false }
+        return store.newestIsUnread(base: inbox.base)
     }
 
     // MARK: listing a mailbox
@@ -4298,12 +4372,16 @@ final class AppModel: ObservableObject {
         let generation = treeReloadGeneration
         PerfLog.mark("tree walk queued")
         Task { [weak self] in
-            let (nodes, outboxUnsent) = await Task.detached(priority: .userInitiated) {
-                // Both off the main thread: the tree walk, and the Out scan for
-                // the unsent badge (it lists Out's TOC, which is cheap but still
-                // I/O, so it has no business on the main actor).
+            let (nodes, outboxUnsent, inboxNewestUnread) =
+                await Task.detached(priority: .userInitiated) {
+                // All off the main thread: the tree walk, the Out scan for the
+                // unsent badge (it lists Out's TOC, which is cheap but still I/O,
+                // so it has no business on the main actor), and the one-record In
+                // read behind the new-mail badge.
                 let nodes = store.tree()
-                return (nodes, Self.outboxHasUnsent(in: nodes, store: store))
+                return (nodes,
+                        Self.outboxHasUnsent(in: nodes, store: store),
+                        Self.inboxNewestIsUnread(in: nodes, store: store))
             }.value
             PerfLog.mark("tree walk done: \(nodes.count) roots")
             guard let self else { return }
@@ -4322,6 +4400,9 @@ final class AppModel: ObservableObject {
             // the new data render under the old identity, which is a diff of a
             // restructured outline — the thing that crashed. See `MailboxTree`.
             self.tree = items
+            // In the same block as the tree it was computed from, so the badge and
+            // the row it sits on can never disagree by a frame.
+            self.inboxHasNewMail = inboxNewestUnread
             self.treeVersion &+= 1
             // Only when the shape actually moved. Hashing 6,699 ids costs
             // microseconds; rebuilding the Move menus costs half a second.
@@ -5294,13 +5375,20 @@ final class AppModel: ObservableObject {
                 // here, against a mailbox not on screen, on every delivery.
                 reloadTree()
             }
-            // Light the sidebar's new-mail glyph on In (dismissed when the user
-            // next engages with In — see `clearInboxNewMailBadge`). This is
-            // deliberately *not* the same signal as the bold unread name: bold
-            // means "In holds unread mail" and stays lit as long as that is
-            // true, while the glyph means "mail arrived since you last looked"
-            // and clears on engagement.
-            inboxHasNewMail = true
+            // Nothing lights the sidebar's new-mail glyph here, and nothing needs
+            // to: both branches above reload the tree — one directly, one once its
+            // rows are back — and the glyph is computed from In's newest message
+            // during that walk (`inboxNewestIsUnread`).
+            //
+            // It used to be set explicitly, right here, which is what made it a
+            // piece of session state and gave it two bugs to be found later. The
+            // arriving message is unread and it is the newest, so the derived
+            // value is already true; saying so twice is how the two copies got a
+            // chance to disagree.
+            //
+            // Still deliberately *not* the same signal as the bold unread name:
+            // bold means "In holds unread mail anywhere" and this means "In's most
+            // recent message is unread".
         }
 
         report(received: received, duplicates: duplicates, failures: failures,
@@ -5734,8 +5822,6 @@ final class AppModel: ObservableObject {
                 loadListing(force: true)
             }
         } else {
-            // Jumping into In from a search hit also dismisses its badge.
-            if inboxHasNewMail, hit.mailbox == inboxID { inboxHasNewMail = false }
             pendingMessageID = index
             pendingMessageIsExplicitJump = true
             selectedMailboxID = hit.mailbox   // onChange → loadListing() applies pending

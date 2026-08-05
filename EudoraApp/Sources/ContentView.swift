@@ -348,6 +348,9 @@ struct SidebarView: View {
                             selected: model.selectedMailboxID,
                             inboxHasNewMail: model.inboxHasNewMail,
                             selection: model.mailboxSelection,
+                            expansionRoot: model.rootURL?.path ?? "",
+                            savedExpansion: { model.savedSidebarExpansion },
+                            onExpansionChanged: { model.recordSidebarExpansion($0) },
                             mailboxIsDeletablyEmpty: { model.mailboxIsDeletablyEmpty($0) },
                             onDeleteMailbox: { model.deleteMailbox($0) },
                             folderIsDeletablyEmpty: { model.folderIsDeletablyEmpty($0) },
@@ -368,7 +371,7 @@ struct SidebarView: View {
 ///
 /// `SidebarView` observes `AppModel` through `@EnvironmentObject`, which means
 /// *any* published change — a row arriving, a preview rendering, a banner
-/// appearing — invalidates it and rebuilds this `OutlineGroup` over every
+/// appearing — invalidates it and rebuilds the outline over every *visible*
 /// mailbox in the tree. On a real Eudora folder that is 2,723 nodes, and it was
 /// costing ~0.7 s of main-thread render on **every** state change: the reason a
 /// click took a perceptible moment to blank the message list even when both
@@ -395,6 +398,19 @@ struct MailboxTree: View, Equatable {
     /// the In row. In `==` so the badge appearing/clearing re-renders the tree.
     let inboxHasNewMail: Bool
     let selection: Binding<MailboxItem.ID?>
+
+    /// The Eudora folder's path, used only as the identity of the remembered
+    /// expansion: opening a different tree must re-seed from *that* tree's saved
+    /// state rather than inherit this one's. Excluded from `==` because it cannot
+    /// change without `treeVersion` changing too — a new root reloads the tree.
+    let expansionRoot: String
+    /// The expansion saved for this Eudora folder, read fresh rather than passed
+    /// as a value so that a stale copy of this view (see `==`) still seeds from
+    /// what the model holds now. Excluded from `==`.
+    let savedExpansion: () -> Set<String>
+    /// Write-through for a disclosure click. The model persists and prunes; it
+    /// does not publish, so this does not re-render anything. Excluded from `==`.
+    let onExpansionChanged: (Set<String>) -> Void
 
     /// Live checks and actions, queried only when a row's context menu is
     /// actually opened. Closures rather than the model itself, so this view stays
@@ -423,18 +439,90 @@ struct MailboxTree: View, Equatable {
     // when `treeVersion` does — both are published in the same synchronous
     // block, in `startTreeReload` and in `open` — so comparing it would be
     // redundant, and this view has to re-render on a structural change anyway.
+    //
+    // Nor is the expansion, and that one is worth being explicit about: it is
+    // `@State` below, owned here. `@State` invalidates *this* view directly,
+    // which no `==` can suppress — `EquatableView` only short-circuits an update
+    // pushed down by the parent. So a disclosure click still re-renders the tree
+    // (it has to, that's the change being drawn) while an unrelated `AppModel`
+    // publish still doesn't.
+
+    /// The live expansion, or `nil` for "untouched this session".
+    ///
+    /// `nil` rather than seeding in `.onAppear`, because `.onAppear` runs *after*
+    /// the first render: the tree would paint fully collapsed and then visibly
+    /// snap open a frame later. Reading through to `savedExpansion()` while nil
+    /// makes the first paint already correct.
+    @State private var liveExpansion: Set<String>?
+
+    private var expandedIDs: Set<String> { liveExpansion ?? savedExpansion() }
+
+    /// One `Bool` binding per folder, over the shared set.
+    private func isExpanded(_ id: MailboxItem.ID) -> Binding<Bool> {
+        Binding(
+            get: { expandedIDs.contains(id) },
+            set: { open in
+                var next = expandedIDs
+                if open { next.insert(id) } else { next.remove(id) }
+                guard next != expandedIDs else { return }
+                liveExpansion = next
+                onExpansionChanged(next)
+            }
+        )
+    }
 
     var body: some View {
         List(selection: selection) {
-            // System mailboxes (In/Out/Junk/Trash) are pinned at the top and have
-            // no children, so they're a flat ForEach; a divider then sets them off
-            // from the user's own mailboxes and folders below.
-            ForEach(systemMailboxes) { item in row(for: item) }
-            if !systemMailboxes.isEmpty && !otherMailboxes.isEmpty {
-                Divider()
+            // The row height, and note where this sits: **inside** the `List`,
+            // wrapped around its content, not on the `List` itself.
+            //
+            // That is the whole finding of three failed attempts. `List` writes
+            // its own `defaultMinListRowHeight` into its content's environment
+            // from the list style, so the same modifier applied outside is
+            // overwritten before any row reads it — measured, not assumed: with 24
+            // set on the `List`, a row still read 32. A `Group` here is below that
+            // write, so the value reaches the rows.
+            //
+            // Why it has to be this value and nothing else: the outline
+            // coordinator answers `heightOfRowByItem`, so the AppKit `rowHeight`
+            // is inert (forced to 20, `rect(ofRow:)` stayed 32); `intercellSpacing`
+            // is already 0, so there is no between-row gap to take; and
+            // `hosted.h == rowView.h == 32` says the height is imposed on the
+            // content rather than derived from it, which is why `.listRowInsets`
+            // could never have worked either. See `SidebarRowMetrics`.
+            Group {
+                // System mailboxes (In/Out/Junk/Trash) are pinned at the top and
+                // have no children, so they're a flat ForEach; a divider then sets
+                // them off from the user's own mailboxes and folders below.
+                ForEach(systemMailboxes) { item in row(for: item) }
+                if !systemMailboxes.isEmpty && !otherMailboxes.isEmpty {
+                    Divider()
+                }
+                // `DisclosureGroup`s bound to `expandedIDs`, not an
+                // `OutlineGroup`. The swap buys exactly one thing: expansion this
+                // app can read and write. `OutlineGroup` keeps it inside
+                // `NSOutlineView` with no public accessor, so it could neither be
+                // saved across launches nor restored after the `.id()` rebuild
+                // below — see `SidebarExpansion`.
+                OutlineRows(items: otherMailboxes, owner: self)
             }
-            OutlineGroup(otherMailboxes, children: \.children) { item in row(for: item) }
+            .environment(\.defaultMinListRowHeight, SidebarRowMetrics.rowHeight)
         }
+        // The row height's actual owner, after five builds of measurement: the
+        // list style. Everything reachable from AppKit is inert on this view —
+        // `rowHeight` forced to 20 left `rect(ofRow:)` at 32, `rowSizeStyle` set
+        // to `.small` left it at 32, `intercellSpacing` is already 0 — and
+        // `defaultMinListRowHeight` demonstrably reaches the rows but is only a
+        // floor, so it cannot lower anything. The sidebar style's 32 pt row is
+        // computed inside SwiftUI's outline coordinator and exposed nowhere else.
+        //
+        // `.plain` is therefore not a cosmetic preference, it is the lever. It
+        // costs the native sidebar look — rectangular selection instead of the
+        // rounded translucent capsule, and no sidebar material behind the rows —
+        // which is a trade Stephen made explicitly rather than one taken quietly.
+        // Reverting is this one line; the 24 above then goes back to being a
+        // floor that never binds and the rows return to 32.
+        .listStyle(.plain)
         // Rebuild the outline outright when the tree's shape changes, rather
         // than letting SwiftUI diff it.
         //
@@ -465,10 +553,19 @@ struct MailboxTree: View, Equatable {
         // collapsing a subtree before moving it — a day's work, and the reason to
         // reach for it is that, not the DisclosureGroups.
         //
-        // The cost: a move *between* groups, a new group or a deleted group
-        // collapses the sidebar to its default expansion. Annoying exactly when
-        // reorganising — but restructuring is occasional, and a crash
-        // mid-reorganise is worse than re-expanding a folder.
+        // **That swap has since happened, and this `.id()` stays.** The tree is
+        // built from `DisclosureGroup`s now, for persistence (`SidebarExpansion`),
+        // and the paragraph above is the reason that did not also retire the
+        // guard: same coordinator, same diff, same crash. What changed is only
+        // the cost, below.
+        //
+        // The cost, as it was: a move *between* groups, a new group or a deleted
+        // group collapsed the sidebar to its default expansion — which meant
+        // Move to ▸ New…, the most-used way of filing, closed the tree under you
+        // every time. That is gone. The rebuild still happens, but expansion no
+        // longer lives inside the view being discarded, so the fresh outline
+        // comes up open exactly where the old one was. Being a fresh build rather
+        // than a diff is also why it cannot hit the assertion above.
         //
         // Move Up/Down is deliberately *not* in that set. It was at first, and
         // it made the feature unusable: reordering a mailbox inside a group
@@ -491,6 +588,18 @@ struct MailboxTree: View, Equatable {
         // assertion with none of our frames on the stack — there is nothing to
         // instrument on the failing side, so instrument the fix instead.
         .onAppear { PerfLog.mark("sidebar outline built (identity \(treeIdentityVersion))") }
+        // Drop back to "read from the model" whenever the Eudora folder changes,
+        // so a newly opened tree seeds from its own saved expansion instead of
+        // inheriting the set the previous one was left with. Also fires once on
+        // first appearance, where it is a no-op.
+        .task(id: expansionRoot) { liveExpansion = nil }
+        // Reads the resulting row geometry and prints it once — it sets nothing.
+        // Here rather than deleted because `defaultMinListRowHeight` above is a
+        // request, and this is how we know what the outline view did with it.
+        // Applied after `.id()`, so it isn't rebuilt when `treeIdentityVersion`
+        // changes; `attach` handles that itself by re-finding the table when the
+        // one it holds has left the window.
+        .background(SidebarRowHeightPin())
     }
 
     /// The pinned system boxes and everything else, split off `tree` (already
@@ -618,6 +727,51 @@ struct MailboxTree: View, Equatable {
     /// sub-groups — so every group is a direct destination, no "Move here" needed.
     /// It's a `View` struct because a `some View` function can't call itself,
     /// which SwiftUI recursion needs.
+    /// One level of the mailbox tree, recursing into folders.
+    ///
+    /// A `View` struct rather than a `@ViewBuilder` function for the same reason
+    /// `GroupSubmenu` below is one: a function returning `some View` cannot call
+    /// itself. Carrying the whole `MailboxTree` as `owner` rather than its dozen
+    /// closures keeps the recursive call to one line and keeps the row builders
+    /// and the context menu where they already are.
+    ///
+    /// A folder is any item with non-nil `children`, which is exactly the test
+    /// the `OutlineGroup` this replaced applied through `children: \.children`.
+    /// The emptiness of that array deliberately doesn't matter: an empty folder
+    /// gets `[]` (a mailbox gets nil), so it keeps the disclosure triangle it has
+    /// always had rather than silently becoming a leaf.
+    ///
+    /// **The tag and the context menu go on the label, not on the
+    /// `DisclosureGroup`** — that is, `row(for:)` is used unchanged, exactly as
+    /// the `OutlineGroup` used it. A `DisclosureGroup` in a `List` flattens to
+    /// several rows, its label plus everything inside it, and a modifier on the
+    /// group applies to that whole span: `.contextMenu` there would put a
+    /// folder's menu on every row nested under it, and `.tag` there would very
+    /// likely make clicking a child select its parent. Keeping both on the label
+    /// keeps them where they demonstrably work today.
+    ///
+    /// If a folder row turns out not to be selectable, *this* is the thing to
+    /// change and the only known candidate — see the note in
+    /// `EudoraDevelopmentNotes.txt`.
+    private struct OutlineRows: View {
+        let items: [MailboxItem]
+        let owner: MailboxTree
+
+        var body: some View {
+            ForEach(items) { item in
+                if let children = item.children {
+                    DisclosureGroup(isExpanded: owner.isExpanded(item.id)) {
+                        OutlineRows(items: children, owner: owner)
+                    } label: {
+                        owner.row(for: item)
+                    }
+                } else {
+                    owner.row(for: item)
+                }
+            }
+        }
+    }
+
     private struct GroupSubmenu: View {
         let folder: MailboxItem
         let moving: MailboxItem.ID
@@ -645,9 +799,11 @@ struct MailboxTree: View, Equatable {
 /// forced directly on the `NSTableView` and re-enforced through KVO when SwiftUI
 /// resets it (see `pinRowHeight` / `enforceRowHeight`).
 ///
-/// So tightening the tree means reaching the backing `NSOutlineView` the same
-/// way, not another SwiftUI modifier. Recorded here so the next attempt starts
-/// from the AppKit route instead of spending a build on this one.
+/// That conclusion — reach for the backing `NSOutlineView` — was tried and is
+/// **wrong for this view**: SwiftUI answers `heightOfRowByItem` here, so the
+/// AppKit `rowHeight` is inert. The height is set by `defaultMinListRowHeight` on
+/// the `List`; see `SidebarRowMetrics` for the measurements. The note stays for
+/// the part that held up: nothing added to *this* view changes its row height.
 struct MailboxRow: View {
     let item: MailboxItem
     /// Whether to draw the new-mail glyph. Only ever true for the In row — the
@@ -671,10 +827,10 @@ struct MailboxRow: View {
                     .interpolation(.none)
                     .help("Unsent mail waiting to be sent")
             }
-            // The new-mail glyph next to In when Check Mail has brought in
-            // messages the user hasn't looked at yet — the In counterpart of the
-            // unsent glyph above. Cleared on engaging with In (see
-            // `AppModel.clearInboxNewMailBadge`).
+            // The new-mail glyph next to In when In's newest message is unread —
+            // the In counterpart of the unsent glyph above. Goes out by itself
+            // when that message is read, because it is derived rather than
+            // dismissed; see `AppModel.inboxNewestIsUnread`.
             //
             // `TreeIcon.newMail`, not `RowIcon.unread`: bigger and green, to be
             // seen from across the room. See the comment on TreeIcon.
@@ -1212,6 +1368,297 @@ enum MessageTableFinder {
             if let found = search(in: child) { return found }
         }
         return nil
+    }
+}
+
+/// Locates the `NSTableView` backing the mailbox sidebar — the other half of
+/// `MessageTableFinder`, and deliberately its mirror image.
+///
+/// Same window, two `NSOutlineView` subclasses (see the layout in
+/// `MessageTableFinder`), so this discriminates the opposite way: **one** column
+/// *and* no header view. The message table has four columns and an
+/// `NSTableHeaderView`, so it can't match either test, and requiring both means
+/// a future column added to the sidebar fails to find it — no change to density —
+/// rather than quietly tightening the message list instead.
+enum SidebarOutlineFinder {
+    static func outline(near view: NSView) -> NSTableView? {
+        var ancestor = view.superview
+        while let current = ancestor {
+            if let found = search(in: current) { return found }
+            ancestor = current.superview
+        }
+        return nil
+    }
+
+    private static func search(in root: NSView) -> NSTableView? {
+        if let table = root as? NSTableView,
+           table.tableColumns.count == 1,
+           table.headerView == nil {
+            return table
+        }
+        for child in root.subviews {
+            if let found = search(in: child) { return found }
+        }
+        return nil
+    }
+}
+
+/// The mailbox sidebar's row height. **This constant is the only knob**; the
+/// mechanism around it took five builds to establish, so it is worth stating as a
+/// conclusion rather than a trail.
+///
+/// Two conditions have to hold together, and neither works alone:
+///
+/// 1. `.listStyle(.plain)` on the `List`. The sidebar style imposes a fixed 32 pt
+///    row that nothing else can reach.
+/// 2. `.environment(\.defaultMinListRowHeight, rowHeight)` applied **inside** the
+///    `List`, around its content. `List` writes its own value into the content
+///    environment from the list style, so the same modifier applied to the `List`
+///    is overwritten before any row reads it — measured, not assumed: with 24 set
+///    on the `List`, a row read back 32.
+///
+/// Everything else was tried and measured inert on this view, which is worth
+/// knowing before reaching for any of it again: the AppKit `rowHeight` (forced to
+/// 20, `rect(ofRow:)` stayed 32 — SwiftUI's outline coordinator answers
+/// `heightOfRowByItem`, so the property is only an estimate here, unlike the
+/// message table's `Table` where the same code does work — see
+/// `MessageRowMetrics`); `usesAutomaticRowHeights`; `intercellSpacing`, already 0,
+/// so there is no between-row gap to reclaim; `rowSizeStyle`, set to `.small`
+/// with `rect(ofRow:)` staying 32; and `.listRowInsets`, which never moved the
+/// height in 2026aug04.
+///
+/// And KVO-pinning the AppKit height the way `TableScrollStateSyncer` does
+/// **stack-overflows here** — the guard that bounds it there depends on
+/// `rowHeight` being authoritative, which it isn't.
+///
+/// **The floor on the value is 20 pt, set by artwork rather than by text.** The
+/// tallest thing in any row is `TreeIcon.newMail`, the green new-mail badge on In:
+/// a 20×20 PNG drawn at native size, no `.frame`, not resizable. Next is the SF
+/// Symbol row icon at ~16 (it gets no `.font`, so it is *not* Arial 13), then the
+/// Arial-13 text line box at ~15. So 21 keeps a point of slack over the badge and
+/// is the tightest value available without touching art; going below that means
+/// bounding the badge — `.resizable()` into a 16 pt frame, or a 16 pt imageset —
+/// and that would visibly shrink a glyph chosen to be seen from across the room.
+///
+/// 32 → 24 halved the space around ~16 pt of content; 21 takes most of what is
+/// left.
+enum SidebarRowMetrics {
+    static let rowHeight: CGFloat = 21
+}
+
+/// One-shot readout of the sidebar's real row geometry.
+///
+/// Off, and intact, per CLAUDE.md's convention. It earned its keep: five builds
+/// of density work were decided by its output, and it is what identified the
+/// height's real owner (`delegateItemHeight true`) after two wrong theories. Turn
+/// it back on if the row height ever stops answering to `SidebarRowMetrics` — the
+/// numbers it prints are the ones that distinguish "the finder missed" from "the
+/// lever is inert" from "the value never arrived", and those look identical from
+/// the outside.
+enum SidebarDensityProbe {
+    static let enabled = false
+    private static var scheduled = false
+
+    /// Call with the table **before** the height is forced — the whole point is
+    /// the value SwiftUI chose, and one line of it.
+    ///
+    /// Split into two moments, because the two halves aren't available at the
+    /// same time. The properties can be read now and must be, since forcing the
+    /// height destroys them; the row geometry can't, because rows may not be in
+    /// yet and SwiftUI's layout may not have run. Same 0.3 s `RowDensityProbe`
+    /// settled on for exactly that reason. Reading `rect(ofRow:)` at attach time
+    /// instead would have reported `rows 0` and latched, spending the build and
+    /// learning nothing.
+    static func reportOnce(_ table: NSTableView) {
+        guard enabled, !scheduled else { return }
+        scheduled = true
+        let before = [
+            "rowHeight \(table.rowHeight)",
+            "automatic \(table.usesAutomaticRowHeights)",
+            "spacing.h \(table.intercellSpacing.height)",
+            // The likeliest reason forcing `rowHeight` does nothing at all: a
+            // delegate height callback overrides it whether automatic heights are
+            // on or off. SwiftUI's outline coordinator behind `List` is a
+            // different object from the one behind `Table`, so the message
+            // table's success here proves nothing about the sidebar — and a
+            // no-change outcome would otherwise be indistinguishable from the
+            // finder having missed.
+            //
+            // Two selectors because the delegate could answer either: `List` is
+            // backed by an `NSOutlineView`, so the item-based callback is the
+            // likelier of the two, but the row-based one would win just as
+            // completely. Both are `#selector` — the string form warns, and the
+            // usual double-parens suppression didn't take here.
+            "delegateRowHeight \(table.delegate?.responds(to: #selector(NSTableViewDelegate.tableView(_:heightOfRow:))) ?? false)",
+            "delegateItemHeight \(table.delegate?.responds(to: #selector(NSOutlineViewDelegate.outlineView(_:heightOfRowByItem:))) ?? false)",
+        ].joined(separator: "  ")
+        // Built by joining an array rather than concatenating interpolations:
+        // this file has already paid for that shape once — a six-element
+        // `+`-chain of interpolated literals is what trips "unable to type-check
+        // in reasonable time" (see the note on `MessageRowMetrics`' neighbours).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak table] in
+            guard let table else { return }
+            let rows = table.numberOfRows
+            let rowRect: CGFloat = rows > 0 ? table.rect(ofRow: 0).height : -1
+            let after = ["rect(ofRow:0).height \(rowRect)", "rows \(rows)"]
+                .joined(separator: "  ")
+            print("[sidebardensity] was: " + before + "  |  is: " + after)
+            reportRowAnatomy(table)
+        }
+    }
+
+    /// Where the 32 pt actually lives: content, or padding around content.
+    ///
+    /// This is the question two builds have now failed to answer by inference.
+    /// `defaultMinListRowHeight` is a *floor*, so it can only lower a row whose
+    /// measured height is above it — setting 24 changed nothing, which means
+    /// either the value never reached the `List` (`reportEnvironment` answers
+    /// that, from the SwiftUI side) or the row measures 32 on its own and the
+    /// floor never bound.
+    ///
+    /// The frames separate those. A 32 pt row view wrapping a ~16 pt hosting view
+    /// is padding, and the lever is `.listRowInsets` or the list style. A 32 pt
+    /// hosting view is content, and the lever is inside `MailboxRow` — most
+    /// likely the SF Symbol, which gets no `.font` and so takes the default body
+    /// size rather than Arial 13.
+    private static func reportRowAnatomy(_ table: NSTableView) {
+        guard table.numberOfRows > 0 else { return }
+        let rowView = table.rowView(atRow: 0, makeIfNecessary: false)
+        let cellView = table.view(atColumn: 0, row: 0, makeIfNecessary: false)
+        let hosted = cellView?.subviews.first
+        let fields = [
+            "rowView.h \(rowView?.frame.height ?? -1)",
+            "cellView.h \(cellView?.frame.height ?? -1)",
+            "hosted.h \(hosted?.frame.height ?? -1)",
+            "cellView.y \(cellView?.frame.origin.y ?? -1)",
+            "rowSizeStyle \(table.rowSizeStyle.rawValue)",
+        ].joined(separator: "  ")
+        print("[sidebaranatomy] " + fields)
+    }
+
+    /// **The SwiftUI half, and it was the decisive one — how to put it back.**
+    /// Give `MailboxRow` an `@Environment(\.defaultMinListRowHeight)` property and
+    /// an `.onAppear` that prints it. It has to be read inside a *row*, not in
+    /// `MailboxTree`: `.environment` applies to the list's content, so reading it
+    /// in the view that sets it reports the old value and proves nothing. That one
+    /// line is what showed a row seeing 32 while 24 had been set on the `List`,
+    /// which is the finding the whole mechanism rests on.
+    ///
+    /// Not left in place because `MailboxRow` is the hot view here — 2,723 of them
+    /// — and it is the one place in this file where an unused environment
+    /// dependency isn't free.
+}
+
+/// Finds the sidebar's outline view and reports its geometry, once.
+///
+/// **Measurement only — it no longer sets anything.** It began as the mirror of
+/// the message table's row-height forcing, and two runs retired that: the KVO
+/// pinning stack-overflowed, and the plain assignment it was reduced to turned
+/// out to be inert, because SwiftUI answers `heightOfRowByItem` on this view. The
+/// height is now set in SwiftUI (`defaultMinListRowHeight`, applied in
+/// `MailboxTree.body`); this stays because the number that lever produces is
+/// worth being able to read rather than infer from looking at the window.
+///
+/// Attached to the mailbox `List` as a zero-sized `.background`, the same
+/// reach-through `TableHeaderIconStyler` and `TableScrollStateSyncer` use on the
+/// message table. Entirely defensive: if the outline view isn't found, nothing
+/// happens and nothing prints.
+struct SidebarRowHeightPin: NSViewRepresentable {
+    final class Coordinator {
+        weak var table: NSTableView?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        // Nothing to do when both diagnostics are off, which is the shipped state.
+        // Worth an explicit guard rather than relying on the probes' own: `attach`
+        // walks the window's view tree to find the outline view, and doing that
+        // to then discover there is nothing to report is the kind of cost that
+        // survives because it is invisible.
+        guard SidebarDensityProbe.enabled || SidebarRowSizeStyleTrial.enabled else { return }
+        let coordinator = context.coordinator
+        // Async, and with retries: the backing view is not in the window
+        // hierarchy on the first pass, and `attach` finding nothing is the
+        // ordinary first outcome rather than a failure.
+        DispatchQueue.main.async {
+            attach(near: nsView, coordinator: coordinator, attemptsLeft: 5)
+        }
+    }
+
+    @MainActor
+    private func attach(near view: NSView, coordinator: Coordinator, attemptsLeft: Int) {
+        // Still pinned to a live table — return without walking the view tree.
+        // `MailboxTree` re-renders on every selection change, so this is the path
+        // an arrow-key press through the sidebar takes; the search is a recursive
+        // descent of the window and has no business running there. Tested on
+        // `window != nil` rather than identity for the same reason
+        // `MessageColumnResizeInstaller.install` does: a table that has left the
+        // hierarchy is the one case that must re-attach.
+        if let existing = coordinator.table, existing.window != nil { return }
+        guard let table = SidebarOutlineFinder.outline(near: view) else {
+            guard attemptsLeft > 0 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                attach(near: view, coordinator: coordinator, attemptsLeft: attemptsLeft - 1)
+            }
+            return
+        }
+        SidebarDensityProbe.reportOnce(table)
+        SidebarRowSizeStyleTrial.tryOnce(table)
+        coordinator.table = table
+    }
+}
+
+/// Tests one hypothesis and reports the answer: is the 32 pt row coming from
+/// `NSTableView.rowSizeStyle`?
+///
+/// Where the evidence points. `defaultMinListRowHeight` now demonstrably reaches
+/// the rows — a row reads back 24 — and `rect(ofRow:)` is still 32, so the floor
+/// is not what sets the height; a floor can only raise. What remains on the chain
+/// is the list style, and the one number it left in view is `rowSizeStyle 2`
+/// (`.medium`). If SwiftUI's outline coordinator answers `heightOfRowByItem` with
+/// something like `max(defaultMinListRowHeight, standardHeight(rowSizeStyle))`,
+/// then `.medium` is the 32 and `.small` should move it while `defaultMinListRowHeight`
+/// keeps the floor at 24.
+///
+/// **Deliberately an experiment, not a fix.** It is a single assignment, no KVO
+/// (that route already stack-overflowed here), and it changes nothing visible if
+/// SwiftUI ignores it — the cheap, non-destructive way to separate this from the
+/// alternative, which is `.listStyle(.plain)` and does change the sidebar's
+/// appearance. If the printed pair shows no movement, `rowSizeStyle` joins
+/// `rowHeight`, `intercellSpacing` and `.listRowInsets` as inert here and the
+/// style is the only thing left.
+enum SidebarRowSizeStyleTrial {
+    /// Off. The trial ran and the answer was no: `styleNow 1  before 32.0
+    /// after 32.0` — the assignment took and the row did not move, so the
+    /// coordinator does not derive its height from `rowSizeStyle`. Left switched
+    /// off rather than deleted, per CLAUDE.md, and it must stay off: it mutates
+    /// the table mid-run, which would confound any later density measurement.
+    static let enabled = false
+    private static var tried = false
+
+    static func tryOnce(_ table: NSTableView) {
+        guard enabled, !tried else { return }
+        tried = true
+        // A beat first, so the "before" is SwiftUI's settled layout rather than a
+        // table that hasn't been laid out yet — the mistake the density probe
+        // made on its first outing.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak table] in
+            guard let table, table.numberOfRows > 0 else { return }
+            let before = table.rect(ofRow: 0).height
+            table.rowSizeStyle = .small
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak table] in
+                guard let table, table.numberOfRows > 0 else { return }
+                let fields = [
+                    "before \(before)",
+                    "after \(table.rect(ofRow: 0).height)",
+                    "styleNow \(table.rowSizeStyle.rawValue)",
+                ].joined(separator: "  ")
+                print("[sidebarstyletrial] " + fields)
+            }
+        }
     }
 }
 
@@ -2603,20 +3050,19 @@ struct TableScrollStateSyncer: NSViewRepresentable {
                 // exhausted, mailbox switched) a failed restore has destroyed the
                 // remembered position.
                 guard model.pendingScrollTopRow == nil, model.pendingRevealRow == nil else { return }
-                // A user scroll in In dismisses its new-mail badge. This is the
-                // user-scroll path (guarded above); the restore write-back calls
-                // `rememberScroll` directly, so delivery's re-list won't clear it.
+                // A badge clear used to live here, on the theory that scrolling In
+                // counted as engaging with it. Removed with the rest of that
+                // machinery: the In badge is now derived from whether In's newest
+                // message is unread (see `AppModel.inboxNewestIsUnread`), so
+                // scrolling past a message without reading it must *not* dismiss
+                // it — that is precisely the case the new rule exists to keep lit.
                 //
-                // `isRevealing` closes the hole the guard above cannot: the
-                // reveal clears `pendingRevealRow` before its own bounds
-                // notification is delivered, so that one notification arrives
-                // looking exactly like a user scroll. For a bottom-parked In that
-                // meant delivery lit the new-mail glyph and then put it out again
-                // a fraction of a second later, with the user having done nothing
-                // — breaking the invariant recorded on `inboxHasNewMail`, that
-                // only user input dismisses it. The position is still worth
-                // recording, so only the badge is gated.
-                if !coordinator.isRevealing { model.clearInboxNewMailBadge() }
+                // Kept as a note because the deleted line came with a hard-won
+                // guard, `!coordinator.isRevealing`: a reveal clears
+                // `pendingRevealRow` before its own bounds notification arrives,
+                // so that one notification looks exactly like a user scroll. If
+                // anything is ever hung off this notification again and must
+                // distinguish a real user scroll, that is the trap.
                 model.rememberScroll(topRow: top, atBottom: atBottom)
             }
         }

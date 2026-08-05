@@ -112,6 +112,48 @@ public struct MailStore: Sendable {
         return (size - Toc.folderSize) / Toc.entrySize
     }
 
+    /// The Eudora status byte of the **newest** message in a mailbox, or nil when
+    /// there isn't one to read.
+    ///
+    /// "Newest" is the last entry in the `.toc`, which for a receiving mailbox is
+    /// the most recent arrival: Eudora appends. Deliberately not "the greatest
+    /// `date`" — the TOC's dates are strings in more than one format, and the
+    /// mailbox Eudora 7 composed into doesn't always have them at all (see the
+    /// cached-date fallback), so ordering by them would be less reliable than
+    /// trusting append order.
+    ///
+    /// **Reads one 218-byte record, not the file.** The entry count comes from the
+    /// file size the same way `tocEntryCount` derives it, then this seeks straight
+    /// to the last record. That is what makes it cheap enough to call on the main
+    /// thread during a tree build: In's `.toc` is 218 bytes per message, so
+    /// parsing all of it to look at the end would be megabytes of work to read one
+    /// byte.
+    ///
+    /// nil, not a guess, when there is no `.toc` or it is too short to hold an
+    /// entry. A mailbox with no TOC cache can't answer this cheaply, and the
+    /// caller treats "don't know" as "no badge" rather than reading the `.mbx`.
+    public func newestStatus(base: URL) -> Int? {
+        guard let count = tocEntryCount(base: base), count > 0,
+              let handle = try? FileHandle(forReadingFrom: tocURL(base)) else { return nil }
+        defer { try? handle.close() }
+        let start = Toc.folderSize + (count - 1) * Toc.entrySize
+        guard (try? handle.seek(toOffset: UInt64(start))) != nil,
+              let record = try? handle.read(upToCount: Toc.entrySize),
+              record.count == Toc.entrySize else { return nil }
+        // Offset 12 within the entry, per the layout documented on `Toc`.
+        return Int(record[record.startIndex + 12])
+    }
+
+    /// Whether the newest message in a mailbox has never been read.
+    ///
+    /// The In sidebar badge's whole definition: if the most recent arrival is
+    /// still unread then the user's pass through In is unfinished, whatever else
+    /// the mailbox contains. Distinct from `DescMapEntry.hasUnread`, which is true
+    /// while *any* message is unread and drives the bold row name.
+    public func newestIsUnread(base: URL) -> Bool {
+        newestStatus(base: base) == MailboxMutator.statusUnread
+    }
+
     /// Accept "In" or "Projects/Music"; fall back to display/filename match.
     public func locate(_ name: String) -> URL? {
         var url = root

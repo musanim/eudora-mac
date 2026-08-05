@@ -86,6 +86,19 @@ instrumentation reports an idle main thread while the app is visibly stalling.
   be AppKit with a `menuNeedsUpdate:` delegate.
 - **Anything observing `AppModel` re-renders on every published change.** New
   expensive views should take plain values and be `Equatable`.
+- **A SwiftUI `List`'s row height answers to exactly two things**, and reaching
+  for anything else costs a build: `.listStyle(.plain)` (the sidebar style pins a
+  fixed 32 pt row) *and* `defaultMinListRowHeight` applied **inside** the `List`,
+  since `List` overwrites that key in its content environment. The AppKit
+  `rowHeight`, `usesAutomaticRowHeights`, `intercellSpacing`, `rowSizeStyle` and
+  `.listRowInsets` were each measured inert on the sidebar — SwiftUI answers
+  `heightOfRowByItem` there — and KVO-pinning the height the way the *message
+  table* legitimately does will stack-overflow. See `SidebarRowMetrics`.
+- **Prefer deriving a badge to remembering one.** The In new-mail flag was
+  session state cleared by "user engagement" and produced two bugs — cleared by a
+  delivery's own selection echo, and lost on quit. Recomputing it from the mail on
+  disk during the tree walk deleted both, plus seven other things. See
+  `AppModel.inboxNewestIsUnread`.
 - **The SwiftUI/AppKit boundary in `ContentView.swift` is hard-won.** Don't
   re-derive the column geometry, and read `MessageTableMetrics` /
   `MessageColumnWidths` before touching widths or `intercellSpacing`.

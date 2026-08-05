@@ -1,10 +1,14 @@
 Project folder: /Users/stephenmalinowski/ClaudeProjects/Eudora
 
-# Handoff: Eudora — 2026aug04 (2)
+# Handoff: Eudora — 2026aug05
 
-**Supersedes `Eudora_handoff_2026aug04-1.md`**, which was written earlier the
-same day and stops before most of this. Both it and `Eudora_handoff_2026aug02.md`
+**Supersedes `Eudora_handoff_2026aug04-1.md`**, which was written a few hours
+earlier and stops before most of this. Both it and `Eudora_handoff_2026aug02.md`
 can go to `handoffs/archive/`.
+
+(The session that produced both ran past midnight Pacific. Anything below dated
+2026aug04 happened in the same sitting; this file is named for the day it was
+finished.)
 
 ---
 

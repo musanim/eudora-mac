@@ -1,4 +1,5 @@
 import Foundation
+import EudoraStore
 
 /// Where the user left off, remembered across launches.
 ///
@@ -77,6 +78,19 @@ struct ViewState: Codable {
     /// and explicitly-unsorted list identically.
     var sortByMailbox: [String: MessageSort] = [:]
 
+    // No `inboxHasNewMail` here, and deliberately not — it was added on
+    // 2026aug05 and taken back out the same day. The In badge is derived from
+    // whether In's newest message is unread (`AppModel.inboxNewestIsUnread`),
+    // which is a fact about the mail on disk and needs no remembering. Anything
+    // stored here would be a second, staler copy of it.
+
+    /// Which sidebar folders were left open. See `SidebarExpansion`, which owns
+    /// the rules; this is only where it is stored.
+    ///
+    /// The comment at the top of this file listed "expanded folders" as a field
+    /// this blob would one day carry. This is that field.
+    var sidebarExpansion = SidebarExpansion()
+
     init() {}
 
     init(from decoder: Decoder) throws {
@@ -90,6 +104,9 @@ struct ViewState: Codable {
             try c.decodeIfPresent([String: Bool].self, forKey: .atBottomByMailbox) ?? [:]
         sortByMailbox =
             try c.decodeIfPresent([String: MessageSort].self, forKey: .sortByMailbox) ?? [:]
+        sidebarExpansion =
+            try c.decodeIfPresent(SidebarExpansion.self, forKey: .sidebarExpansion)
+            ?? SidebarExpansion()
     }
 }
 
