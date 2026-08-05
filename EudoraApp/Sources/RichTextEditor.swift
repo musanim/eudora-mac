@@ -385,6 +385,26 @@ final class RichTextEditorController: NSObject, ObservableObject, NSTextViewDele
             applyCorrection(endingBefore: p.end, terminatorLength: p.terminatorLength)
         }
         readBack()
+
+        // **A workaround, not an explanation.** Text sometimes stops being drawn
+        // after an edit: paste a URL, press Return twice, and the pasted run goes
+        // invisible. It is still there — the caret walks through it — and it
+        // comes back on anything that forces a full redraw.
+        //
+        // What was measured, 2026aug04: it happens with anti-aliasing set to
+        // *System*, so `BodyTextView`'s custom halo drawing is not involved;
+        // resizing the window brings the text back, so it is laid out and simply
+        // not painted; and the pasted run carries no unusual attributes, since
+        // `paste` routes external pastes through `pasteAsPlainText`. That places
+        // it squarely in invalidation, and nothing this subclass overrides
+        // touches invalidation — so the cause is upstream of anything here and
+        // was not found.
+        //
+        // Invalidating the visible rect after every change costs one repaint of
+        // what is already on screen, which for a compose body is nothing, and it
+        // cannot leave a region unpainted. If the real cause ever surfaces, this
+        // is the line to delete.
+        if let textView { textView.setNeedsDisplay(textView.visibleRect) }
     }
 
     /// Replace the word ending just before `end` (where the terminator was typed)

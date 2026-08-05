@@ -489,6 +489,17 @@ final class AppModel: ObservableObject {
     // view-update pass — not during it (which SwiftUI warns about).
     @Published var selectedMailboxID: MailboxItem.ID?
 
+    /// Addresses waiting to be pasted into the ISP's blocklist, edited in
+    /// Tools ▸ Blacklist….
+    ///
+    /// Saved on every change, including every keystroke while the window is
+    /// open. That is a few hundred bytes into `UserDefaults` and not worth
+    /// debouncing — where losing the list to a crash mid-edit would be, since the
+    /// window is the only copy until it is drained.
+    @Published var blacklistQueue = BlacklistStore.load() {
+        didSet { BlacklistStore.save(blacklistQueue) }
+    }
+
     /// The selected messages. Usually one; ⌘-click and ⇧-click grow it.
     /// `private(set)` so "one owner" is a compile error to violate rather than a
     /// convention. `applyMessageSelection` is the only writer, and the getter of
@@ -3918,9 +3929,9 @@ final class AppModel: ObservableObject {
     }
 
     /// Blacklist the selected message's sender. The caller has already confirmed
-    /// (this is the point of no return): send the notice reply, append the address
-    /// to `~/email_blacklist.txt`, open that file in TextEdit, and delete the
-    /// message. The ISP-side blacklisting Stephen does by hand.
+    /// (this is the point of no return): send the notice reply, add the address to
+    /// the blacklist queue, and delete the message. The ISP-side blacklisting
+    /// Stephen does by hand, from Tools ▸ Blacklist….
     func blacklistSelectedSender() {
         guard let part = selectedPart() else { return }
         let origFrom = part.header("From") ?? ""
@@ -3940,12 +3951,11 @@ final class AppModel: ObservableObject {
         // row going away. Deleting first would build the notice from a message
         // that no longer sits where the selection says it does.
         //
-        // **Before opening the blacklist file**, which is the other half of the
-        // ordering. `appendToBlacklistFileAndOpen` takes only a `String` and
-        // never touches the message, so it is free to come last — and last is
-        // where it belongs, because it brings TextEdit to the front. Deleting
-        // first means the veil, the relist and the scroll restore all run while
-        // Eudora is still frontmost.
+        // **Before queuing the address**, which is the other half of the
+        // ordering. `addToBlacklistQueue` takes only a `String` and never
+        // touches the message, so it is free to come last — and last is where it
+        // belongs, because it raises a banner and the delete's own feedback
+        // should not be talked over.
         //
         // **Unconditional, even if the notice failed to send.** The mail is
         // unwanted either way, the address is on the list either way, and the
@@ -3956,14 +3966,14 @@ final class AppModel: ObservableObject {
         // case here would be the surprise. The confirmation says so.
         deleteSelected()
 
-        appendToBlacklistFileAndOpen(addr)
+        addToBlacklistQueue(addr)
     }
 
     /// Auto-send the "you've been blacklisted" reply to the sender.
     private func sendBlacklistNotice(to origFrom: String, address: String, about part: MIMEPart) {
         guard let accounts, accounts.account.isConfigured, !accounts.password.isEmpty else {
             showError("Couldn't send the blacklist notice — set up your SMTP account in Settings first. "
-                      + "The address was still added to your blacklist file, and the message "
+                      + "The address was still added to your blacklist, and the message "
                       + "was still deleted.")
             return
         }
@@ -3995,7 +4005,7 @@ final class AppModel: ObservableObject {
                 showBanner("Blacklist notice sent to \(address).")
             } catch {
                 showError("The blacklist notice to \(address) didn't send: " + describe(error)
-                          + " (The address was still added to your blacklist file, and the "
+                          + " (The address was still added to your blacklist, and the "
                           + "message was still deleted.)")
             }
         }
@@ -4041,35 +4051,23 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Append the address (one per line) to `~/email_blacklist.txt`, creating it
-    /// if need be, then open it in TextEdit.
-    private func appendToBlacklistFileAndOpen(_ address: String) {
-        let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("email_blacklist.txt")
-        let line = Data((address + "\n").utf8)
-        do {
-            if let handle = try? FileHandle(forWritingTo: url) {
-                defer { try? handle.close() }
-                try handle.seekToEnd()
-                try handle.write(contentsOf: line)
-            } else {
-                try line.write(to: url)   // didn't exist — create it
-            }
-        } catch {
-            // Surface it rather than the notice's "was still added" reassurance
-            // quietly becoming a lie.
-            showError("Couldn't write \(address) to ~/email_blacklist.txt: " + describe(error))
-            return
-        }
-
-        // TextEdit specifically, per Stephen; fall back to the default handler if
-        // it isn't found.
-        if let textEdit = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.TextEdit") {
-            NSWorkspace.shared.open([url], withApplicationAt: textEdit,
-                                    configuration: NSWorkspace.OpenConfiguration(),
-                                    completionHandler: nil)
+    /// Add the address to the pending blacklist, and say where it went.
+    ///
+    /// It used to append to `~/email_blacklist.txt` and open that file in
+    /// TextEdit. That put the app and a text editor on one file: blacklist a
+    /// second sender while TextEdit holds the first with unsaved edits — which is
+    /// what happens, since the drain is edit-then-cut-then-save — and TextEdit
+    /// finds its document both modified and stale and refuses to save. The list
+    /// lives in the app now; see `BlacklistQueue`.
+    ///
+    /// The banner carries the count because nothing opens any more: it is the
+    /// only standing sign that addresses are waiting.
+    private func addToBlacklistQueue(_ address: String) {
+        if blacklistQueue.add(address) {
+            showBanner("\(address) added to your blacklist — "
+                       + "\(blacklistQueue.count) waiting (Tools ▸ Blacklist…).")
         } else {
-            NSWorkspace.shared.open(url)
+            showBanner("\(address) was already on your blacklist.")
         }
     }
 
@@ -4541,6 +4539,53 @@ final class AppModel: ObservableObject {
                 try MailboxMutator.removeMany(base: sel.item.base, indices: sel.indices)
                 afterRemoval(veil: "Deleting…")
             }
+        } catch {
+            showError("Delete failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Remove the selected messages outright, from any mailbox — the command
+    /// Delete already is *in Trash* and isn't anywhere else.
+    ///
+    /// Exists for triage: with 19,000 messages in Trash, the workable method is
+    /// to move a manageable batch somewhere else and sort it out there. But
+    /// Delete in a working mailbox moves to Trash, so everything you decided to
+    /// destroy went straight back where it came from. This is the way out.
+    ///
+    /// **Confirmed, unlike Delete.** Not caution for its own sake: everywhere
+    /// else in this app "delete" means "moved to Trash, recoverable", and this
+    /// one command breaks that promise. Something that quietly destroys mail
+    /// while wearing the same word deserves the one dialog. The count is in the
+    /// message because ⇧-click makes a selection whose size is easy to
+    /// misjudge — which is the whole point of using it for this job.
+    ///
+    /// The dangerous button is not the default, so Return cancels, matching the
+    /// blacklist confirmation.
+    func deletePermanentlySelected() {
+        guard let sel = currentSelectionSet() else { return }
+        let n = sel.indices.count
+
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = n == 1
+            ? "Delete this message permanently?"
+            : "Delete \(n) messages permanently?"
+        alert.informativeText =
+            "They will not go to Trash, and this can't be undone."
+        let yes = alert.addButton(withTitle: n == 1 ? "Delete It" : "Delete Them")
+        let cancel = alert.addButton(withTitle: "Cancel")
+        yes.keyEquivalent = ""
+        cancel.keyEquivalent = "\r"
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        do {
+            try MailboxMutator.removeMany(base: sel.item.base, indices: sel.indices)
+            // A notice here where an ordinary delete has none: the rows closing
+            // is feedback that *something* happened, and the thing worth
+            // confirming is which of the two deletes it was.
+            afterRemoval(veil: "Deleting…",
+                         notice: n == 1 ? "Message deleted permanently."
+                                        : "\(n) messages deleted permanently.")
         } catch {
             showError("Delete failed: \(error.localizedDescription)")
         }

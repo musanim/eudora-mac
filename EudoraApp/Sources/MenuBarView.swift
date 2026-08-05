@@ -152,13 +152,34 @@ struct MenuBarView: View {
             // selection. Mirrors the real command in `EudoraApp`.
             Toggle("Blah Blah Blah (All Headers)", isOn: $model.showAllHeaders)
                 .keyboardShortcut("b", modifiers: [.command, .shift])
-            Divider()
-            // `canActOnSelection`, not `canActOnMessage`: Delete (like
-            // Transfer) acts on the whole multi-selection, where Reply/Forward
-            // and Mark as Read above require exactly one message.
-            Button("Delete") { model.deleteSelected() }
-                .keyboardShortcut("d", modifiers: .command)
+            // Grouped for the same reason the Reply block above is: adding the
+            // two delete items took this menu to twelve children and
+            // `ViewBuilder` stops at ten. No effect on how the menu looks.
+            Group {
+                Divider()
+                // `canActOnSelection`, not `canActOnMessage`: Delete (like
+                // Transfer) acts on the whole multi-selection, where
+                // Reply/Forward and Mark as Read above require exactly one.
+                Button("Delete") { model.deleteSelected() }
+                    .keyboardShortcut("d", modifiers: .command)
+                    .disabled(!model.canActOnSelection)
+                Divider()
+                // No keyboard shortcut, deliberately. This destroys mail
+                // outright, and the one thing it must never be is something the
+                // hand does on the way to Delete. It sits below a divider for
+                // the same reason it sits below the gap in the right-click menu.
+                Button {
+                    model.deletePermanentlySelected()
+                } label: {
+                    // Concatenated `Text` rather than markdown in the title:
+                    // this is the one label whose emphasis has to be certain to
+                    // render, and `.bold()` on a `Text` run is, where a
+                    // `LocalizedStringKey`'s markdown depends on how the menu
+                    // chooses to build its label.
+                    Text("Delete ") + Text("PERMANENTLY").bold() + Text("…")
+                }
                 .disabled(!model.canActOnSelection)
+            }
         }.menuBarItem()
     }
 
@@ -211,6 +232,15 @@ struct MenuBarView: View {
             Button("Search…") { openWindow(id: "find") }
             Button("Rebuild Search Index") { model.rebuildIndex() }
                 .disabled(model.rootURL == nil)
+            Divider()
+            // The count is in the title because the list is otherwise invisible:
+            // blacklisting a sender no longer opens anything, so this is the only
+            // standing reminder that addresses are waiting to go to the ISP.
+            Button(model.blacklistQueue.isEmpty
+                   ? "Blacklist…"
+                   : "Blacklist… (\(model.blacklistQueue.count))") {
+                openWindow(id: "blacklist")
+            }
         }.menuBarItem()
     }
 

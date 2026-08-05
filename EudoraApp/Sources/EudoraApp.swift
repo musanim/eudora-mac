@@ -81,6 +81,15 @@ struct EudoraApp: App {
                 .frame(minWidth: 720, minHeight: 620)
         }
 
+        // The blacklist queue (Tools ▸ Blacklist…). A window rather than a
+        // Settings pane: it is a working list that gets edited and emptied, not
+        // a preference, and it needs to be open alongside a browser while its
+        // contents are pasted into the ISP's form.
+        Window("Blacklist", id: "blacklist") {
+            BlacklistView()
+                .environmentObject(model)
+        }
+
         Settings {
             SettingsView()
                 .environmentObject(model)
@@ -242,6 +251,21 @@ struct EudoraApp: App {
             Button("Delete") { model.deleteSelected() }
                 .keyboardShortcut("d", modifiers: .command)
                 .disabled(!deleteCommandEnabled)
+            Divider()
+            // No keyboard shortcut, deliberately. This destroys mail outright,
+            // and the one thing it must never be is something the hand does on
+            // the way to Delete. It also sits below a divider for the same
+            // reason it sits below the gap in the right-click menu.
+            Button {
+                model.deletePermanentlySelected()
+            } label: {
+                // Concatenated `Text` rather than markdown in the title: this is
+                // the one label whose emphasis has to be certain to render, and
+                // `.bold()` on a `Text` run is, where a `LocalizedStringKey`'s
+                // markdown depends on how the menu chooses to build its label.
+                Text("Delete ") + Text("PERMANENTLY").bold() + Text("…")
+            }
+            .disabled(!deleteCommandEnabled)
         }
     }
 }

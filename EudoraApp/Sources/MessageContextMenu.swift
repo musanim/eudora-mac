@@ -455,49 +455,73 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         add("Delete", #selector(deleteMessage))
 
-        // Blacklist a sender — a single *received* message (never one you sent,
-        // which would blacklist yourself). Auto-sends and can't be undone, so the
-        // action itself also gates hard behind a confirmation.
+        // ---- Below the gap: everything irreversible. ----
         //
-        // Last, behind its own separator. It used to sit directly above Delete,
-        // which put the menu's one irreversible, mail-sending action adjacent to
-        // its most-used one. Isolating it costs nothing — the separator is the
-        // whole safeguard at this level — and the confirmation still stands
-        // behind it.
+        // The GAP is deliberate and not a bug for a later reader to tidy away.
+        // Stephen asked for real distance between the menu's most-used action —
+        // Delete, just above — and the ones that cannot be undone, so that a
+        // slightly-off click lands on dead space rather than on a thing that
+        // destroys mail or sends it on his behalf.
         //
-        // The separators are added inside the `if`, so a menu without the item
-        // doesn't end in stray dividers.
+        // Two blank rows, not one: Stephen widened it again once there were two
+        // irreversible items below it rather than one. See `addGap`, which also
+        // records why plain consecutive separators can't produce a gap at all.
         //
-        // The GAP is deliberate and is not a bug for a later reader to tidy away.
-        // Stephen asked for real distance between the menu's most-used action and
-        // its only irreversible one, so a slightly-off click lands on dead space
-        // rather than on a thing that sends mail on his behalf. He also finds it
-        // funny, which is a perfectly good second reason.
+        // **Delete Permanently belongs here, not beside Delete.** The two are one
+        // word apart and a world apart in consequence, and everywhere else in
+        // this app "delete" means "moved to Trash, still there". A command that
+        // breaks that promise should not sit where the muscle memory goes. Its
+        // confirmation lives in `AppModel.deletePermanentlySelected`, so this
+        // menu and the menu-bar command warn identically.
         //
-        // **Consecutive separators do not work.** Three `.separator()` in a row
-        // coalesce into a single line — tried 2026aug03, and the menu looked
-        // exactly as it did before. AppKit needs something between them, so the
-        // gap is separator / blank item / separator. The blank carries a space
-        // rather than an empty string, which is what guarantees it a full-height
-        // row, and it is disabled so it can't be "chosen".
+        // **Add to BLACKLIST** is last: a single *received* message only (never
+        // one you sent, which would blacklist yourself), and it auto-sends, so it
+        // gates behind its own confirmation as well. It appears conditionally —
+        // hence built inside the `if` — but the gap above is unconditional now
+        // that Delete Permanently always follows it.
+        addGap(blankRows: 2)
+        addShouting(n == 1 ? "Delete " : "Delete \(n) ", "PERMANENTLY",
+                    #selector(deletePermanently))
+
         if n == 1, let id = clickedPrimary, !model.isSentMessage(id) {
-            menu.addItem(.separator())
+            addShouting("Add to ", "BLACKLIST", #selector(blacklist))
+        }
+    }
+
+    /// Dead space above the irreversible items.
+    ///
+    /// **Consecutive separators do not work** — three `.separator()` in a row
+    /// coalesce into one line (tried 2026aug04; the menu looked unchanged), so
+    /// AppKit needs something between them. Each blank row carries a space
+    /// rather than an empty string, which is what guarantees it a full-height
+    /// row, and is disabled so it can't be chosen. `blankRows` is how far the
+    /// gap opens: n blanks make n + 1 rules.
+    private func addGap(blankRows: Int) {
+        menu.addItem(.separator())
+        for _ in 0..<blankRows {
             let spacer = NSMenuItem(title: " ", action: nil, keyEquivalent: "")
             spacer.isEnabled = false
             menu.addItem(spacer)
             menu.addItem(.separator())
-            let item = NSMenuItem(title: "Add to BLACKLIST", action: #selector(blacklist),
-                                  keyEquivalent: "")
-            item.target = self
-            // "BLACKLIST" in bold, the rest in the normal menu font. The plain
-            // `title` stays set as the accessibility label.
-            let menuFont = NSFont.menuFont(ofSize: 0)
-            let bold = NSFontManager.shared.convert(menuFont, toHaveTrait: .boldFontMask)
-            let title = NSMutableAttributedString(string: "Add to ", attributes: [.font: menuFont])
-            title.append(NSAttributedString(string: "BLACKLIST", attributes: [.font: bold]))
-            item.attributedTitle = title
-            menu.addItem(item)
         }
+    }
+
+    /// An item whose last word is shouted — "Delete 12 **PERMANENTLY**", "Add to
+    /// **BLACKLIST**".
+    ///
+    /// Both items that can't be undone are labelled this way, so the shouting
+    /// itself is the signal rather than a flourish on one of them. The plain
+    /// `title` stays set as the accessibility label; `attributedTitle` is what
+    /// draws.
+    private func addShouting(_ lead: String, _ shout: String, _ action: Selector) {
+        let item = NSMenuItem(title: lead + shout, action: action, keyEquivalent: "")
+        item.target = self
+        let menuFont = NSFont.menuFont(ofSize: 0)
+        let bold = NSFontManager.shared.convert(menuFont, toHaveTrait: .boldFontMask)
+        let title = NSMutableAttributedString(string: lead, attributes: [.font: menuFont])
+        title.append(NSAttributedString(string: shout, attributes: [.font: bold]))
+        item.attributedTitle = title
+        menu.addItem(item)
     }
 
     private func add(_ title: String, _ action: Selector, enabled: Bool = true) {
@@ -533,6 +557,12 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
     }
     @objc private func deleteMessage() { actOnClickedRows { model.deleteSelected() } }
 
+    /// Destroys the messages outright. The confirmation lives in the model, so
+    /// the menu-bar command and this one can't drift apart about what they warn.
+    @objc private func deletePermanently() {
+        actOnClickedRows { model.deletePermanentlySelected() }
+    }
+
     /// Blacklist the clicked message's sender, behind a deliberate confirmation.
     /// The dangerous button is *not* the default, so a stray Return cancels — the
     /// "in case I clicked by accident" guard.
@@ -552,8 +582,8 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
                 : "and move the message to Trash."
             alert.informativeText =
                 "This can't be undone. It will reply to this message telling the sender "
-                + "they've been blacklisted, add \(address) to ~/email_blacklist.txt, open that "
-                + "file, " + fate
+                + "they've been blacklisted, add \(address) to your blacklist list "
+                + "(Tools ▸ Blacklist…), " + fate
             let yes = alert.addButton(withTitle: "Yes, I'm totally sure")
             let cancel = alert.addButton(withTitle: "Cancel")
             yes.keyEquivalent = ""          // Return must not fire the destructive action
