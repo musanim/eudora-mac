@@ -271,7 +271,14 @@ struct ContentView: View {
         .onChange(of: model.selectedMailboxID) { _ in
             DispatchQueue.main.async { model.loadListing() }
         }
-        .onChange(of: model.selectedMessageIDs) { _ in
+        // `primaryMessageID`, not `selectedMessageIDs`: the primary is what the
+        // preview shows, so this now fires exactly when the shown message
+        // changes. It catches a case the old form missed — a right-click inside
+        // an existing multi-selection moves the primary without changing the
+        // membership, and the preview used to stay on the previous message — and
+        // it drops a pointless reload when rows leave a selection whose primary
+        // survives.
+        .onChange(of: model.primaryMessageID) { _ in
             DispatchQueue.main.async { model.loadMessage() }
         }
         .overlay(alignment: .top) {
@@ -3624,16 +3631,6 @@ struct PreviewView: View {
         }
     }
 
-    /// A multi-selection message belongs to the main window only — the Find
-    /// window's table is single-select, so this must not consult the main
-    /// window's selection when showing a result.
-    private var multiSelectionCount: Int {
-        switch source {
-        case .mainSelection:            return model.selectedMessageIDs.count
-        case .given:                    return 0
-        }
-    }
-
     /// Whether the actions in the message body act on what is being shown.
     ///
     /// False in the Find window: `model.forward()` forwards the *main window's*
@@ -3642,7 +3639,12 @@ struct PreviewView: View {
     /// context menu's View in Mailbox takes you to the message, where every
     /// action applies to the message you are looking at.
     private var actsOnShownMessage: Bool {
-        if case .mainSelection = source { return true }
+        // Single selection only. Now that a multi-selection previews its primary,
+        // this pane renders where it used to show a count — and `model.forward()`
+        // goes through `selectedMessageID`, which is deliberately nil for a
+        // multi-selection, so the item would have appeared and silently done
+        // nothing. Offering an action that no-ops is worse than not offering it.
+        if case .mainSelection = source { return model.selectedMessageIDs.count == 1 }
         return false
     }
 
@@ -3706,14 +3708,20 @@ struct PreviewView: View {
     }
 
     @ViewBuilder private func content(paneHeight: CGFloat) -> some View {
-        if multiSelectionCount > 1 {
-            // A multi-selection previews nothing (the design decision — Mail's
-            // convention). Checked before `preview`: a stale render must not
-            // linger under a selection it no longer describes.
-            Text("\(multiSelectionCount) messages selected")
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let p = shown {
+        // A multi-selection used to render "N messages selected" here instead of
+        // a message, following Mail. It no longer does: ⇧-arrowing down a run of
+        // mail is done in order to *read* each one as it joins the selection, and
+        // a count is not something you can read. `AppModel.loadMessage` previews
+        // the primary, which follows the moving end of the extension.
+        //
+        // The count is simply gone rather than relocated — the highlighted rows
+        // in the list say how many there are, more precisely than a number does.
+        //
+        // The old branch also served to keep a stale render from lingering under
+        // a selection it no longer describes. That is now handled the same way it
+        // always was for a single selection: `loadMessage` clears `preview`
+        // before it starts loading.
+        if let p = shown {
             let headerHeight = HeaderPaneLayout.height(liveHeaderHeight ?? storedHeaderHeight,
                                                        pane: paneHeight)
             VStack(alignment: .leading, spacing: 0) {

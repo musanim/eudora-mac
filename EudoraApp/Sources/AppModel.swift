@@ -476,12 +476,16 @@ final class AppModel: ObservableObject {
     /// a set that no longer matches, which is worse than the bug it fixed.
     @Published private(set) var selectedMessageIDs: Set<MessageRow.ID> = []
 
-    /// The **primary** selected message — the last row the user actually
-    /// clicked, as against the rest of a multi-selection. This is the one the
-    /// preview would show if only one were selected, the one whose position
-    /// `keepSelectionVisible` protects, and the one that persists across
-    /// relaunch. Maintained by `applyMessageSelection`; always a member of
-    /// `selectedMessageIDs`, or nil when that is empty.
+    /// The **primary** selected message — the moving end of the selection, as
+    /// against the rest of it. For a single selection that is simply the row; for
+    /// a range it is the end furthest from `selectionAnchorID`, which is the row
+    /// a ⇧-click just landed on or the row ⇧-arrow has reached.
+    ///
+    /// This is the one the preview shows — including for a multi-selection, which
+    /// is the point of it moving — the one whose position `keepSelectionVisible`
+    /// protects, and the one that persists across relaunch. Maintained by
+    /// `applyMessageSelection`; always a member of `selectedMessageIDs`, or nil
+    /// when that is empty.
     @Published private(set) var primaryMessageID: MessageRow.ID?
 
     /// The single selected message, or nil when none — **or several** — are
@@ -606,6 +610,31 @@ final class AppModel: ObservableObject {
     /// in for.
     private var pendingMessageSelection: Set<MessageRow.ID>?
 
+    /// Trace every selection change and every preview load: the incoming set,
+    /// the anchor, the primary, and whether the render landed.
+    ///
+    /// Off, and kept. It was switched on because ⇧↓ moved the preview once and
+    /// then stopped, and it settled the question in a single run by printing
+    /// `new [13, 19] … primary 13` followed by `new [13, 15, 19] … primary 13`.
+    /// Two selections apart on screen, the same primary — which said plainly
+    /// that "furthest from the anchor" was being computed in the wrong space.
+    /// The rows are sorted by date, so ⇧↓ from ID 19 selects 13, then 15, then
+    /// 14; `abs(id - anchor)` crowned 13 on the first press and nothing could
+    /// unseat it. No amount of staring at the code would have shown that,
+    /// because the code looked right — it was the assumption underneath it that
+    /// was wrong.
+    static let diagnoseSelection = false
+
+    /// The row a ⇧-extension measures from — the one that stays put while the
+    /// other end moves.
+    ///
+    /// Its own stored fact rather than something inferred from
+    /// `primaryMessageID`, because the primary is now the *moving* end (see
+    /// `applyMessageSelection`) and the two are the opposite ends of the same
+    /// range. Set whenever the selection collapses to a single row, or when a
+    /// caller names the clicked row.
+    private var selectionAnchorID: MessageRow.ID?
+
     /// Guards against a superseded keystroke's deferred block applying after a
     /// newer one. Each `set` bumps this and its block refuses unless it is still
     /// the newest, so an auto-repeat burst applies once, with the final set,
@@ -685,16 +714,36 @@ final class AppModel: ObservableObject {
                 })
     }
 
+    /// Where a message sits in the list *as displayed*.
+    ///
+    /// The selection's two ends are decided by this, never by comparing IDs. An
+    /// ID is a position in the mailbox file; the list is sorted by date, who or
+    /// subject, so consecutive rows on screen are not consecutive IDs and are
+    /// not even monotonic in ID. Falls back to the ID only when the row isn't in
+    /// the current listing, where any answer is a guess and a stable one beats a
+    /// crash.
+    private func position(of id: MessageRow.ID) -> Int {
+        rowPositionByID[id] ?? id
+    }
+
+    /// How far apart two messages are on screen, in rows.
+    private func selectionDistance(_ id: MessageRow.ID, from anchor: MessageRow.ID) -> Int {
+        abs(position(of: id) - position(of: anchor))
+    }
+
     /// Install a new selection set and keep `primaryMessageID` truthful.
     ///
-    /// The Table's `Set` binding reports only the new membership — not which
-    /// row was clicked — so the primary is inferred from the difference:
-    /// exactly one row appearing is a click (plain or ⌘), and that row is the
-    /// new primary. A ⇧-click extends the range by several rows at once and
-    /// keeps its anchor, so an unchanged primary that is still selected stays.
-    /// A primary that *left* the selection (⌘-click deselected it) falls back
-    /// to an arbitrary member: which one is primary then matters less than
-    /// there being one at all.
+    /// The Table's `Set` binding reports only the new membership — not which row
+    /// was clicked, nor which way a range grew — so both ends are derived from
+    /// the set itself. `selectionAnchorID` is the fixed end, reset whenever the
+    /// selection collapses to one row; `primaryMessageID` is the moving end, the
+    /// member furthest from it.
+    ///
+    /// Expressed as a property of the resulting set rather than a case analysis
+    /// over what changed, because the case analysis is where the bugs live: an
+    /// earlier version handled growth and let every other gesture fall through to
+    /// an arbitrary `Set.first`, which was invisible only for as long as a
+    /// multi-selection previewed nothing.
     ///
     /// Every programmatic selection change goes through here too, so the
     /// invariant — primary is a member, or nil — has one owner. A caller that
@@ -718,18 +767,70 @@ final class AppModel: ObservableObject {
         // first.
         if removalVeil != nil, !new.isEmpty { return }
         if new != selectedMessageIDs {
-            let added = new.subtracting(selectedMessageIDs)
             selectedMessageIDs = new
             if new.isEmpty {
                 primaryMessageID = nil
+                selectionAnchorID = nil
             } else if let p = preferred, new.contains(p) {
+                // A caller that knows which row was clicked. It becomes both the
+                // primary and the anchor a later ⇧-extension will measure from.
                 primaryMessageID = p
-            } else if added.count == 1 {
-                primaryMessageID = added.first
-            } else if let p = primaryMessageID, new.contains(p) {
-                // ⇧-click range extension: the anchor stays primary.
-            } else {
+                selectionAnchorID = p
+            } else if new.count == 1 {
+                // The selection collapsed to one row — a plain click, a plain
+                // arrow, a programmatic select. That row is where any subsequent
+                // ⇧-extension starts, so it is the new anchor.
                 primaryMessageID = new.first
+                selectionAnchorID = new.first
+            } else {
+                // A multi-selection. The primary is the member FURTHEST FROM THE
+                // ANCHOR — the moving end — because that is the row the user's
+                // attention is on and, now that a multi-selection previews the
+                // primary, the message they expect to be looking at.
+                //
+                // One rule covers every gesture, which is why it is expressed as
+                // a property of the resulting set rather than as a case analysis
+                // over what changed:
+                //   ⇧↓ growing away from the anchor   → the newest row
+                //   ⇧↑ shrinking back toward it       → the new far end
+                //   ⇧-click across the anchor         → the row clicked
+                //   ⌘-click adding a distant row      → that row
+                //   ⌘-click removing the primary      → the far end of what's left
+                //
+                // An earlier version keyed on "rows were added" and kept the
+                // anchor primary otherwise. It got growth right and everything
+                // else arbitrary: shrinking fell through to `Set.first`, which is
+                // hash-ordered, so ⇧↓ ⇧↓ ⇧↑ previewed a random member of the
+                // selection. That was invisible while a multi-selection previewed
+                // nothing, and is not any more.
+                //
+                // The anchor has to be its own stored fact. It used to be implied
+                // by the primary, and once the primary moves to the far end that
+                // implication is gone.
+                //
+                // **Distance is measured in VISUAL ROW POSITION, not in ID.** An
+                // ID is a 1-based index into the mailbox file; the list is sorted
+                // by date (or who, or subject), so the two orders are unrelated.
+                // Measured, after a first attempt that did the arithmetic on IDs:
+                // ⇧↓ from row-ID 19 selected 13, then 15, then 14 — so `abs(id -
+                // anchor)` crowned 13 on the first press and never unseated it,
+                // and the preview moved once and then stopped.
+                if selectionAnchorID == nil || !new.contains(selectionAnchorID!) {
+                    // The anchor left the selection (⌘-click, or a re-list that
+                    // dropped it). Topmost survivor, by position: deterministic,
+                    // and it doesn't pretend to guess an intent that is gone.
+                    selectionAnchorID = new.min(by: { position(of: $0) < position(of: $1) })
+                }
+                if let anchor = selectionAnchorID {
+                    primaryMessageID = new.max(by: {
+                        selectionDistance($0, from: anchor) < selectionDistance($1, from: anchor)
+                    })
+                }
+            }
+            if Self.diagnoseSelection {
+                print("sel: new \(new.sorted()) preferred \(preferred as Any)"
+                      + "  anchor \(selectionAnchorID as Any)"
+                      + "  primary \(primaryMessageID as Any)")
             }
         } else if let p = preferred, new.contains(p), p != primaryMessageID {
             // Same membership, different pointer — a right-click inside the
@@ -2338,10 +2439,21 @@ final class AppModel: ObservableObject {
         PerfLog.mark("loadMessage begins")
         previewTask?.cancel()
 
+        // `primaryMessageID`, not `selectedMessageID`. A multi-selection used to
+        // preview nothing and show "N messages selected" instead — Mail's
+        // convention. But the whole point of ⇧-arrowing through a run of mail is
+        // to look at each message as it joins the selection, and a count cannot
+        // be looked at. The primary follows the moving end of the extension (see
+        // `applyMessageSelection`), so this shows the message just added.
+        //
+        // Deliberately only the preview. Reply, Forward and mark-as-read still
+        // go through `selectedMessageID` and so still refuse a multi-selection:
+        // showing a message is safe, acting on one of several is the thing the
+        // design decision was actually protecting against.
         guard let store,
               let mid = selectedMailboxID,
               let item = itemsByID[mid], !item.isFolder,
-              let index = selectedMessageID else {
+              let index = primaryMessageID else {
             preview = nil
             isLoadingPreview = false
             return
@@ -2354,12 +2466,37 @@ final class AppModel: ObservableObject {
         let root = store.root
         let note = listingSource
 
+        // **By byte offset, not by row index.** `message(at:index:)` reads the
+        // entire `.mbx` and scans it for record boundaries, because an index is a
+        // position in that list and there is no other way to find one — 613 MB
+        // per keystroke on Trash. The row already carries the offset (from the
+        // TOC, so it is there before enrichment), and `message(at:offset:)` seeks
+        // straight to it and reads a few kilobytes. `loadFindPreview` has always
+        // done this; the main preview had no pressing reason to until ⇧-arrow
+        // started previewing every row it passes over.
+        //
+        // The offset is validated on the other side — the reader returns nil
+        // unless a record actually starts there — so a stale row can only fail to
+        // render, never render the middle of some other message.
+        //
+        // Falls back to the index path when the row can't be found, which keeps
+        // this working for any caller that sets a primary the current `rows`
+        // don't contain.
+        let offset = rowPositionByID[index].flatMap { pos in
+            pos < rows.count ? rows[pos].offset : nil
+        }
+        if Self.diagnoseSelection {
+            print("loadMessage: primary \(index)  offset \(offset as Any)")
+        }
+
         previewTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: selectionSettleDelay)
             guard !Task.isCancelled else { return }
 
             let rendered = await Task.detached(priority: .userInitiated) { () -> RenderedMessage? in
-                guard let msg = store.message(at: base, index: index) else { return nil }
+                let found = offset.flatMap { store.message(at: base, offset: $0) }
+                    ?? store.message(at: base, index: index)
+                guard let msg = found else { return nil }
                 var preview = AppModel.render(msg.part,
                                               sourceNote: note,
                                               locator: AttachmentLocator(mailRoot: root))
@@ -2374,7 +2511,13 @@ final class AppModel: ObservableObject {
                 return RenderedMessage(preview: preview, offset: msg.record.offset)
             }.value
 
-            guard !Task.isCancelled, let self else { return }
+            guard !Task.isCancelled, let self else {
+                if Self.diagnoseSelection { print("loadMessage: cancelled before render landed") }
+                return
+            }
+            if Self.diagnoseSelection {
+                print("loadMessage: rendered offset \(rendered?.offset as Any)")
+            }
             self.preview = rendered?.preview
             self.isLoadingPreview = false
             if let offset = rendered?.offset { self.rememberSelection(messageOffset: offset) }
@@ -4219,8 +4362,16 @@ final class AppModel: ObservableObject {
     /// pass. Without that, holding an arrow key through fifty unread messages
     /// would be fifty status writes and fifty tree reloads.
     ///
-    /// Only for a single selection: shift-clicking twenty rows selects them but
-    /// displays none of them, and none of them has been read.
+    /// Only for a single selection, and that justification has weakened. It used
+    /// to be airtight — shift-clicking twenty rows displayed none of them, so
+    /// none had been read. A multi-selection now previews its primary, so a
+    /// message *is* on screen and stays marked unread.
+    ///
+    /// Left as it is on purpose, pending a decision rather than by oversight.
+    /// ⇧-arrowing through fifty messages to pick a few to file would otherwise
+    /// mark all fifty read, and the unread flag is the more valuable of the two
+    /// signals to keep honest. Extending it to the primary of a multi-selection
+    /// is a one-line change here if that turns out to be the wrong call.
     private func scheduleMarkSelectedRead() {
         markReadTask?.cancel()
         markReadTask = nil
