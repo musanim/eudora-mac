@@ -638,6 +638,16 @@ struct MailboxTree: View, Equatable {
     }
 }
 
+/// **`.listRowInsets` does not change this sidebar's row height.** Tried
+/// 2026aug04, halving the vertical inset: no visible effect at all. The same
+/// lesson the message table already learned — SwiftUI floors the row height
+/// regardless of the content, which is why `MessageRowMetrics.rowHeight` is
+/// forced directly on the `NSTableView` and re-enforced through KVO when SwiftUI
+/// resets it (see `pinRowHeight` / `enforceRowHeight`).
+///
+/// So tightening the tree means reaching the backing `NSOutlineView` the same
+/// way, not another SwiftUI modifier. Recorded here so the next attempt starts
+/// from the AppKit route instead of spending a build on this one.
 struct MailboxRow: View {
     let item: MailboxItem
     /// Whether to draw the new-mail glyph. Only ever true for the In row — the
