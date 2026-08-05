@@ -253,4 +253,55 @@ final class MailboxTreeReorderTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(
             atPath: folder.appendingPathComponent("Secret.mbx").path))
     }
+
+    // MARK: sort alphabetically
+
+    func testSortInterleavesMailboxesAndFolders() throws {
+        try writeDescmap("In,In.mbx,I,N\r\nZed,Zed.mbx,M,N\r\nMid,Mid.fol,F,N\r\nAce,Ace.mbx,M,N\r\n")
+        XCTAssertTrue(try MailboxTreeMutator.sortEntries(directory: dir))
+        XCTAssertEqual(order(), ["In.mbx", "Ace.mbx", "Mid.fol", "Zed.mbx"])
+    }
+
+    /// System entries hold their slots wherever they sit — including in the
+    /// middle, which `ensureSystemMailboxes` can produce by appending Junk.
+    func testSortLeavesSystemEntriesWhereTheyAre() throws {
+        try writeDescmap("In,In.mbx,I,N\r\nZed,Zed.mbx,M,N\r\nJunk,Junk.mbx,S,N\r\nAce,Ace.mbx,M,N\r\n")
+        XCTAssertTrue(try MailboxTreeMutator.sortEntries(directory: dir))
+        // Slots 0 and 2 were system and keep their occupants; 1 and 3 take the
+        // movable entries in sorted order.
+        XCTAssertEqual(order(), ["In.mbx", "Ace.mbx", "Junk.mbx", "Zed.mbx"])
+    }
+
+    /// The Finder's ordering: case-insensitive, and numbers compared as numbers.
+    func testSortIsCaseInsensitiveAndNumberAware() throws {
+        try writeDescmap("Item 10,i10.mbx,M,N\r\nitem 2,i2.mbx,M,N\r\nItem 1,i1.mbx,M,N\r\n")
+        XCTAssertTrue(try MailboxTreeMutator.sortEntries(directory: dir))
+        XCTAssertEqual(order(), ["i1.mbx", "i2.mbx", "i10.mbx"])
+    }
+
+    func testSortReportsWhenAlreadyInOrder() throws {
+        try writeDescmap("In,In.mbx,I,N\r\nAce,Ace.mbx,M,N\r\nZed,Zed.mbx,M,N\r\n")
+        XCTAssertFalse(try MailboxTreeMutator.sortEntries(directory: dir))
+        XCTAssertEqual(order(), ["In.mbx", "Ace.mbx", "Zed.mbx"])
+    }
+
+    /// Same fidelity promise as `moveEntry`: an LF-only file stays LF-only, the
+    /// last line gains its terminator, and each entry's own bytes are carried
+    /// across rather than rebuilt.
+    func testSortPreservesDialectAndEntryBytes() throws {
+        try writeDescmap("Zed,Zed.mbx,M,N\nAce,Ace.mbx,M,Y")
+        XCTAssertTrue(try MailboxTreeMutator.sortEntries(directory: dir))
+        let text = try String(contentsOf: dir.appendingPathComponent("descmap.pce"),
+                              encoding: .isoLatin1)
+        XCTAssertEqual(text, "Ace,Ace.mbx,M,Y\nZed,Zed.mbx,M,N\n")
+    }
+
+    func testSortOfAnEmptyOrMissingDescmap() throws {
+        try writeDescmap("")
+        XCTAssertFalse(try MailboxTreeMutator.sortEntries(directory: dir))
+        let missing = dir.appendingPathComponent("nowhere", isDirectory: true)
+        XCTAssertThrowsError(try MailboxTreeMutator.sortEntries(directory: missing)) {
+            XCTAssertEqual($0 as? MailboxTreeMutator.MoveError, .noIndex)
+        }
+    }
 }

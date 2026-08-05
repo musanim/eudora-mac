@@ -134,13 +134,16 @@ struct MessagePreview: Sendable {
     let subject: String
     let from: String
     let to: String
-    let date: String
+    /// The message's own `Date:`, or the listing's cached date when it has none.
+    /// See `supplyDateIfMissing`.
+    var date: String
     /// The header block as it sits on disk, for "Blah Blah Blah". A `var` with a
     /// default because it can't be filled in by `render`, which is handed a
     /// parsed `MIMEPart` and never sees the bytes — `loadMessage` re-reads it by
     /// offset and assigns it afterwards. Empty when that read failed, which the
     /// view treats as "nothing to show" rather than an error.
     var rawHeaders: String = ""
+
     let isHTML: Bool
     let content: String          // HTML string when isHTML, else plain text
     let images: [String: EmbeddedImage]  // eudora-image:<id> -> bytes (HTML only)
@@ -153,6 +156,24 @@ struct MessagePreview: Sendable {
     /// rather than as header chips — their bytes aren't in the message.
     let detached: [LocatedAttachment]
     let indexSourceNote: String  // shown subtly so we can see toc vs scan
+
+    /// Supply the listing's cached date when the message itself carries none.
+    ///
+    /// **Eudora 7 never wrote `Date:` into its stored copy** — only into what
+    /// went over the wire. Measured against the real tree: of 694 messages
+    /// Eudora 7 composed in `MISCINQ.mbx`, not one has the header, and that is
+    /// every message it ever sent or drafted, across the whole archive. The
+    /// `.toc` holds the date, which is why the Date *column* was populated all
+    /// along and only the reader looked blank.
+    ///
+    /// **The three-line summary only.** The raw header block is deliberately
+    /// left alone: "Blah Blah Blah" promises the bytes as they sit on disk, and
+    /// a date that is not among them must not appear there. The summary is
+    /// derived by definition, so filling a gap in it from the index is honest;
+    /// doing the same to the raw block would be a small forgery.
+    mutating func supplyDateIfMissing(_ cached: String) {
+        if date.trimmingCharacters(in: .whitespaces).isEmpty { date = cached }
+    }
 }
 
 /// One attached file whose bytes are present in the message. Carried so the
@@ -2482,9 +2503,11 @@ final class AppModel: ObservableObject {
         // Falls back to the index path when the row can't be found, which keeps
         // this working for any caller that sets a primary the current `rows`
         // don't contain.
-        let offset = rowPositionByID[index].flatMap { pos in
-            pos < rows.count ? rows[pos].offset : nil
-        }
+        let row = rowPositionByID[index].flatMap { pos in pos < rows.count ? rows[pos] : nil }
+        let offset = row?.offset
+        // The listing's date, for a message that carries none of its own — every
+        // message Eudora 7 composed. See `MessagePreview.supplyDateIfMissing`.
+        let cachedDate = row?.date ?? ""
         if Self.diagnoseSelection {
             print("loadMessage: primary \(index)  offset \(offset as Any)")
         }
@@ -2508,6 +2531,7 @@ final class AppModel: ObservableObject {
                 preview.rawHeaders = store.rawHeaderBlock(at: base,
                                                           offset: msg.record.offset,
                                                           length: msg.record.length) ?? ""
+                preview.supplyDateIfMissing(cachedDate)
                 return RenderedMessage(preview: preview, offset: msg.record.offset)
             }.value
 
@@ -2559,6 +2583,7 @@ final class AppModel: ObservableObject {
         let base = item.base
         let root = store.root
         let offset = hit.offset
+        let cachedDate = hit.date
 
         findPreviewTask = Task { [weak self] in
             // The same settle delay the main preview uses, and for the same
@@ -2575,6 +2600,8 @@ final class AppModel: ObservableObject {
                 preview.rawHeaders = store.rawHeaderBlock(at: base,
                                                           offset: msg.record.offset,
                                                           length: msg.record.length) ?? ""
+                // The hit carries the index's date — same gap, same fill.
+                preview.supplyDateIfMissing(cachedDate)
                 return preview
             }.value
 
@@ -3274,10 +3301,22 @@ final class AppModel: ObservableObject {
 
         let existingID = part.header("Message-ID")?.trimmingCharacters(in: .whitespaces) ?? ""
         if existingID.isEmpty {
-            // Real Eudora stamps Message-ID at *send* time, so a draft it wrote
-            // has none — and this app's identity check needs one. Without it
-            // `locateDraft` fails closed, every save appends another copy, and
-            // the count grows without bound.
+            // Some drafts arrive with no Message-ID, and this app's identity
+            // check needs one. Without it `locateDraft` fails closed, every save
+            // appends another copy, and the count grows without bound.
+            //
+            // This used to say real Eudora stamps Message-ID only at send time,
+            // so a draft it wrote never has one. Not true: a Eudora 7 draft from
+            // 2026jul13 in Stephen's Out carries
+            // `<7.1.0.9.2.20260713192152.04400040@musanim.com>` — its version
+            // number and a timestamp. Which is why this branch tests
+            // `existingID.isEmpty` rather than assuming; the assumption was
+            // wrong and the code was right anyway.
+            //
+            // Note what those drafts *don't* carry: a `Date:` header, which
+            // Eudora 7 does stamp only at send. So an old draft shows no date in
+            // the reader, and the only record of when it was written is the
+            // timestamp inside that Message-ID.
             //
             // So mint one and stamp it on the record now, while `messageIndex`
             // is known good because we have just read it. `replace` leaves this
@@ -4790,6 +4829,51 @@ final class AppModel: ObservableObject {
         reloadTree()
     }
 
+    /// Sort the list this item sits in — its siblings — alphabetically.
+    ///
+    /// The level, not the item: right-clicking a folder sorts the folder's
+    /// siblings, exactly as Move Up and Move Down move the folder among them.
+    /// `sortFolderContents` is the separate command for what's *inside* a folder,
+    /// named differently because it does a different thing.
+    func sortSiblingsAlphabetically(_ id: MailboxItem.ID) {
+        guard let item = itemsByID[id] else { return }
+        sortEntries(in: item.base.deletingLastPathComponent(), what: "that list")
+    }
+
+    /// Sort what's inside a folder alphabetically.
+    ///
+    /// A folder's `base` *is* its `.fol` directory (see `MailStore.build`), so
+    /// this is the same call with a different directory. The wording matters:
+    /// "the contents of X" rather than "X", because the two menu items are one
+    /// word apart and "Sorted “Projects”" would read like the other one.
+    func sortFolderContents(_ id: MailboxItem.ID) {
+        guard let item = itemsByID[id], item.isFolder else { return }
+        sortEntries(in: item.base, what: "the contents of \u{201C}\(item.display)\u{201D}")
+    }
+
+    /// Shared by both sort commands.
+    ///
+    /// **There is no undo, and the `.bak` is not one.** `MailboxIO.backupOnce`
+    /// copies only if no `.bak` exists yet, so by the time anyone sorts, some
+    /// earlier create/rename/move has almost certainly consumed it and it holds
+    /// an arbitrary older state rather than the order that was just replaced.
+    /// Worth knowing before adding any other one-click rearrangement here.
+    private func sortEntries(in directory: URL, what: String) {
+        do {
+            if try MailboxTreeMutator.sortEntries(directory: directory) {
+                showBanner("Sorted \(what) alphabetically.")
+                reloadTree()
+            } else {
+                // Said rather than silently doing nothing: a menu item that
+                // appears to have been ignored is worse than one that reports it
+                // had nothing to do.
+                showBanner("\(what.prefix(1).uppercased())\(what.dropFirst()) was already in order.")
+            }
+        } catch {
+            showError("Couldn't sort: \(error.localizedDescription)")
+        }
+    }
+
     /// A folder with nothing listed inside it. The menu's grey-out; the mutator
     /// makes the authoritative on-disk check (descmap empty *and* no stray
     /// `.mbx`/`.fol`), so a folder holding orphaned mail is refused there.
@@ -5381,7 +5465,14 @@ final class AppModel: ObservableObject {
             let outcome = await Task.detached(priority: .userInitiated) { () -> (Int?, String) in
                 do {
                     let idx = try SearchIndex(path: scratch)
-                    try idx.rebuild(from: store) { done, total in
+                    // The `.toc` date parser, handed down because it lives here
+                    // and the index target can't see it. Without it, every
+                    // message Eudora 7 composed indexes with no sortable date.
+                    try idx.rebuild(from: store,
+                                    cachedDateEpoch: { cached in
+                                        EudoraDateFormat.tocDate(cached)
+                                            .map { Int($0.timeIntervalSince1970) } ?? 0
+                                    }) { done, total in
                         Task { @MainActor [weak self] in
                             guard let self, self.indexGeneration == gen else { return }
                             self.indexProgress = IndexProgress(done: done, total: total)

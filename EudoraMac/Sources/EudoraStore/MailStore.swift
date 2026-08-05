@@ -160,6 +160,31 @@ public struct MailStore: Sendable {
         12: " ",  // MS_RECOVERED
     ]
 
+    /// The dates Eudora cached in a mailbox's `.toc`, keyed by record offset.
+    ///
+    /// **A `.toc` read and nothing else** — no `.mbx`, no record scan. That is
+    /// the whole reason it exists rather than callers going through `list(at:)`,
+    /// which reads and scans the entire `.mbx` before it ever opens the `.toc`:
+    /// across the real tree that is 1.59 GB of reading against 54 MB of `.toc`.
+    /// The search indexer wants only these dates, for the messages Eudora 7
+    /// composed and left without a `Date:` header of their own.
+    ///
+    /// Keyed on the `.toc`'s own offsets, unvalidated against the `.mbx`. A
+    /// caller looks up a record offset it already has, so a stale entry pointing
+    /// into compaction padding simply never matches — the same offset-equality
+    /// pairing `list(at:)` uses for the dates it shows, minus the majority test,
+    /// which cannot help per-entry anyway.
+    ///
+    /// Empty when there is no readable `.toc`, which is also the case where the
+    /// answer would be worthless: without one, a listing's date *is* the
+    /// message's own `Date:` header, which any caller already has.
+    public func cachedDates(at base: URL) -> [Int: String] {
+        guard let entries = Toc.read(tocURL(base)) else { return [:] }
+        var out: [Int: String] = [:]
+        for e in entries where !e.date.isEmpty { out[e.offset] = e.date }
+        return out
+    }
+
     public func list(_ name: String) -> Listing? {
         guard let base = locate(name) else { return nil }
         return list(at: base, name: name)

@@ -225,8 +225,18 @@ struct FindView: View {
             ResultRow(id: "\(i)",
                       hit: hit,
                       mailbox: model.mailboxDisplay(hit.mailbox),
-                      dateSort: EudoraDateFormat.parse(hit.date) ?? .distantPast,
-                      dateText: AppModel.eudoraDate(hit.date) ?? hit.date,
+                      // A hit's date is usually the message's own RFC-822
+                      // `Date:` header, but for anything Eudora 7 composed the
+                      // index falls back to the string Eudora cached in the
+                      // `.toc` ("07:21 PM 7/13/2026"), which the RFC-822 parsers
+                      // can't read. `tocDate`/`displayCached` try that format
+                      // first and the header format second, so both shapes sort
+                      // and display correctly — without them a pre-cutover
+                      // message showed its raw cached string and sorted to the
+                      // beginning of time.
+                      dateSort: EudoraDateFormat.tocDate(hit.date)
+                          ?? EudoraDateFormat.parse(hit.date) ?? .distantPast,
+                      dateText: EudoraDateFormat.displayCached(hit.date),
                       subject: hit.subject.isEmpty ? "(no subject)" : hit.subject,
                       snippet: hit.snippet)
         }

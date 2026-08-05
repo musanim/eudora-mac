@@ -5,7 +5,9 @@ import EudoraStore
 
 /// Builds a tiny tree in a temp dir, indexes it into an in-memory FTS5 db, and
 /// checks search behaviour: body match, diacritic folding, HTML indexing,
-/// column filters, and no-match. No `.toc` needed (indexing scans the `.mbx`).
+/// column filters, and no-match. The fixture writes no `.toc`, so the indexer's
+/// cached-date fallback is inert here — `MailStoreCachedDatesTests` covers that
+/// side, and the closure below only pins the parameter's shape.
 final class EudoraSearchTests: XCTestCase {
     var root: URL!
     var index: SearchIndex!
@@ -16,7 +18,15 @@ final class EudoraSearchTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try buildFixture()
         index = try SearchIndex(path: ":memory:")
-        try index.rebuild(from: MailStore(root: root))
+        try index.rebuild(from: MailStore(root: root),
+                          // Enough of Eudora's cached format for the fixture; the
+                          // app hands down `EudoraDateFormat.tocDate`.
+                          cachedDateEpoch: { cached in
+                              let f = DateFormatter()
+                              f.locale = Locale(identifier: "en_US_POSIX")
+                              f.dateFormat = "hh:mm a M/d/yyyy"
+                              return f.date(from: cached).map { Int($0.timeIntervalSince1970) } ?? 0
+                          })
     }
 
     override func tearDownWithError() throws {

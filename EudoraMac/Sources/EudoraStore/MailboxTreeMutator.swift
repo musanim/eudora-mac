@@ -146,8 +146,13 @@ public enum MailboxTreeMutator {
     public enum MoveDirection { case up, down }
 
     public enum MoveError: LocalizedError, Equatable {
-        /// No descmap.pce, or no line in it names this file.
+        /// No line in the index names this file.
         case notFound
+        /// The directory has no readable `descmap.pce`. Distinct from
+        /// `.notFound`, which is about an entry: sorting a folder made in the
+        /// Finder fails this way, and "that item isn't in the index" would be a
+        /// sentence about an item when the problem is the whole directory.
+        case noIndex
         /// A system mailbox (In/Out/Junk/Trash) — pinned, never reordered.
         case notMovable
         /// No movable neighbour on that side — either the end of the list, or a
@@ -158,6 +163,7 @@ public enum MailboxTreeMutator {
         public var errorDescription: String? {
             switch self {
             case .notFound:       return "that item isn't in the folder's index"
+            case .noIndex:        return "that folder has no descmap.pce index"
             case .notMovable:     return "the standard mailboxes stay put"
             case .atBoundary:     return "there's nothing it can swap with on that side"
             case .ioError(let m): return m
@@ -201,7 +207,7 @@ public enum MailboxTreeMutator {
     public static func moveEntry(directory: URL, filename: String,
                                  direction: MoveDirection) throws {
         let descURL = directory.appendingPathComponent("descmap.pce")
-        guard let data = try? Data(contentsOf: descURL) else { throw MoveError.notFound }
+        guard let data = try? Data(contentsOf: descURL) else { throw MoveError.noIndex }
         let lines = descLines(in: data)
         guard let i = lines.firstIndex(where: { lineFilename($0, in: data) == filename }) else {
             throw MoveError.notFound
@@ -253,6 +259,94 @@ public enum MailboxTreeMutator {
             try MailboxIO.backupOnce(descURL)
             try MailboxIO.atomicWrite(out, to: descURL)
         } catch { throw MoveError.ioError(error.localizedDescription) }
+    }
+
+    /// Sort one directory's entries alphabetically by display name, in place.
+    ///
+    /// Eudora 7 sorted mailboxes within a group by name; Eudora 8 keeps whatever
+    /// order the file holds, so that an order can be arranged by hand. This is
+    /// the one-off action that gets alphabetical back when it's wanted, rather
+    /// than a mode that would take the hand ordering away.
+    ///
+    /// **System mailboxes keep their positions.** The movable entries are sorted
+    /// among the slots they already occupy, and anything system stays in the slot
+    /// it was in. That matches `moveEntry`, which steps over system lines rather
+    /// than moving them, and it means this can't disturb In/Out/Junk/Trash
+    /// wherever in the file they happen to sit.
+    ///
+    /// Mailboxes and folders interleave in a single run: they intermix by hand,
+    /// so they intermix here too.
+    ///
+    /// Compared with `localizedStandardCompare`, which is the Finder's ordering —
+    /// case-insensitive, and number-aware, so "Item 2" sorts before "Item 10"
+    /// rather than after it.
+    ///
+    /// Byte fidelity is the same promise `moveEntry` makes: each entry's text is
+    /// carried across untouched (display name, filename, type, unread flag), only
+    /// terminators are normalised to the file's dialect, and blank lines between
+    /// entries stay where they are.
+    ///
+    /// - Returns: false if the order was already alphabetical, so a caller can
+    ///   say "already sorted" rather than claiming to have done something.
+    @discardableResult
+    public static func sortEntries(directory: URL) throws -> Bool {
+        let descURL = directory.appendingPathComponent("descmap.pce")
+        guard let data = try? Data(contentsOf: descURL) else { throw MoveError.noIndex }
+        let lines = descLines(in: data)
+        guard !lines.isEmpty else { return false }
+
+        // The movable entries, in file order, paired with the name to sort on.
+        let movable = lines.enumerated().filter { $0.element.group != .system }
+        let sorted = movable.sorted { a, b in
+            let (na, nb) = (displayName(a.element, in: data), displayName(b.element, in: data))
+            switch na.localizedStandardCompare(nb) {
+            case .orderedAscending: return true
+            case .orderedDescending: return false
+            case .orderedSame:
+                // Two entries can share a display name — `create` and `rename`
+                // forbid it, but a tree real Eudora wrote can contain it. Without
+                // a tiebreak, `sorted(by:)` is free to permute them, so the file
+                // would be rewritten and "Sorted…" reported when nothing visibly
+                // changed, every time. Filenames are unique, so they settle it.
+                return (lineFilename(a.element, in: data) ?? "")
+                    < (lineFilename(b.element, in: data) ?? "")
+            }
+        }
+        guard sorted.map(\.offset) != movable.map(\.offset) else { return false }
+
+        // Slot k of the file takes: the same system line it already had, or the
+        // next movable entry in sorted order.
+        var queue = sorted.map { $0.element }
+        var texts: [Line] = []
+        for line in lines {
+            if line.group == .system { texts.append(line) } else { texts.append(queue.removeFirst()) }
+        }
+
+        let term = lineTerminator(of: data)
+        var out = Data()
+        out.append(data.subdata(in: data.startIndex..<lines[0].full.lowerBound))
+        for (k, line) in lines.enumerated() {
+            out.append(data.subdata(in: texts[k].text))
+            out.append(contentsOf: term)
+            if k + 1 < lines.count {
+                // Whatever sat between these two entries — blank lines that
+                // `descLines` skipped — stays between them.
+                out.append(data.subdata(in: line.full.upperBound..<lines[k + 1].full.lowerBound))
+            }
+        }
+        out.append(data.subdata(in: lines[lines.count - 1].full.upperBound..<data.endIndex))
+
+        do {
+            try MailboxIO.backupOnce(descURL)
+            try MailboxIO.atomicWrite(out, to: descURL)
+        } catch { throw MoveError.ioError(error.localizedDescription) }
+        return true
+    }
+
+    /// The display name a descmap line carries — its first comma-separated field.
+    static func displayName(_ line: Line, in data: Data) -> String {
+        guard let text = String(data: data.subdata(in: line.text), encoding: .isoLatin1) else { return "" }
+        return text.components(separatedBy: ",").first ?? ""
     }
 
     /// Every descmap line, in file order, with its byte spans and group.

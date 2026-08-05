@@ -145,7 +145,14 @@ public final class SearchIndex: @unchecked Sendable {
     /// called as `(mailboxesDone, mailboxesTotal)` — throttled to ~100 calls —
     /// so a caller can drive a progress bar. The caller runs this off the main
     /// thread; the callback is invoked on that same (background) thread.
+    /// - Parameter cachedDateEpoch: turns a date string Eudora cached in a
+    ///   `.toc` into seconds since 1970, for messages that carry no `Date:`
+    ///   header of their own. Supplied by the caller because the parser for that
+    ///   format lives in the app (`EudoraDateFormat.tocDate`); without it those
+    ///   messages keep an epoch of 0 and are simply excluded from date
+    ///   predicates, exactly as before.
     public func rebuild(from store: MailStore,
+                        cachedDateEpoch: ((String) -> Int)? = nil,
                         progress: ((Int, Int) -> Void)? = nil) throws {
         try db.exec("DELETE FROM messages;")
         try db.exec("BEGIN;")
@@ -158,13 +165,42 @@ public final class SearchIndex: @unchecked Sendable {
         let total = mailboxes.count
         let step = max(1, total / 100)
         for (i, mailbox) in mailboxes.enumerated() {
+            // The dates Eudora cached in this mailbox's `.toc`, by record offset.
+            //
+            // **Eudora 7 never wrote `Date:` into a message it composed** — only
+            // into the copy that went over the wire. Measured: of 694 such
+            // messages in one real mailbox, none has the header. Indexing only
+            // what the message carries therefore left every message Stephen ever
+            // sent with no date and no sortable epoch, so Find showed a blank
+            // column for them *and* its before/after/on criteria could never
+            // match one. The `.toc` has had the date all along.
+            //
+            // `cachedDates`, not `list(at:)`: the listing reads and record-scans
+            // the whole `.mbx` before it opens the `.toc`, which across the real
+            // tree is 1.59 GB of reading for 54 MB of answers — and in the
+            // no-`.toc` case it re-parses every message to produce dates that are
+            // the message's own header, which `ContentExtractor` has already
+            // read. This is a `.toc` read and nothing more.
+            let cachedDates = store.cachedDates(at: mailbox.base)
             for message in store.loadMessages(at: mailbox.base) {
                 let c = ContentExtractor.extract(message.part)
+                var date = c.date
+                var epoch = c.epoch
+                // Two conditions, not one. A missing header is the common case,
+                // but a header `RFC822Date.epoch` can't parse leaves a usable
+                // date with epoch 0 — undated as far as every date criterion is
+                // concerned — while the `.toc` holds a date that parses fine.
+                if date.trimmingCharacters(in: .whitespaces).isEmpty || epoch == 0,
+                   let cached = cachedDates[message.record.offset],
+                   !cached.trimmingCharacters(in: .whitespaces).isEmpty {
+                    if date.trimmingCharacters(in: .whitespaces).isEmpty { date = cached }
+                    if epoch == 0 { epoch = cachedDateEpoch?(cached) ?? 0 }
+                }
                 insert.reset()
                 insert.bind(1, mailbox.name)
                 insert.bind(2, message.record.offset)
-                insert.bind(3, c.date)
-                insert.bind(4, c.epoch)
+                insert.bind(3, date)
+                insert.bind(4, epoch)
                 insert.bind(5, c.headers)
                 insert.bind(6, c.sender)
                 insert.bind(7, c.recipients)
