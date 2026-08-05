@@ -150,8 +150,8 @@ public enum MailboxTreeMutator {
         case notFound
         /// A system mailbox (In/Out/Junk/Trash) — pinned, never reordered.
         case notMovable
-        /// Already at the top/bottom of its group (mailboxes among mailboxes,
-        /// folders among folders): there is no same-group neighbour to swap with.
+        /// No movable neighbour on that side — either the end of the list, or a
+        /// pinned system mailbox.
         case atBoundary
         case ioError(String)
 
@@ -159,7 +159,7 @@ public enum MailboxTreeMutator {
             switch self {
             case .notFound:       return "that item isn't in the folder's index"
             case .notMovable:     return "the standard mailboxes stay put"
-            case .atBoundary:     return "it's already at the end of its group"
+            case .atBoundary:     return "there's nothing it can swap with on that side"
             case .ioError(let m): return m
             }
         }
@@ -168,20 +168,36 @@ public enum MailboxTreeMutator {
     /// One descmap line's spans and role, for reordering.
     struct Line { let full: Range<Data.Index>; let text: Range<Data.Index>; let group: Group }
 
-    /// The reorder group a line belongs to. System mailboxes don't move, and a
-    /// mailbox only ever swaps with a mailbox, a folder only with a folder — so
-    /// the standard mailboxes stay at the top and the mailbox-before-folder
-    /// grouping is preserved without anyone having to enforce it.
+    /// The reorder group a line belongs to.
+    ///
+    /// Only `.system` is special now: In/Out/Junk/Trash are pinned and never
+    /// swap, which is what keeps them as a block at the top of the sidebar.
+    /// Everything below them reorders freely — a mailbox may swap with a folder
+    /// and vice versa.
+    ///
+    /// **This used to also keep mailboxes above folders**, on the reasoning that
+    /// it preserved the grouping Eudora 7 wrote without anyone enforcing it. It
+    /// was a restriction nobody asked for, and it had a sharp edge: `create`
+    /// appends to `descmap.pce`, so a newly made top-level mailbox lands after
+    /// every folder and then could not be moved up past them — Move Up was
+    /// greyed out with no way to reach anything. Ordinary use hit that within a
+    /// day of anyone creating a mailbox at the top level.
+    ///
+    /// Nothing else depended on the grouping: `MailStore.build` walks
+    /// `descmap.pce` in file order and does not sort, so the sidebar has always
+    /// simply shown whatever order the file holds.
     enum Group: Equatable { case system, mailbox, folder }
 
-    /// Move a mailbox or folder one place up or down **within its own group** by
-    /// swapping its `descmap.pce` line with the adjacent same-group line. The
-    /// swapped lines keep their exact text bytes (display name, filename, type,
-    /// unread flag); only line terminators are normalised to the file's dialect,
-    /// as `create` already does. Everything else in the file is untouched.
+    /// Move a mailbox or folder one place up or down by swapping its
+    /// `descmap.pce` line with its neighbour. Mailboxes and folders intermix
+    /// freely; only the system mailboxes are pinned. The swapped lines keep their
+    /// exact text bytes (display name, filename, type, unread flag); only line
+    /// terminators are normalised to the file's dialect, as `create` already
+    /// does. Everything else in the file is untouched.
     ///
-    /// - Throws: `.atBoundary` when the neighbour on that side is a different
-    ///   group (or absent) — which is exactly when the menu greys the item out.
+    /// - Throws: `.atBoundary` when there is no neighbour on that side, or the
+    ///   neighbour is a system mailbox — which is exactly when the menu greys the
+    ///   item out.
     public static func moveEntry(directory: URL, filename: String,
                                  direction: MoveDirection) throws {
         let descURL = directory.appendingPathComponent("descmap.pce")
@@ -193,11 +209,32 @@ public enum MailboxTreeMutator {
         guard lines[i].group != .system else { throw MoveError.notMovable }
 
         // The lower of the two positions to swap. Up swaps (i-1, i); down (i, i+1).
-        let lower = (direction == .up) ? i - 1 : i
-        guard lower >= 0, lower + 1 < lines.count,
-              lines[lower].group == lines[lower + 1].group else { throw MoveError.atBoundary }
+        // The nearest MOVABLE neighbour in that direction, stepping over any
+        // system lines in between rather than stopping at them.
+        //
+        // Skipping matters because system lines are not reliably at the top of
+        // the file. `ensureSystemMailboxes` appends a missing role — Junk, most
+        // often, since it postdates most Eudora trees — so a tree can easily
+        // read In, Out, …user's mailboxes…, Junk. Anything created after that
+        // lands below Junk, and a rule that stopped at the adjacent line would
+        // leave it with a system line above and nothing below: both move
+        // commands dead, permanently, and the blocking entry *invisible*,
+        // because the sidebar hides Junk by default.
+        //
+        // Nothing is lost by skipping. The sidebar hoists system rows into their
+        // own block above the divider (`MailboxTree.systemMailboxes`) whatever
+        // order the file is in, so file-adjacency was never what kept them
+        // together — and the splice below copies the bytes *between* the two
+        // swapped lines verbatim, so an intervening system line stays exactly
+        // where it was. What the user sees is the entry moving one place among
+        // the entries they can actually see.
+        let step = (direction == .up) ? -1 : 1
+        var j = i + step
+        while j >= 0, j < lines.count, lines[j].group == .system { j += step }
+        guard j >= 0, j < lines.count else { throw MoveError.atBoundary }
 
-        let a = lines[lower], b = lines[lower + 1]
+        // Ordered by position, so the splice below always writes earlier-first.
+        let (a, b) = i < j ? (lines[i], lines[j]) : (lines[j], lines[i])
         let term = lineTerminator(of: data)
         var out = Data()
         out.append(data.subdata(in: data.startIndex..<a.full.lowerBound))

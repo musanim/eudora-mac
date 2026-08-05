@@ -467,8 +467,9 @@ struct MailboxTree: View, Equatable {
         // Move Up/Down is deliberately *not* in that set. It was at first, and
         // it made the feature unusable: reordering a mailbox inside a group
         // closed the group under you every time. A sibling reorder can't
-        // reparent anything (`MailboxTreeMutator.moveEntry` swaps two lines in
-        // one descmap and refuses to cross a group boundary), so it isn't the
+        // reparent anything (`MailboxTreeMutator.moveEntry` swaps two lines
+        // within one descmap, which is the whole reason it can't change any
+        // item's parent), so it isn't the
         // shape that crashed and doesn't need the blunt instrument. See
         // `AppModel.identitySignature`.
         //
@@ -513,7 +514,8 @@ struct MailboxTree: View, Equatable {
             .contextMenu { contextMenu(for: item) }
     }
 
-    /// A regular mailbox or a folder gets Move Up / Move Down (within its group)
+    /// A regular mailbox or a folder gets Move Up / Move Down (mailboxes and
+    /// folders intermix; only the system mailboxes are pinned)
     /// and Delete (only when empty; a non-empty item shows the reason, greyed).
     /// System mailboxes (In/Out/Junk/Trash) get no menu at all — an empty
     /// `@ViewBuilder` result means none appears.

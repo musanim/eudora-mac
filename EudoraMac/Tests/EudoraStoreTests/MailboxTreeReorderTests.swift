@@ -35,19 +35,40 @@ final class MailboxTreeReorderTests: XCTestCase {
         XCTAssertEqual(order(), ["In.mbx", "Out.mbx", "Aaa.mbx", "Bbb.mbx", "Proj.fol"])
     }
 
-    func testMailboxWontCrossIntoSystemOrFolders() throws {
+    /// A mailbox stops at the system block above it, and at the end of the list
+    /// below it — but nothing else stops it.
+    func testMailboxStopsOnlyAtSystemAndAtTheEnd() throws {
         try writeDescmap(sample)
-        // Aaa is the top mailbox: up would collide with a system mailbox.
+        // Aaa is the topmost non-system entry: up would collide with a system
+        // mailbox, which is the one boundary that remains.
         XCTAssertThrowsError(try MailboxTreeMutator.moveEntry(
             directory: dir, filename: "Aaa.mbx", direction: .up)) {
             XCTAssertEqual($0 as? MailboxTreeMutator.MoveError, .atBoundary)
         }
-        // Bbb is the bottom mailbox: down would collide with a folder.
+        // Bbb sits above a folder, and may now swap with it.
+        try MailboxTreeMutator.moveEntry(directory: dir, filename: "Bbb.mbx", direction: .down)
+        XCTAssertEqual(order(), ["In.mbx", "Out.mbx", "Aaa.mbx", "Proj.fol", "Bbb.mbx"])
+        // Now it is last: down has nowhere to go.
         XCTAssertThrowsError(try MailboxTreeMutator.moveEntry(
             directory: dir, filename: "Bbb.mbx", direction: .down)) {
             XCTAssertEqual($0 as? MailboxTreeMutator.MoveError, .atBoundary)
         }
-        XCTAssertEqual(order(), ["In.mbx", "Out.mbx", "Aaa.mbx", "Bbb.mbx", "Proj.fol"])
+    }
+
+    /// The case that prompted the change: `create` appends, so a new top-level
+    /// mailbox lands below every folder and used to be stranded there with Move
+    /// Up greyed out. It must be able to walk all the way up to the system block.
+    func testNewMailboxAppendedBelowFoldersCanWalkToTheTop() throws {
+        try writeDescmap("In,In.mbx,I,N\r\nP,P.fol,F,N\r\nQ,Q.fol,F,N\r\nNew,New.mbx,M,N\r\n")
+        try MailboxTreeMutator.moveEntry(directory: dir, filename: "New.mbx", direction: .up)
+        XCTAssertEqual(order(), ["In.mbx", "P.fol", "New.mbx", "Q.fol"])
+        try MailboxTreeMutator.moveEntry(directory: dir, filename: "New.mbx", direction: .up)
+        XCTAssertEqual(order(), ["In.mbx", "New.mbx", "P.fol", "Q.fol"])
+        // Stopped by In, and by nothing before it.
+        XCTAssertThrowsError(try MailboxTreeMutator.moveEntry(
+            directory: dir, filename: "New.mbx", direction: .up)) {
+            XCTAssertEqual($0 as? MailboxTreeMutator.MoveError, .atBoundary)
+        }
     }
 
     func testSystemMailboxIsPinned() throws {
@@ -58,13 +79,39 @@ final class MailboxTreeReorderTests: XCTestCase {
         }
     }
 
-    func testFoldersReorderAmongThemselves() throws {
+    /// A system line in the MIDDLE of the file must be stepped over, not stopped
+    /// at. `ensureSystemMailboxes` appends a missing role, so a tree that gained
+    /// Junk late reads In, …user's entries…, Junk — and anything created after
+    /// that lands below it. Stopping there would strand the new mailbox with both
+    /// move commands dead, and the entry blocking it is invisible, since the
+    /// sidebar hides Junk by default.
+    func testStepsOverASystemLineInTheMiddle() throws {
+        try writeDescmap("In,In.mbx,I,N\r\nAaa,Aaa.mbx,M,N\r\nJunk,Junk.mbx,S,N\r\nNew,New.mbx,M,N\r\n")
+        try MailboxTreeMutator.moveEntry(directory: dir, filename: "New.mbx", direction: .up)
+        // New and Aaa exchanged; Junk did not move.
+        XCTAssertEqual(order(), ["In.mbx", "New.mbx", "Junk.mbx", "Aaa.mbx"])
+        // Now nothing movable above it — In is system and there is nothing beyond.
+        XCTAssertThrowsError(try MailboxTreeMutator.moveEntry(
+            directory: dir, filename: "New.mbx", direction: .up)) {
+            XCTAssertEqual($0 as? MailboxTreeMutator.MoveError, .atBoundary)
+        }
+        // And back down again, over Junk.
+        try MailboxTreeMutator.moveEntry(directory: dir, filename: "New.mbx", direction: .down)
+        XCTAssertEqual(order(), ["In.mbx", "Aaa.mbx", "Junk.mbx", "New.mbx"])
+    }
+
+    func testFoldersAndMailboxesIntermix() throws {
         try writeDescmap("Aaa,Aaa.mbx,M,N\r\nP,P.fol,F,N\r\nQ,Q.fol,F,N\r\n")
         try MailboxTreeMutator.moveEntry(directory: dir, filename: "Q.fol", direction: .up)
         XCTAssertEqual(order(), ["Aaa.mbx", "Q.fol", "P.fol"])
-        // Q is now the top folder — up would collide with the mailbox above.
+        // A folder may now rise past a mailbox — the restriction this replaced.
+        try MailboxTreeMutator.moveEntry(directory: dir, filename: "Q.fol", direction: .up)
+        XCTAssertEqual(order(), ["Q.fol", "Aaa.mbx", "P.fol"])
+        // And nothing above it, so that is the boundary.
         XCTAssertThrowsError(try MailboxTreeMutator.moveEntry(
-            directory: dir, filename: "Q.fol", direction: .up))
+            directory: dir, filename: "Q.fol", direction: .up)) {
+            XCTAssertEqual($0 as? MailboxTreeMutator.MoveError, .atBoundary)
+        }
     }
 
     func testUnknownFilename() throws {

@@ -1626,9 +1626,9 @@ final class AppModel: ObservableObject {
     ///   made the feature unusable.
     ///
     /// That last exclusion is safe for a specific, checked reason rather than
-    /// optimism: `MailboxTreeMutator.moveEntry` swaps two adjacent lines within
-    /// one `descmap.pce` and throws `.atBoundary` rather than crossing into
-    /// another group, so a reorder **cannot** change any item's parent. What
+    /// optimism: `MailboxTreeMutator.moveEntry` exchanges two lines within one
+    /// `descmap.pce` and touches no other file, so a reorder **cannot** change
+    /// any item's parent — whichever two lines it picks. What
     /// crashed SwiftUI's outline diff was reparenting an *expanded subtree* —
     /// deleting it from one parent and inserting it under another inside one
     /// animated batch. A permutation of the same ids under the same parent is
@@ -4757,17 +4757,23 @@ final class AppModel: ObservableObject {
 
     // MARK: reordering & folder delete
 
-    /// Whether this mailbox or folder can move up/down — i.e. there is a
-    /// same-group neighbour on that side. The menu greys the item out otherwise;
+    /// Whether this mailbox or folder can move up/down — i.e. there is a movable
+    /// neighbour on that side. The menu greys the item out otherwise;
     /// `MailboxTreeMutator.moveEntry` is the authority and throws `.atBoundary`
     /// if the courtesy check is ever stale.
     func canMove(_ id: MailboxItem.ID, up: Bool) -> Bool {
-        guard let item = itemsByID[id] else { return false }
+        guard let item = itemsByID[id], Self.isMovable(item) else { return false }
         let siblings = siblingList(of: id)
         guard let idx = siblings.firstIndex(where: { $0.id == id }) else { return false }
-        let neighbour = up ? idx - 1 : idx + 1
-        guard neighbour >= 0, neighbour < siblings.count else { return false }
-        return Self.sameMovableGroup(item, siblings[neighbour])
+        // Nearest movable neighbour, stepping over system mailboxes — mirroring
+        // `MailboxTreeMutator.moveEntry`, which skips them rather than stopping.
+        // The walk matters here for the same reason it does there: `siblingList`
+        // reads the full tree, so a hidden Junk sitting in the middle of the file
+        // would otherwise grey out a command that will in fact work.
+        let step = up ? -1 : 1
+        var n = idx + step
+        while n >= 0, n < siblings.count, !Self.isMovable(siblings[n]) { n += step }
+        return n >= 0 && n < siblings.count
     }
 
     /// Move a mailbox or folder one place within its group and re-list the tree.
@@ -4848,16 +4854,13 @@ final class AppModel: ObservableObject {
         return tree
     }
 
-    /// Two items reorder together only if both are movable — a regular mailbox
-    /// or a folder, not a system mailbox — and of the same kind, so a mailbox
-    /// never swaps past a folder and the standard mailboxes stay pinned on top.
-    private static func sameMovableGroup(_ a: MailboxItem, _ b: MailboxItem) -> Bool {
-        func group(_ x: MailboxItem) -> Int? {
-            if x.isFolder { return 2 }
-            return x.type == .mailbox ? 1 : nil     // nil = system, unmovable
-        }
-        guard let ga = group(a), let gb = group(b) else { return false }
-        return ga == gb
+    /// A regular mailbox or a folder — anything but a pinned system mailbox.
+    ///
+    /// The complement of `MailboxTreeMutator.Group.system`, which is the
+    /// authority. Mailboxes and folders intermix freely; kinds used to have to
+    /// match, and see the note on that enum for why they no longer do.
+    private static func isMovable(_ x: MailboxItem) -> Bool {
+        x.isFolder || x.type == .mailbox
     }
 
     // MARK: mailbox management (create)
