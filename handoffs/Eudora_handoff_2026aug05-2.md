@@ -40,9 +40,8 @@ Stephen uses it all day. Work is ordinary improvement, driven by what he hits.
 failures (up from 484; the delta is larger than the 16 tests added here, so the
 484 figure in the previous handoff evidently predated something — not chased).
 
-**One change is written but not yet built or committed:** `PointerAlert` moved to
-its own file and applied to five right-click dialogs. It needs `xcodegen generate`
-before it will build — see "Pointer-positioned dialogs" below.
+**Everything in this handoff is built, confirmed by Stephen, and committed.**
+Nothing is in flight.
 
 Two items from the previous session may still be uncommitted — the compose
 repaint workaround and a sidebar row-density revert. `git status` is the check;
@@ -81,8 +80,17 @@ confirmation anchor their **action button** on the pointer; New Mailbox, Rename 
 the composer's "Correct … to…" prompt anchor their **text field**, because those
 are type-and-Return dialogs whose button is never clicked.
 
-**Status: written, not compiled, not committed.** `xcodegen generate` first, since
-it adds a file. Commit message is ready in `reference/commit-message.txt`.
+Also in the same pass: **Delete PERMANENTLY and Add to BLACKLIST now have the
+same gap between them** as the one above them. Different reasoning from the first
+gap, which is distance from the most-used action — this is distance between two
+adjacent shouting items that do entirely different things, one destroying the
+message and the other replying to the sender on Stephen's behalf *and then*
+destroying it. Built inside the conditional that adds the blacklist item, so the
+gap arrives with the item it protects. See `MessageContextMenu`, and note that
+`addGap` interleaves disabled spacer rows because consecutive separators coalesce.
+
+Built and confirmed. Note for a future session: adding a file under
+`EudoraApp/Sources` needs `xcodegen generate` before it will build.
 
 Three things in it cost a build each and are all recorded in the file's header
 comment: setting the frame before `runModal` does nothing (`NSAlert` positions its
@@ -173,13 +181,11 @@ how to put it back in one line. It's out because `MailboxRow` is the hot view.
 Nothing is pending or half-finished. Work is driven by what Stephen hits, so the
 likely candidates, in no particular order:
 
-1. **Build, test and commit `PointerAlert`** — `xcodegen generate` first. This is
-   the only thing actually in flight.
-2. Whatever the tightened sidebar turns up in daily use.
-3. The write-up for Stephen's friend on the Windows question, if he wants it.
-4. Bounding the In badge art, if 21 pt still isn't tight enough.
-5. `Mailbox ▸ New…` at the pointer too, if the menu-bar case turns out to want it.
-6. STARTTLS, if a mail server ever forces it.
+1. Whatever the tightened sidebar turns up in daily use.
+2. The write-up for Stephen's friend on the Windows question, if he wants it.
+3. Bounding the In badge art, if 21 pt still isn't tight enough.
+4. `Mailbox ▸ New…` at the pointer too, if the menu-bar case turns out to want it.
+5. STARTTLS, if a mail server ever forces it.
 
 **Draft — confirm or replace before relying on it.** Stephen supplied no next
 steps with the handoff request, so this list is inferred from the session tail.
