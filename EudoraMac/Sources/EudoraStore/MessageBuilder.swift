@@ -236,17 +236,98 @@ public struct OutgoingMessage: Sendable {
         let a = addressOnly(address)
         let n = name.trimmingCharacters(in: .whitespaces)
         if n.isEmpty { return a }
-        return "\(encodeHeaderText(n)) <\(a)>"
+        return "\(quotedIfNeeded(encodeHeaderText(n))) <\(a)>"
     }
 
     /// Pass an address entry through, encoding a leading display name if needed.
     static func encodeAddress(_ entry: String) -> String {
         let s = entry.trimmingCharacters(in: .whitespaces)
         guard let lt = s.firstIndex(of: "<") else { return s } // bare address
-        let name = String(s[..<lt]).trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
+        let name = unquotedDisplayName(String(s[..<lt]))
         let addr = s[lt...]
         if name.isEmpty { return String(addr) }
-        return "\(encodeHeaderText(name)) \(addr)"
+        return "\(quotedIfNeeded(encodeHeaderText(name))) \(addr)"
+    }
+
+    /// A display name as the user means it: outer quotes removed and the
+    /// quoted-string escapes undone.
+    ///
+    /// The inverse of `quotedIfNeeded`, and it exists so the two compose. A name
+    /// that merely had its quotes stripped would be re-escaped on the way back
+    /// out, and since this app reads its own sent mail — reply, reopen a draft,
+    /// Send Again — the escapes would double on every pass. Real senders make
+    /// this concrete: `"Catherine Krick \(via Dropbox\)"` is a Dropbox
+    /// notification, one of 106 backslash-bearing display names in Stephen's
+    /// mail, and without this it grows a pair of backslashes every round trip.
+    ///
+    /// The lone `'` trim on the quoted branch keeps Outlook's doubly-quoted
+    /// `"'Matias Help Desk'"` reducing exactly as it always did.
+    static func unquotedDisplayName(_ raw: String) -> String {
+        let s = raw.trimmingCharacters(in: .whitespaces)
+        guard s.count >= 2, s.hasPrefix("\""), s.hasSuffix("\"") else {
+            return s.trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
+        }
+        var out = ""
+        var escaped = false
+        for ch in s.dropFirst().dropLast() {
+            if escaped { out.append(ch); escaped = false }
+            else if ch == "\\" { escaped = true }
+            else { out.append(ch) }
+        }
+        return out.trimmingCharacters(in: CharacterSet(charactersIn: " '"))
+    }
+
+    /// Quote a display name that holds a character a reader would otherwise
+    /// take for structure — the comma above all.
+    ///
+    /// This is not cosmetic. `encodeAddress` strips the quotes off an incoming
+    /// `"Andrews, Cody" <a@b.com>`, and without putting them back the header
+    /// goes out as `To: Andrews, Cody <a@b.com>` — which every conforming
+    /// reader parses as *two* recipients. Delivery still succeeds, because the
+    /// SMTP envelope is built from `addressOnly` and never sees the name, so
+    /// the damage is invisible until the copy saved in Out is reopened: the
+    /// composer reads that header back, splits the now-unquoted comma, and the
+    /// send fails on a recipient the user never typed.
+    ///
+    /// Never quotes an RFC 2047 encoded-word: quoting one stops it decoding,
+    /// and its base64 alphabet cannot contain a special in any case. Tested at
+    /// both ends, so an ordinary ASCII name that merely opens `=?` isn't let
+    /// through unquoted.
+    ///
+    /// The period is deliberately **not** in the set, though RFC 5322 lists it
+    /// among `specials`. It turns up in ordinary names constantly — an initial,
+    /// `Jr.`, `Inc.` — and no reader splits an address list on it, so including
+    /// it would put quotes around a large share of the display names this app
+    /// writes, to fix nothing. Every other character here genuinely misleads a
+    /// parser.
+    static func quotedIfNeeded(_ name: String) -> String {
+        let specials = "()<>[]:;@\\,\""
+        guard !(name.hasPrefix("=?") && name.hasSuffix("?=")),
+              name.contains(where: { specials.contains($0) })
+        else { return name }
+        let escaped = name.replacingOccurrences(of: "\\", with: "\\\\")
+                          .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
+    }
+
+    /// One address-list entry with its display name quoted if it needs it —
+    /// `Doe, Jane <j@x>` → `"Doe, Jane" <j@x>`. A bare address, an empty name,
+    /// and an already-quoted name all pass through untouched.
+    ///
+    /// For text on its way *into* a recipient field, where an unquoted comma
+    /// would later be read as a separator. The header-assembly path uses
+    /// `encodeAddress`, which quotes as part of encoding.
+    ///
+    /// Unquotes before re-quoting, which makes it idempotent — applying it twice
+    /// gives what applying it once did. A cheaper "does it already start and end
+    /// with a quote?" test looks equivalent and isn't: `"Smith", and "Jones"`
+    /// passes it, and would then be left with its separating comma bare.
+    public static func quotingDisplayName(_ entry: String) -> String {
+        let s = entry.trimmingCharacters(in: .whitespaces)
+        guard let lt = s.firstIndex(of: "<") else { return s } // bare address
+        let name = unquotedDisplayName(String(s[..<lt]))
+        guard !name.isEmpty else { return s }
+        return "\(quotedIfNeeded(name)) \(s[lt...])"
     }
 
     /// RFC 2047 B-encode a header value if it contains non-ASCII; else verbatim.
@@ -263,8 +344,7 @@ public struct OutgoingMessage: Sendable {
     public static func splitFrom(_ s: String) -> (name: String, address: String) {
         let t = s.trimmingCharacters(in: .whitespaces)
         guard let lt = t.firstIndex(of: "<") else { return ("", t) }
-        let name = String(t[..<lt]).trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
-        return (name, addressOnly(t))
+        return (unquotedDisplayName(String(t[..<lt])), addressOnly(t))
     }
 
     /// The address inside <> if present, else the trimmed token.

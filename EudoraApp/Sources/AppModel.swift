@@ -2889,28 +2889,20 @@ final class AppModel: ObservableObject {
     /// Join parsed recipients into the comma-separated string the composer's To
     /// and Cc fields hold.
     ///
-    /// A display name containing a comma — `"Doe, Jane" <j@x>` — is reduced to
-    /// its bare address on the way in. The parser goes to some trouble to keep
-    /// such a name intact (the comma is percent-encoded precisely so it is not a
-    /// separator), but `splitAddresses` re-splits this field on every comma
-    /// without regard for quoting, so preserving the name here would hand the
-    /// composer two broken recipients instead of one good one. Losing a display
-    /// name is cosmetic; losing the address is not.
+    /// This used to strip a comma-bearing display name back to its bare address
+    /// — `"Doe, Jane" <j@x>` → `j@x` — because `splitAddresses` re-split the
+    /// field on every comma and would otherwise have produced two broken
+    /// recipients from one good one. That rationale is gone: `splitAddresses`
+    /// now respects quoting, so the name the parser went to some trouble to keep
+    /// intact (the comma is percent-encoded precisely so it is not a separator)
+    /// survives all the way into the field, as it already did for a reply.
     ///
-    /// Only rescues the `Name <addr>` form. A bare `Doe, Jane` with no address
-    /// at all is malformed input the parser deliberately admits rather than
-    /// swallows, and it still splits in two — visibly, in a field the user reads
-    /// before sending.
+    /// The name is quoted on the way in when it isn't already. A mailto may
+    /// carry `to=Doe%2C%20Jane%20%3Cj@x.com%3E` — one entry, comma in the name,
+    /// no quotes anywhere — which is malformed but common, and which the
+    /// field's quote-aware split would otherwise still tear in two.
     private func recipientField(_ addresses: [String]) -> String {
-        addresses.map { address -> String in
-            guard address.contains(","),
-                  let open = address.lastIndex(of: "<"),
-                  let close = address.lastIndex(of: ">"),
-                  open < close else { return address }
-            return String(address[address.index(after: open)..<close])
-                .trimmingCharacters(in: .whitespaces)
-        }
-        .joined(separator: ", ")
+        addresses.map(OutgoingMessage.quotingDisplayName).joined(separator: ", ")
     }
 
     /// The single funnel every new message goes through — new, reply, forward.
@@ -3369,9 +3361,9 @@ final class AppModel: ObservableObject {
 
         var draft = ComposeDraft(
             from: HeaderDecoder.decode(part.header("From") ?? ""),
-            to: HeaderDecoder.decode(part.header("To") ?? ""),
-            cc: HeaderDecoder.decode(part.header("Cc") ?? ""),
-            bcc: HeaderDecoder.decode(part.header("Bcc") ?? ""),
+            to: Self.recipientFieldText(part.header("To") ?? ""),
+            cc: Self.recipientFieldText(part.header("Cc") ?? ""),
+            bcc: Self.recipientFieldText(part.header("Bcc") ?? ""),
             subject: HeaderDecoder.decode(part.header("Subject") ?? ""),
             body: styled?.plainText ?? Self.plainText(of: part),
             styledBody: styled,
@@ -3465,9 +3457,9 @@ final class AppModel: ObservableObject {
         let styled = Self.styledBody(of: part)
         beginCompose(ComposeDraft(
             from: HeaderDecoder.decode(part.header("From") ?? ""),
-            to: HeaderDecoder.decode(part.header("To") ?? ""),
-            cc: HeaderDecoder.decode(part.header("Cc") ?? ""),
-            bcc: HeaderDecoder.decode(part.header("Bcc") ?? ""),
+            to: Self.recipientFieldText(part.header("To") ?? ""),
+            cc: Self.recipientFieldText(part.header("Cc") ?? ""),
+            bcc: Self.recipientFieldText(part.header("Bcc") ?? ""),
             subject: HeaderDecoder.decode(part.header("Subject") ?? ""),
             body: styled?.plainText ?? Self.plainText(of: part),
             styledBody: styled,
@@ -3475,6 +3467,26 @@ final class AppModel: ObservableObject {
             inReplyTo: part.header("In-Reply-To")?.trimmingCharacters(in: .whitespaces),
             references: (part.header("References") ?? "")
                 .split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)))
+    }
+
+    /// A stored `To`/`Cc`/`Bcc` header as recipient-field text: split first,
+    /// decode each entry, re-quote any name that needs it.
+    ///
+    /// Order is the whole point, and decoding the header whole — which is what
+    /// this replaced — gets it wrong in a way that only shows on the *second*
+    /// send. A non-ASCII comma name travels as an encoded-word, so the comma is
+    /// hidden inside base64 and the header is unambiguous:
+    ///
+    ///     To: =?utf-8?B?TcO8bGxlciwgSsO2cmc=?= <j@x.com>
+    ///
+    /// Decode that whole and the comma comes back bare — `Müller, Jörg
+    /// <j@x.com>` — and the field splits into a recipient called `Müller`.
+    /// Splitting the raw header keeps the entry intact while its comma is still
+    /// hidden; re-quoting after the decode keeps it intact from then on.
+    nonisolated static func recipientFieldText(_ rawHeader: String) -> String {
+        EmailAddress.splitList(rawHeader)
+            .map { OutgoingMessage.quotingDisplayName(HeaderDecoder.decode($0)) }
+            .joined(separator: ", ")
     }
 
     /// The attachment parts of a parsed message, as composer attachments with
@@ -3505,12 +3517,18 @@ final class AppModel: ObservableObject {
             .split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
         if let m = msgID { refs.append(m) }
 
+        // Through `recipientFieldText` rather than raw, so the field shows the
+        // sender's name decoded and readable, with quotes kept only where they
+        // are doing work. `"Steve McGowan" <steve@matias.ca>` loses them — there
+        // is nothing in that name to protect — while `"Andrews, Cody" <a@b.com>`
+        // keeps them, because they are all that stops the comma being read as a
+        // separator.
         var cc: [String] = []
-        if all { cc = (splitAddresses(origTo) + splitAddresses(origCc)) }
+        if all { cc = [Self.recipientFieldText(origTo), Self.recipientFieldText(origCc)] }
 
         beginCompose(ComposeDraft(
-            to: origFrom,
-            cc: cc.joined(separator: ", "),
+            to: Self.recipientFieldText(origFrom),
+            cc: cc.filter { !$0.isEmpty }.joined(separator: ", "),
             subject: subject.lowercased().hasPrefix("re:") ? subject : "Re: \(subject)",
             body: quotedReply(part, from: origFrom),
             inReplyTo: msgID,
@@ -4236,11 +4254,16 @@ final class AppModel: ObservableObject {
         return "\n\nOn \(part.header("Date") ?? "a previous date"), \(who) wrote:\n\(quoted)\n"
     }
 
-    /// Split a header address list on commas/semicolons into trimmed entries.
+    /// Split a header address list on commas/semicolons into trimmed entries,
+    /// ignoring separators inside a quoted display name or angle brackets.
+    ///
+    /// This split feeds `RCPT TO` by way of `OutgoingMessage.envelopeRecipients`,
+    /// so getting it wrong doesn't garble a name — it invents a recipient. The
+    /// naive version this replaced split on every comma, so replying to
+    /// `"Andrews, Cody" <a@b.com>` asked the server to accept `"Andrews`, and the
+    /// send failed on an address the user never typed.
     func splitAddresses(_ s: String) -> [String] {
-        s.split(whereSeparator: { $0 == "," || $0 == ";" })
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+        EmailAddress.splitList(s)
     }
 
     // MARK: recently-used recipients (To/Cc/Bcc auto-fill)

@@ -140,6 +140,17 @@ struct ComposeView: View {
             // Wire the editor's auto-correction to the user's own list.
             editor.lookupCorrection = { model.correctionReplacement(for: $0) }
             editor.saveCorrection = { model.addCorrection(trigger: $0, replacement: $1) }
+            // A reply arrives addressed, so the caret belongs in the body, above
+            // the quoted text. A new message arrives empty and wants To, which is
+            // where AppKit puts it anyway. Keyed off the seed rather than the live
+            // `to` because this decides once, at open.
+            // The closure is made here, in `body`, and writes this view's own
+            // `@FocusState` — see `focusBody`, which explains why the write is
+            // required rather than tidy, and `MailboxTree.setExpanded` for why
+            // it is made here rather than handed `self`.
+            if !seed.to.trimmingCharacters(in: .whitespaces).isEmpty {
+                editor.focusBody { focus = nil }
+            }
         }
         .onChange(of: reviewSnapshot) { _ in pushReview() }
         .onDisappear { model.closeDraft(draftID) }

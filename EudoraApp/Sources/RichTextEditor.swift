@@ -359,6 +359,51 @@ final class RichTextEditorController: NSObject, ObservableObject, NSTextViewDele
         }
     }
 
+    /// Put the caret at the very top of the body and give it first responder, so
+    /// a reply opens ready to type the answer above the quoted text.
+    ///
+    /// Only for a draft that arrives with a recipient already filled in. On a new
+    /// message the first thing wanted is the address, and AppKit's own choice —
+    /// the first key view, which is To — is already right.
+    ///
+    /// Two mechanisms, because they cover different moments. `initialFirstResponder`
+    /// is what AppKit consults the first time the window is made key, and setting
+    /// it means our choice *is* AppKit's choice rather than a correction racing
+    /// it; `makeFirstResponder` handles a window that is already key by the time
+    /// this runs. Both are idempotent.
+    ///
+    /// The retry mirrors `WindowCloseGuard.install`: this is called from
+    /// `onAppear`, and the text view has no window on the first pass. It only
+    /// re-arms while there is no window, so it cannot yank focus from a user who
+    /// has clicked somewhere — there is nothing on screen to click yet.
+    ///
+    /// `onFocused` must clear the composer's `@FocusState`, and taking the body
+    /// is not finished until it has. `RecipientField` writes `focus = .to` from
+    /// `controlTextDidBeginEditing` when AppKit's key-view loop hands To its
+    /// field editor, and then re-grabs first responder from `updateNSView` on
+    /// every pass where `focus == .to` and the field has no editor — which is
+    /// exactly the state this leaves behind. `ComposeView.body` reads
+    /// `editor.content`, so every republish (the deferred `readBack` here, then
+    /// the first keystroke in the body) runs that pass. Without the handshake
+    /// the caret jumps out of the body and into To after one character, and only
+    /// sometimes, depending on whether the window became key first.
+    func focusBody(attemptsLeft: Int = 20, onFocused: @escaping () -> Void = {}) {
+        guard let textView, let window = textView.window else {
+            guard attemptsLeft > 0 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.focusBody(attemptsLeft: attemptsLeft - 1, onFocused: onFocused)
+            }
+            return
+        }
+        let top = NSRange(location: 0, length: 0)
+        textView.setSelectedRange(top)
+        textView.scrollRangeToVisible(top)
+        window.initialFirstResponder = textView
+        // Only on success: a refused first-responder change must not leave the
+        // recipient fields believing focus is nowhere.
+        if window.makeFirstResponder(textView) { onFocused() }
+    }
+
     // MARK: delegate
 
     /// Note a typed word-terminator so `textDidChange` can correct the word that

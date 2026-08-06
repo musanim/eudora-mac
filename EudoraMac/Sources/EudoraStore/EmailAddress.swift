@@ -96,13 +96,38 @@ public enum EmailAddress {
     /// but only those outside quotes and angle brackets, so the comma in a
     /// quoted display name (`"Doe, Jane" <j@x>`) doesn't tear one address into
     /// two. Entries are trimmed; empties dropped.
-    static func splitList(_ s: String) -> [String] {
+    ///
+    /// Public because the composer's To/Cc/Bcc fields split on exactly these
+    /// rules (`AppModel.splitAddresses`). They used to split on every comma,
+    /// which turned a reply to `"Andrews, Cody" <a@b.com>` into two recipients —
+    /// the phantom first one, `"Andrews`, being what the SMTP server then
+    /// refused at `RCPT TO`. A display name is cosmetic; a torn address is not.
+    ///
+    /// An unbalanced quote leaves the scanner in-quote to the end of the string,
+    /// so the remaining commas don't split; an unbalanced `<` does the same. Both
+    /// happen mid-edit, and both are the safer of the two failure modes — the
+    /// user sees one over-long recipient in a field they read before sending,
+    /// rather than a plausible-looking address that goes somewhere else — but
+    /// they are failure modes, not guarantees.
+    ///
+    /// A backslash inside a quoted string escapes the next character, so a name
+    /// holding an escaped quote — `"5\" nails, sharp"` — doesn't end the quoted
+    /// run early and take its comma with it. This matters more than the rarity
+    /// suggests: `OutgoingMessage.quotedIfNeeded` now *writes* that form, so
+    /// without it the app would generate headers its own splitter tore apart.
+    public static func splitList(_ s: String) -> [String] {
         var out: [String] = []
         var cur = ""
         var inQuote = false
+        var escaped = false
         var angle = 0
         for ch in s {
+            // The character after a backslash is literal, whatever it is — it
+            // must not toggle the quote state or act as a separator.
+            if escaped { cur.append(ch); escaped = false; continue }
             switch ch {
+            case "\\" where inQuote:
+                escaped = true; cur.append(ch)
             case "\"":
                 inQuote.toggle(); cur.append(ch)
             case "<" where !inQuote:

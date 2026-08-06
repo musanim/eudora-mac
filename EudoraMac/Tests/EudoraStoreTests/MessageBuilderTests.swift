@@ -119,6 +119,122 @@ final class MessageBuilderTests: XCTestCase {
         XCTAssertTrue(text.contains("From: Alter Ego <alter@example.com>"), text)
     }
 
+    // MARK: - comma-bearing display names
+
+    /// The round trip that matters, and the one that hid the bug: a reply to
+    /// `"Andrews, Cody Kathy" <a@b.com>` is sent, its copy lands in Out, and
+    /// that copy is reopened. If the `To:` header loses the quotes, the reopened
+    /// draft splits at the comma and the *second* send asks the server for a
+    /// recipient called `Andrews`. The first send always looked fine, because
+    /// the SMTP envelope is built from `addressOnly` and never sees the name.
+    func testCommaBearingNameSurvivesTheHeaderAndSplitsBackAsOneRecipient() throws {
+        var message = plainMessage(body: "Hi")
+        message.to = ["\"Andrews, Cody Kathy\" <a@b.com>"]
+        let text = String(decoding: message.rfc822(date: date, messageID: messageID).data,
+                          as: UTF8.self)
+        XCTAssertTrue(text.contains("To: \"Andrews, Cody Kathy\" <a@b.com>"), text)
+
+        // Reopening reads that header back into the composer's To field.
+        // `components(separatedBy:)` rather than `split(separator: "\r\n")`:
+        // the multi-character `split` overload is macOS 13, and this package
+        // still targets macOS 12.
+        let toHeader = try XCTUnwrap(text.components(separatedBy: "\r\n")
+            .first { $0.hasPrefix("To: ") }).dropFirst(4)
+        XCTAssertEqual(EmailAddress.splitList(String(toHeader)),
+                       ["\"Andrews, Cody Kathy\" <a@b.com>"])
+        XCTAssertEqual(message.envelopeRecipients, ["a@b.com"])
+    }
+
+    /// The same protection on From, which `formatAddress` builds separately.
+    func testCommaBearingFromNameIsQuotedInTheHeader() {
+        var message = plainMessage(body: "Hi")
+        message.fromName = "Malinowski, Stephen"
+        let text = String(decoding: message.rfc822(date: date, messageID: messageID).data,
+                          as: UTF8.self)
+        XCTAssertTrue(text.contains("From: \"Malinowski, Stephen\" <stephen@example.com>"), text)
+    }
+
+    /// A name with nothing special in it must not acquire quotes — every header
+    /// this app has ever written would otherwise change.
+    func testOrdinaryNamesAreNotQuoted() {
+        XCTAssertEqual(OutgoingMessage.quotedIfNeeded("Stephen Malinowski"),
+                       "Stephen Malinowski")
+        XCTAssertEqual(OutgoingMessage.encodeAddress("Steve <s@x.com>"), "Steve <s@x.com>")
+        // A period is not treated as special, though RFC 5322 lists it: quoting
+        // every initial and every "Inc." would fix nothing.
+        XCTAssertEqual(OutgoingMessage.quotedIfNeeded("Stephen J. Malinowski"),
+                       "Stephen J. Malinowski")
+    }
+
+    /// A non-ASCII comma name becomes an encoded-word, and must *not* then be
+    /// quoted — quoting an encoded-word stops it decoding. This pins the
+    /// composition of `encodeHeaderText` and `quotedIfNeeded`, not either alone:
+    /// the comma has to disappear into the base64 before the quoting test runs.
+    func testNonASCIICommaNameEncodesRatherThanQuotes() {
+        let encoded = OutgoingMessage.encodeAddress("\"Müller, Jörg\" <j@x.com>")
+        XCTAssertFalse(encoded.hasPrefix("\""), encoded)
+        XCTAssertTrue(encoded.hasSuffix(" <j@x.com>"), encoded)
+        XCTAssertTrue(encoded.hasPrefix("=?utf-8?B?"), encoded)
+        // And it is still one entry to the splitter, comma and all.
+        XCTAssertEqual(EmailAddress.splitList(encoded).count, 1)
+    }
+
+    /// Quoting must be undone before it is redone, or the escapes grow.
+    ///
+    /// This app reads its own sent mail — reply, reopen a draft, Send Again — so
+    /// a name that gains a backslash per pass gains them without bound.
+    /// `"Catherine Krick \(via Dropbox\)"` is a real sender in Stephen's mail,
+    /// and is the shape that showed it.
+    func testRepeatedQuotingDoesNotAccumulateEscapes() {
+        let entry = "\"Catherine Krick \\(via Dropbox\\)\" <no-reply@dropbox.com>"
+        let once = OutgoingMessage.encodeAddress(entry)
+        XCTAssertEqual(once, "\"Catherine Krick (via Dropbox)\" <no-reply@dropbox.com>")
+        // Idempotent: feeding the result back in changes nothing, four times over.
+        var s = once
+        for _ in 0..<4 { s = OutgoingMessage.encodeAddress(s) }
+        XCTAssertEqual(s, once)
+
+        var t = OutgoingMessage.quotingDisplayName(entry)
+        for _ in 0..<4 { t = OutgoingMessage.quotingDisplayName(t) }
+        XCTAssertEqual(t, OutgoingMessage.quotingDisplayName(entry))
+    }
+
+    /// `unquotedDisplayName` is the inverse the other two rest on.
+    func testUnquotedDisplayName() {
+        XCTAssertEqual(OutgoingMessage.unquotedDisplayName("\"Doe, Jane\""), "Doe, Jane")
+        XCTAssertEqual(OutgoingMessage.unquotedDisplayName("\"a\\\\b\""), "a\\b")
+        XCTAssertEqual(OutgoingMessage.unquotedDisplayName("\"say \\\"hi\\\"\""), "say \"hi\"")
+        XCTAssertEqual(OutgoingMessage.unquotedDisplayName("Plain Name"), "Plain Name")
+        // Outlook's doubly-quoted form reduces exactly as it always did.
+        XCTAssertEqual(OutgoingMessage.unquotedDisplayName("\"'Matias Help Desk'\""),
+                       "Matias Help Desk")
+    }
+
+    /// An embedded quote or backslash is escaped rather than closing the string.
+    func testQuotingEscapesQuotesAndBackslashes() {
+        XCTAssertEqual(OutgoingMessage.quotedIfNeeded("Say \"hi\", Bob"),
+                       "\"Say \\\"hi\\\", Bob\"")
+        XCTAssertEqual(OutgoingMessage.quotedIfNeeded("a\\b, c"), "\"a\\\\b, c\"")
+    }
+
+    /// `quotingDisplayName` is the way *in* to a recipient field — a mailto
+    /// carrying an unquoted comma name is the case it exists for.
+    func testQuotingDisplayNameOnTheWayIntoARecipientField() {
+        XCTAssertEqual(OutgoingMessage.quotingDisplayName("Doe, Jane <j@x.com>"),
+                       "\"Doe, Jane\" <j@x.com>")
+        // Already quoted, bare address, and no name: all untouched.
+        XCTAssertEqual(OutgoingMessage.quotingDisplayName("\"Doe, Jane\" <j@x.com>"),
+                       "\"Doe, Jane\" <j@x.com>")
+        XCTAssertEqual(OutgoingMessage.quotingDisplayName("j@x.com"), "j@x.com")
+        XCTAssertEqual(OutgoingMessage.quotingDisplayName("<j@x.com>"), "<j@x.com>")
+        XCTAssertEqual(OutgoingMessage.quotingDisplayName("Steve <s@x.com>"),
+                       "Steve <s@x.com>")
+        // And the result splits as one entry, which is the whole point.
+        XCTAssertEqual(
+            EmailAddress.splitList(OutgoingMessage.quotingDisplayName("Doe, Jane <j@x.com>")),
+            ["\"Doe, Jane\" <j@x.com>"])
+    }
+
     // MARK: - the styled path
 
     func testStyledMessageIsMultipartAlternative() {
