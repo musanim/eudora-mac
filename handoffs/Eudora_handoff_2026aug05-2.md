@@ -2,11 +2,11 @@ Project folder: /Users/stephenmalinowski/ClaudeProjects/Eudora
 
 # Handoff: Eudora — 2026aug05 (2)
 
-**Supersedes `Eudora_handoff_2026aug05-1.md`**, written earlier the same day. Its
-"Next steps — the sidebar, three independent problems" section is **entirely
-done** — all three, in its own suggested order — so nothing in it applies any
-more except the standing project facts, which are repeated below. That file can
-go to `handoffs/archive/`.
+**Supersedes `Eudora_handoff_2026aug05-1.md`**, written earlier the same day and
+already in `handoffs/archive/`. Its "Next steps — the sidebar, three independent
+problems" section is **entirely done** — all three, in its own suggested order — so
+nothing in it applies any more except the standing project facts, which are
+repeated below.
 
 ---
 
@@ -49,7 +49,8 @@ today's commit staged explicit paths, not `-A`, so it didn't sweep them in.
 
 ## Completed this session
 
-All three built and confirmed by Stephen.
+Six changes, every one built and confirmed by Stephen. The three sidebar items the
+previous handoff listed as next steps, then three more that came out of use.
 
 - **Sidebar expansion persists.** New `SidebarExpansion` in `EudoraStore` (a Set
   of open folder ids, `Codable` as a *sorted* array so identical state encodes
@@ -80,24 +81,24 @@ confirmation anchor their **action button** on the pointer; New Mailbox, Rename 
 the composer's "Correct … to…" prompt anchor their **text field**, because those
 are type-and-Return dialogs whose button is never clicked.
 
-Also in the same pass: **Delete PERMANENTLY and Add to BLACKLIST now have the
-same gap between them** as the one above them. Different reasoning from the first
-gap, which is distance from the most-used action — this is distance between two
-adjacent shouting items that do entirely different things, one destroying the
-message and the other replying to the sender on Stephen's behalf *and then*
-destroying it. Built inside the conditional that adds the blacklist item, so the
-gap arrives with the item it protects. See `MessageContextMenu`, and note that
-`addGap` interleaves disabled spacer rows because consecutive separators coalesce.
-
-Built and confirmed. Note for a future session: adding a file under
-`EudoraApp/Sources` needs `xcodegen generate` before it will build.
-
 Three things in it cost a build each and are all recorded in the file's header
 comment: setting the frame before `runModal` does nothing (`NSAlert` positions its
 panel when shown); a queued main-queue block also runs too early; and the offset
 must be *read* from the anchor view rather than computed, because the window frame
 carries shadow margin on top of `NSAlert`'s unpublished padding. It is also
 deliberately not `@MainActor` — annotating it makes both hooks errors on Swift 5.7.
+
+Also in the same pass: **Delete PERMANENTLY and Add to BLACKLIST now have the same
+gap between them** as the one above them. Different reasoning from the first gap,
+which is distance from the most-used action — this is distance between two adjacent
+shouting items that do entirely different things, one destroying the message and
+the other replying to the sender on Stephen's behalf *and then* destroying it.
+Built inside the conditional that adds the blacklist item, so the gap arrives with
+the item it protects. See `MessageContextMenu`, and note that `addGap` interleaves
+disabled spacer rows because consecutive separators coalesce into one line.
+
+One process note worth carrying: adding a file under `EudoraApp/Sources` needs
+`xcodegen generate` before it will build, and this session forgot it once.
 
 ## What was learned, so it isn't re-derived
 
