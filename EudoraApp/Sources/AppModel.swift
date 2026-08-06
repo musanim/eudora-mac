@@ -8,6 +8,116 @@ import EudoraStore
 import EudoraSearch
 import EudoraNet
 
+/// Runs an `NSAlert` centred on the pointer instead of in the middle of the
+/// screen.
+///
+/// **Setting the frame before running does nothing** — measured 2026aug05, first
+/// attempt: `alert.layout()`, `setFrameOrigin`, then run. The alert appeared
+/// dead centre exactly as before. `NSAlert` positions its own panel when the
+/// panel is *shown*, which is after any frame we set, so the assignment is
+/// simply overwritten. That also retired the first version's use of
+/// `NSApp.runModal(for:)`, which had been there only to bypass a centring it
+/// turned out not to bypass; this is back to the documented `alert.runModal()`,
+/// which also closes the panel for us.
+///
+/// **A queued main-queue block wasn't enough either** — measured, second attempt.
+/// The panel still landed in AppKit's default spot: horizontally centred on the
+/// display, about 30% down. The block does run during the modal session, but
+/// evidently before the panel is displayed, so `NSAlert`'s own positioning still
+/// came last. What worked was repositioning on `didBecomeKeyNotification`, which
+/// fires after the panel is on screen and therefore after that.
+///
+/// The pointer is sampled **now**, before the loop, not inside the block: by the
+/// time the block runs the hand may have moved, and the whole point is where the
+/// hand was when it chose the menu item.
+///
+/// Anchored by its **lower-right corner** at the pointer, so the panel opens up
+/// and to the left and its buttons — which AppKit puts at the bottom right — land
+/// where the hand already is. Stephen's call, and the right one for a dialog
+/// reached from a right-click: nothing else in the panel needs to be near the
+/// pointer, and the buttons are the only thing you came here to click.
+///
+/// It does mean the *destructive* button sits nearest, since the first button
+/// added is the rightmost. An earlier version centred on the pointer to keep some
+/// distance from it for exactly that reason. What makes the trade sound is that
+/// the danger is handled where it should be rather than by geometry: the delete
+/// button is deliberately not the default, and Return cancels (see
+/// `deletePermanentlySelected`). A mis-aimed click is a miss, not a deletion.
+///
+/// Not hidden and un-hidden around the move, which would avoid any flash of the
+/// centred position. That was considered and rejected as the wrong risk to take
+/// first: if the queued block ever failed to run, an `alphaValue` of 0 would
+/// leave an invisible modal dialog and a hung-looking app, where the worst this
+/// version can do is show the alert somewhere unhelpful. If a flash turns out to
+/// be visible, the fix is that trick, and by then the block will be known to run.
+///
+/// Lives here rather than in its own file only to keep `xcodegen generate` out of
+/// the loop for a small helper. If a second caller appears — the blacklist
+/// confirmation and the two New Mailbox/Folder prompts are the candidates — it
+/// should move.
+enum PointerAlert {
+    /// Off, and intact. It is what would say **which of the two hooks below
+    /// actually does the work** — that was never captured, because the build that
+    /// added the trace also fixed the behaviour and the question stopped being
+    /// urgent. So both hooks are kept deliberately rather than out of neglect:
+    /// they are idempotent, one of them is very likely redundant, and one run with
+    /// this on would settle which to delete.
+    static let traceEnabled = false
+
+    static func runModal(_ alert: NSAlert) -> NSApplication.ModalResponse {
+        let pointer = NSEvent.mouseLocation
+        let window = alert.window
+
+        // Hook 1: the main queue, as before. Kept because if this is what runs
+        // too early, that is worth seeing rather than assuming.
+        DispatchQueue.main.async {
+            place(window, near: pointer, via: "queued")
+        }
+
+        // Hook 2: after the panel is key, which is after it has been displayed and
+        // therefore after `NSAlert` has positioned it. This is the one expected to
+        // stick.
+        let token = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
+        ) { _ in
+            place(window, near: pointer, via: "didBecomeKey")
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+
+        return alert.runModal()
+    }
+
+    private static func place(_ window: NSWindow, near pointer: NSPoint, via: String) {
+        let was = window.frame.origin
+        let target = origin(for: window.frame.size, near: pointer)
+        window.setFrameOrigin(target)
+        guard traceEnabled else { return }
+        // `isVisible` is the discriminator: a hook that fires before the panel is
+        // on screen is one whose frame `NSAlert` is about to overwrite.
+        print("[alertpos] \(via)  visible \(window.isVisible)"
+              + "  was \(was)  asked \(target)  now \(window.frame.origin)")
+    }
+
+    /// Origin that puts a panel's **lower-right corner** at `pointer`, clamped to
+    /// the screen the pointer is on so a right-click near an edge — or on a second
+    /// display — can't put a button where it cannot be clicked. `visibleFrame`
+    /// rather than `frame`: it excludes the menu bar and the Dock.
+    ///
+    /// An `NSWindow`'s origin is its **bottom-left** and screen y grows upward, so
+    /// the right edge at `pointer.x` means `x - width`, and the bottom edge at
+    /// `pointer.y` means `y` unchanged. Neither is a half-size offset any more; if
+    /// this ever looks centred again, that is the line that regressed.
+    private static func origin(for size: NSSize, near pointer: NSPoint) -> NSPoint {
+        var origin = NSPoint(x: pointer.x - size.width, y: pointer.y)
+        let screen = NSScreen.screens.first { $0.frame.contains(pointer) } ?? NSScreen.main
+        if let visible = screen?.visibleFrame {
+            origin.x = min(max(origin.x, visible.minX), max(visible.minX, visible.maxX - size.width))
+            origin.y = min(max(origin.y, visible.minY), max(visible.minY, visible.maxY - size.height))
+        }
+        return origin
+    }
+}
+
 // MARK: - UI-facing value types
 //
 // These wrap the format-agnostic types EudoraStore already vends (MailboxNode,
@@ -4657,7 +4767,11 @@ final class AppModel: ObservableObject {
         let cancel = alert.addButton(withTitle: "Cancel")
         yes.keyEquivalent = ""
         cancel.keyEquivalent = "\r"
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        // At the pointer, not the middle of the screen — this is reached from a
+        // right-click on a row, and the hand is already there. Same reasoning as
+        // the context menu's centring (see `MessageContextMenu`): the axis that
+        // matters is how far the eye and the hand have to travel.
+        guard PointerAlert.runModal(alert) == .alertFirstButtonReturn else { return }
 
         do {
             try MailboxMutator.removeMany(base: sel.item.base, indices: sel.indices)
