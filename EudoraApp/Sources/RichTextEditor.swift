@@ -454,7 +454,13 @@ final class RichTextEditorController: NSObject, ObservableObject, NSTextViewDele
         alert.addButton(withTitle: "Add")
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = field
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        // At the pointer, anchored on the field. This one is reached by
+        // right-clicking a word in the composer ("Correct “x” to…"), so the same
+        // argument applies as for the New Mailbox and Rename prompts: the hand is
+        // at the word, and the gesture is type-and-Return rather than a click.
+        guard PointerAlert.runModal(alert, anchor: field) == .alertFirstButtonReturn else {
+            return
+        }
         saveCorrection(word, field.stringValue)
     }
 

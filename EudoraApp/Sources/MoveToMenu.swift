@@ -347,7 +347,13 @@ enum NewMailboxDialog {
         alert.accessoryView = accessory
         alert.window.initialFirstResponder = field
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        // At the pointer, anchored on the **field** rather than the default action
+        // button. This is a type-and-Return dialog: "Create" is the default and
+        // first responder is the field, so the button is never clicked, and aiming
+        // at it would put the one control the hand doesn't want under the cursor.
+        guard PointerAlert.runModal(alert, anchor: field) == .alertFirstButtonReturn else {
+            return nil
+        }
         return Response(name: field.stringValue, isFolder: checkbox.state == .on)
     }
 }
@@ -373,7 +379,11 @@ enum RenameDialog {
         alert.window.initialFirstResponder = field
         field.selectText(nil)   // whole name selected: typing replaces it
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        // Anchored on the field, for the reason given in `NewMailboxDialog`: type
+        // and Return, so the button is never clicked.
+        guard PointerAlert.runModal(alert, anchor: field) == .alertFirstButtonReturn else {
+            return nil
+        }
         return field.stringValue
     }
 }

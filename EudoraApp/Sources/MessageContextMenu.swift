@@ -479,11 +479,27 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         // gates behind its own confirmation as well. It appears conditionally —
         // hence built inside the `if` — but the gap above is unconditional now
         // that Delete Permanently always follows it.
+        //
+        // **The two irreversible items are separated from each other, too**, by
+        // the same gap. Distance from Delete was never the whole problem: these
+        // two are adjacent, both shouting, and they do entirely different things —
+        // one destroys the message, the other replies to the sender on Stephen's
+        // behalf and *then* destroys it. Landing on the wrong one of the two is a
+        // worse outcome than landing on either from Delete, because a
+        // mis-blacklisting has already left the building by the time you notice.
+        // So the second gap is the same size as the first rather than a token
+        // one-row nod: the point is dead space wide enough that a slightly-off
+        // click cannot cross it.
         addGap(blankRows: 2)
         addShouting(n == 1 ? "Delete " : "Delete \(n) ", "PERMANENTLY",
                     #selector(deletePermanently))
 
         if n == 1, let id = clickedPrimary, !model.isSentMessage(id) {
+            // Inside the `if`, so the gap arrives with the item it protects.
+            // Unconditionally placed, this would leave a menu ending in two blank
+            // rows and a trailing rule whenever the item is absent — which is
+            // every multi-selection and every message Stephen sent.
+            addGap(blankRows: 2)
             addShouting("Add to ", "BLACKLIST", #selector(blacklist))
         }
     }
@@ -588,7 +604,9 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             let cancel = alert.addButton(withTitle: "Cancel")
             yes.keyEquivalent = ""          // Return must not fire the destructive action
             cancel.keyEquivalent = "\r"     // Return / Esc both cancel
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            // At the pointer: this is reached by right-clicking a row, so the hand
+            // is already there. `PointerAlert` centres the action button on it.
+            guard PointerAlert.runModal(alert) == .alertFirstButtonReturn else { return }
             model.blacklistSelectedSender()
         }
     }
