@@ -91,6 +91,15 @@ struct ViewState: Codable {
     /// this blob would one day carry. This is that field.
     var sidebarExpansion = SidebarExpansion()
 
+    /// The mailboxes mail has most recently been filed into — behind the
+    /// sidebar's Recents row. See `RecentMailboxes`, which owns the rules.
+    ///
+    /// Here rather than in a UserDefaults key of its own (where
+    /// `recentRecipients` lives) because its entries are `MailboxItem.ID`s, and
+    /// an id is only meaningful inside the tree it came from. Per Eudora folder
+    /// is the same reasoning that already keys selection and sort.
+    var recentMailboxes = RecentMailboxes()
+
     init() {}
 
     init(from decoder: Decoder) throws {
@@ -107,6 +116,9 @@ struct ViewState: Codable {
         sidebarExpansion =
             try c.decodeIfPresent(SidebarExpansion.self, forKey: .sidebarExpansion)
             ?? SidebarExpansion()
+        recentMailboxes =
+            try c.decodeIfPresent(RecentMailboxes.self, forKey: .recentMailboxes)
+            ?? RecentMailboxes()
     }
 }
 

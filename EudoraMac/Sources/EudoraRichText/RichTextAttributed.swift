@@ -1,5 +1,8 @@
 import AppKit
 import EudoraStore
+// For `objc_getAssociatedObject` / `objc_setAssociatedObject`, which memoise the
+// image derived from an attachment AppKit built.
+import ObjectiveC
 
 /// The composer's default face and size: what a run with no override renders as,
 /// and the baseline every attributed run is measured against when read back.
@@ -24,6 +27,72 @@ public struct RichTextDefaults: Equatable, Sendable {
     public static let arial12 = RichTextDefaults(family: "Arial", size: 12)
 }
 
+/// An embedded image inside the editor's attributed string.
+///
+/// A subclass rather than a plain `NSTextAttachment` so the image's identity
+/// travels with it. Reading the editor back is not a rare event — it happens on
+/// every keystroke, through `readBack` — and recomputing a content hash from the
+/// bytes each time would put a SHA-256 of a multi-megabyte screenshot on the
+/// typing path. Carrying the already-hashed `RichTextImage` makes the read a
+/// pointer copy.
+///
+/// It also keeps the round trip exact. If the identity were re-derived, a
+/// re-derivation that differed in any way would make `ComposeView.isDirty` true
+/// forever and the composer would prompt to save a draft nobody had edited.
+public final class RichTextImageAttachment: NSTextAttachment {
+    /// Not named `image`: `NSTextAttachment` already has an `image` of its own,
+    /// which is the `NSImage` it draws.
+    public let source: RichTextImage
+
+    public init(_ source: RichTextImage) {
+        self.source = source
+        // `ofType` wants a UTI, not a MIME type. It doesn't affect drawing —
+        // `image` below settles that — but it is what gets written into any
+        // RTFD this attachment is archived into, which is how an internal
+        // copy-paste travels.
+        super.init(data: source.data, ofType: Self.uti(forMIMEType: source.mimeType))
+        // What the text view actually draws. `contents`/`fileType` alone are a
+        // TextKit 2 route; the composer is a TextKit 1 `NSTextView`, which wants
+        // this. A payload AppKit can't decode leaves the cell empty rather than
+        // throwing, which is the right failure for a paste of something odd.
+        self.image = NSImage(data: source.data)
+    }
+
+    /// Unarchiving produces a plain `NSTextAttachment`, not this. That is not a
+    /// gap: `RichTextAttributed.richText` recovers an image from any attachment
+    /// carrying bytes, re-hashing to recover the identity, so a selection copied
+    /// and pasted within the draft — which round-trips through RTFD on the
+    /// pasteboard and loses the subclass — still keeps its picture.
+    required init?(coder: NSCoder) { return nil }
+
+    /// The UTI for an image MIME type, for `NSTextAttachment`'s `ofType`.
+    /// Unknown types fall back to `public.data`, which is honest rather than
+    /// wrong — the bytes are still there and `source` still has the real type.
+    static func uti(forMIMEType mime: String) -> String {
+        switch mime.lowercased() {
+        case "image/png":  return "public.png"
+        case "image/jpeg": return "public.jpeg"
+        case "image/gif":  return "com.compuserve.gif"
+        case "image/tiff": return "public.tiff"
+        case "image/heic": return "public.heic"
+        case "image/webp": return "org.webmproject.webp"
+        default:           return "public.data"
+        }
+    }
+}
+
+/// Associated-object storage for `embeddedImage(of:)`'s memo. A class box
+/// because an associated object must be an object, and the value is optional —
+/// "we looked and there was no image" is worth caching too.
+private final class RichTextImageBox {
+    let image: RichTextImage?
+    init(_ image: RichTextImage?) { self.image = image }
+}
+
+/// Plain `var`, not `nonisolated(unsafe)`: that spelling is Swift 5.10 and this
+/// target is 5.7. Only its address is ever used, and only from the main thread.
+private var derivedImageKey: UInt8 = 0
+
 /// `RichText` ⇄ `NSAttributedString`, for the composer's `NSTextView`.
 ///
 /// **AppKit lives here, not in `EudoraStore`.** The store target is deliberately
@@ -41,8 +110,13 @@ public enum RichTextAttributed {
     public static func attributed(_ rich: RichText, defaults: RichTextDefaults) -> NSAttributedString {
         let out = NSMutableAttributedString()
         for run in rich.runs {
-            out.append(NSAttributedString(string: run.text,
-                                          attributes: attributes(for: run.style, defaults: defaults)))
+            if let image = run.image {
+                out.append(NSAttributedString(attachment: RichTextImageAttachment(image)))
+            } else {
+                out.append(NSAttributedString(string: run.text,
+                                              attributes: attributes(for: run.style,
+                                                                     defaults: defaults)))
+            }
         }
         return out
     }
@@ -104,9 +178,97 @@ public enum RichTextAttributed {
         attributed.enumerateAttributes(in: full, options: []) { attrs, range, _ in
             let text = (attributed.string as NSString).substring(with: range)
             guard !text.isEmpty else { return }
+            // An attachment run is one object-replacement character carrying an
+            // `.attachment`; it has no text to style, so it is taken whole and
+            // the style pass is skipped.
+            if let attachment = attrs[.attachment] as? NSTextAttachment,
+               let image = embeddedImage(of: attachment) {
+                runs.append(RichTextRun(image: image))
+                return
+            }
             runs.append(RichTextRun(text, style: style(from: attrs, defaults: defaults)))
         }
         return RichText(runs: runs)
+    }
+
+    /// The image an attachment carries, however it got there.
+    ///
+    /// The fast path is our own subclass, which already holds a hashed
+    /// `RichTextImage`. The slow path re-derives one from the bytes, and exists
+    /// for attachments AppKit made rather than us: an internal copy-paste goes
+    /// through RTFD on the pasteboard and comes back as a plain
+    /// `NSTextAttachment`. The content hash means the recovered image is *the
+    /// same image*, so it merges with the original rather than travelling twice.
+    ///
+    /// **The slow path is memoised, and has to be.** A plain attachment doesn't
+    /// go away after the paste — it stays in the text storage, and `readBack`
+    /// converts the whole storage on every keystroke. Without the cache, every
+    /// character typed after an internal image paste would re-run SHA-256 over a
+    /// multi-megabyte screenshot and materialise its bytes again. The cache is
+    /// keyed on the attachment object and held by it, so it dies with it.
+    ///
+    /// Returns nil for an attachment with no usable bytes, which drops it. A
+    /// file attached by paperclip is not represented here at all; those live on
+    /// `ComposeDraft.attachments` and never enter the text storage.
+    static func embeddedImage(of attachment: NSTextAttachment) -> RichTextImage? {
+        if let ours = attachment as? RichTextImageAttachment { return ours.source }
+        if let cached = objc_getAssociatedObject(attachment, &derivedImageKey)
+            as? RichTextImageBox { return cached.image }
+
+        let derived = deriveImage(of: attachment)
+        objc_setAssociatedObject(attachment, &derivedImageKey,
+                                 RichTextImageBox(derived), .OBJC_ASSOCIATION_RETAIN)
+        return derived
+    }
+
+    /// The uncached derivation. Split out so the memo above reads as one thing.
+    private static func deriveImage(of attachment: NSTextAttachment) -> RichTextImage? {
+        let wrapper = attachment.fileWrapper
+        guard let data = attachment.contents ?? wrapper?.regularFileContents,
+              !data.isEmpty
+        else { return nil }
+
+        // Prefer a declared type; fall back to sniffing the first bytes, since a
+        // pasteboard-built attachment often names only a filename extension.
+        let type = attachment.fileType.flatMap(mimeType(forUTIOrExtension:))
+            ?? wrapper?.preferredFilename.flatMap { name in
+                name.split(separator: ".").last.map { mimeType(forUTIOrExtension: String($0)) } ?? nil
+            }
+            ?? sniffedImageType(data)
+        guard let type else { return nil }
+        return RichTextImage(mimeType: type, data: data)
+    }
+
+    /// A UTI or a bare filename extension as an image MIME type, or nil when it
+    /// isn't an image this should embed.
+    public static func mimeType(forUTIOrExtension raw: String) -> String? {
+        let s = raw.lowercased()
+        switch s {
+        case "public.png", "png":                     return "image/png"
+        case "public.jpeg", "jpeg", "jpg":            return "image/jpeg"
+        case "com.compuserve.gif", "gif":             return "image/gif"
+        case "public.tiff", "tiff", "tif":            return "image/tiff"
+        case "org.webmproject.webp", "webp":          return "image/webp"
+        case "public.heic", "heic":                   return "image/heic"
+        default:
+            return s.hasPrefix("image/") ? s : nil
+        }
+    }
+
+    /// The image type of a byte stream, from its magic number.
+    ///
+    /// Only the formats a Mac clipboard actually produces. Anything else returns
+    /// nil and the attachment is dropped rather than sent with a type that would
+    /// make a reader show a broken image.
+    public static func sniffedImageType(_ data: Data) -> String? {
+        let b = [UInt8](data.prefix(12))
+        if b.count >= 8, b[0] == 0x89, b[1] == 0x50, b[2] == 0x4E, b[3] == 0x47 { return "image/png" }
+        if b.count >= 3, b[0] == 0xFF, b[1] == 0xD8, b[2] == 0xFF { return "image/jpeg" }
+        if b.count >= 6, b[0] == 0x47, b[1] == 0x49, b[2] == 0x46 { return "image/gif" }
+        if b.count >= 4, (b[0] == 0x49 && b[1] == 0x49) || (b[0] == 0x4D && b[1] == 0x4D) {
+            return "image/tiff"
+        }
+        return nil
     }
 
     /// One attribute run's style, expressed relative to `defaults`.

@@ -666,6 +666,10 @@ struct ComposeView: View {
             to: toList, cc: model.splitAddresses(cc), bcc: model.splitAddresses(bcc),
             subject: subject, body: content.plainText, htmlBody: html,
             attachments: attachments,
+            // Only alongside HTML, and `content.isStyled` is already true
+            // whenever there is an image — so this is never set without the
+            // `htmlBody` the `cid:` references live in.
+            inlineImages: content.images,
             inReplyTo: seed.inReplyTo, references: seed.references)
 
         sending = true

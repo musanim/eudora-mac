@@ -44,6 +44,17 @@ public struct OutgoingMessage: Sendable {
     /// and stays authoritative; the HTML is the extra.
     public var htmlBody: String?
 
+    /// Images embedded *in* the body, as distinct from files attached beside it.
+    ///
+    /// Each becomes a part of a `multipart/related` carrying a `Content-ID` that
+    /// the HTML refers to as `cid:`. Set only alongside `htmlBody`, and from
+    /// `RichText.images` — which already deduplicates, so the same picture
+    /// pasted twice is one part referred to twice.
+    ///
+    /// Empty is the same guarantee `htmlBody`'s nil is: a message with no
+    /// embedded image assembles to exactly the bytes it did before this existed.
+    public var inlineImages: [RichTextImage]
+
     public var inReplyTo: String?     // Message-ID being replied to (with <>)
     public var references: [String]   // References chain (each with <>)
 
@@ -51,6 +62,7 @@ public struct OutgoingMessage: Sendable {
                 to: [String], cc: [String] = [], bcc: [String] = [],
                 subject: String, body: String, htmlBody: String? = nil,
                 attachments: [Attachment] = [],
+                inlineImages: [RichTextImage] = [],
                 inReplyTo: String? = nil, references: [String] = []) {
         self.fromName = fromName
         self.fromAddress = fromAddress
@@ -61,6 +73,7 @@ public struct OutgoingMessage: Sendable {
         self.body = body
         self.htmlBody = htmlBody
         self.attachments = attachments
+        self.inlineImages = inlineImages
         self.inReplyTo = inReplyTo
         self.references = references
     }
@@ -134,7 +147,15 @@ public struct OutgoingMessage: Sendable {
             headers.append("Content-Type: multipart/mixed; boundary=\"\(mixed)\"")
 
             let bodyPart: String
-            if let html = htmlBody, !html.isEmpty {
+            if let html = htmlBody, !html.isEmpty, !inlineImages.isEmpty {
+                // Embedded images as well as attached files: the related group
+                // (body plus the pictures the body points at) is one part of the
+                // mixed wrapper, and the attachments are its siblings. Nesting it
+                // the other way round would put the images at the same level as
+                // the attachments, and a reader would show each of them twice —
+                // once inline and once as a paperclip.
+                bodyPart = Self.relatedEntity(plain: body, html: html, images: inlineImages)
+            } else if let html = htmlBody, !html.isEmpty {
                 let alt = Self.generatedBoundary()
                 bodyPart = "Content-Type: multipart/alternative; boundary=\"\(alt)\"" + CRLF + CRLF
                     + "--\(alt)" + CRLF + Self.textEntity(body, subtype: "plain") + CRLF
@@ -150,6 +171,16 @@ public struct OutgoingMessage: Sendable {
             }
             parts += "--\(mixed)--" + CRLF
             bodyText = parts
+        } else if let html = htmlBody, !html.isEmpty, !inlineImages.isEmpty {
+            // Styled with embedded images and nothing attached: the related
+            // group is the whole message, so its Content-Type is the top-level
+            // one. `relatedEntity` builds headers-plus-content as a nested part
+            // would need; here the headers are hoisted and only the content
+            // follows the blank line, which is the same bytes either way.
+            let mark = boundary ?? Self.generatedBoundary()
+            headers.append(Self.relatedContentType(boundary: mark))
+            bodyText = Self.relatedParts(plain: body, html: html,
+                                         images: inlineImages, boundary: mark) + CRLF
         } else if let html = htmlBody, !html.isEmpty {
             // Styled: plain text first, HTML second. Order is not cosmetic —
             // RFC 2046 §5.1.4 has the *last* alternative be the richest, and
@@ -215,6 +246,68 @@ public struct OutgoingMessage: Sendable {
         out += "Content-Transfer-Encoding: base64" + CRLF
         out += "Content-Disposition: attachment; filename=\"\(name)\"" + CRLF + CRLF
         out += att.data.base64EncodedString(
+            options: [.lineLength76Characters, .endLineWithCarriageReturn, .endLineWithLineFeed])
+        return out
+    }
+
+    /// The `Content-Type` line for a `multipart/related` group.
+    ///
+    /// `type="multipart/alternative"` names the root part — the one a reader
+    /// should display, with everything else in the group there only to be
+    /// referred to. Readers that honour it stop treating the images as content
+    /// in their own right.
+    static func relatedContentType(boundary: String) -> String {
+        "Content-Type: multipart/related; type=\"multipart/alternative\"; boundary=\"\(boundary)\""
+    }
+
+    /// The delimited children of a `multipart/related`: the alternative pair
+    /// first, then one part per embedded image. No trailing line ending, as
+    /// `textEntity` and `attachmentEntity` also omit it.
+    static func relatedParts(plain: String, html: String,
+                             images: [RichTextImage], boundary: String) -> String {
+        let CRLF = "\r\n"
+        let alt = generatedBoundary()
+        var out = "--\(boundary)" + CRLF
+            + "Content-Type: multipart/alternative; boundary=\"\(alt)\"" + CRLF + CRLF
+            + "--\(alt)" + CRLF + textEntity(plain, subtype: "plain") + CRLF
+            + "--\(alt)" + CRLF + textEntity(html, subtype: "html") + CRLF
+            + "--\(alt)--" + CRLF
+        for image in images {
+            out += "--\(boundary)" + CRLF + inlineImageEntity(image) + CRLF
+        }
+        out += "--\(boundary)--"
+        return out
+    }
+
+    /// A whole `multipart/related` entity — headers, blank line, children — for
+    /// nesting inside a `multipart/mixed`.
+    static func relatedEntity(plain: String, html: String, images: [RichTextImage]) -> String {
+        let CRLF = "\r\n"
+        let mark = generatedBoundary()
+        return relatedContentType(boundary: mark) + CRLF + CRLF
+            + relatedParts(plain: plain, html: html, images: images, boundary: mark)
+    }
+
+    /// One embedded image part, base64, carrying the `Content-ID` the HTML's
+    /// `cid:` refers to.
+    ///
+    /// **Deliberately carries no `name=` or `filename=`.** `MIMEPart.isAttachment`
+    /// answers true for *any* part with a filename, whatever its disposition, so
+    /// naming this one would make the app treat its own embedded image as an
+    /// attached file — and reopening a draft would move the picture out of the
+    /// body and onto the paperclip row, where saving it again would then send it
+    /// both ways. Leaving the name off makes `isAttachment` false and the whole
+    /// round trip correct without touching a predicate that received mail also
+    /// depends on. The cost is that a recipient saving the image out is offered
+    /// a name their client invents; `suggestedFilename` exists for the day that
+    /// matters enough to widen `isAttachment` instead.
+    static func inlineImageEntity(_ image: RichTextImage) -> String {
+        let CRLF = "\r\n"
+        var out = "Content-Type: \(image.mimeType)" + CRLF
+        out += "Content-Transfer-Encoding: base64" + CRLF
+        out += "Content-ID: <\(image.id)>" + CRLF
+        out += "Content-Disposition: inline" + CRLF + CRLF
+        out += image.data.base64EncodedString(
             options: [.lineLength76Characters, .endLineWithCarriageReturn, .endLineWithLineFeed])
         return out
     }

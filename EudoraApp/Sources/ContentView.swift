@@ -360,7 +360,9 @@ struct SidebarView: View {
                             onRename: { model.renameTreeItem($0) },
                             onMoveToGroup: { model.moveIntoGroup($0, into: $1) },
                             onSortSiblings: { model.sortSiblingsAlphabetically($0) },
-                            onSortContents: { model.sortFolderContents($0) })
+                            onSortContents: { model.sortFolderContents($0) },
+                            recentFilings: { model.recentFilings() },
+                            onPickRecent: { model.openRecent($0) })
                     .equatable()
             }
         }
@@ -430,6 +432,13 @@ struct MailboxTree: View, Equatable {
     let onSortSiblings: (MailboxItem.ID) -> Void
     /// Sort what's inside this folder. Folders only.
     let onSortContents: (MailboxItem.ID) -> Void
+
+    /// The Recents list, read when its menu opens rather than passed as a value —
+    /// so filing a message doesn't have to re-render the sidebar for the next
+    /// open of the menu to be current. Excluded from `==` for that reason.
+    let recentFilings: () -> [(id: MailboxItem.ID, display: String)]
+    /// Open a mailbox picked from Recents. See `AppModel.openRecent`.
+    let onPickRecent: (MailboxItem.ID) -> Void
 
     static func == (a: MailboxTree, b: MailboxTree) -> Bool {
         a.treeVersion == b.treeVersion && a.selected == b.selected
@@ -532,9 +541,21 @@ struct MailboxTree: View, Equatable {
                 // have no children, so they're a flat ForEach; a divider then sets
                 // them off from the user's own mailboxes and folders below.
                 ForEach(systemMailboxes) { item in row(for: item) }
-                if !systemMailboxes.isEmpty && !otherMailboxes.isEmpty {
-                    Divider()
-                }
+                // Recents is its own set, between the system mailboxes and the
+                // user's own: a divider above it as well as below. Stephen's
+                // reason, and the one to keep in mind before moving it — unlike
+                // everything else in the sidebar, it is not a mailbox. Sharing a
+                // set with rows that are would say it was.
+                //
+                // Placed after the whole system block rather than after the Trash
+                // row, because descmap order isn't guaranteed to put Trash last
+                // (see `MailboxTreeMutator.moveEntry`) — the block is hoisted here
+                // whatever order the file is in, so this is the only stable way to
+                // say "below Trash". Inside the `Group`, so it inherits the 21 pt
+                // row height along with everything else.
+                RecentsRow(entries: recentFilings, onPick: onPickRecent,
+                           ruleAbove: !systemMailboxes.isEmpty,
+                           ruleBelow: !otherMailboxes.isEmpty)
                 // `DisclosureGroup`s bound to `expandedIDs`, not an
                 // `OutlineGroup`. The swap buys exactly one thing: expansion this
                 // app can read and write. `OutlineGroup` keeps it inside
@@ -1492,6 +1513,92 @@ enum SidebarOutlineFinder {
 /// left.
 enum SidebarRowMetrics {
     static let rowHeight: CGFloat = 21
+
+    /// The rule between sets of sidebar rows.
+    ///
+    /// Deliberately darker than `NSColor.separatorColor`, which is what the
+    /// `List` already draws *between* rows. The two lines have different jobs —
+    /// one parts neighbours, one parts groups — and at the same weight the set
+    /// break was the least visible line on screen. `Color.primary` rather than a
+    /// fixed grey so it inverts with the appearance.
+    static let setDividerColor = Color.primary.opacity(0.45)
+    static let setDividerThickness: CGFloat = 1
+
+    /// How far the set rules reach past the row's content on each side, to cross
+    /// the list's own row inset and meet the window edges. Generous on purpose —
+    /// an overlay wider than it needs to be is invisible if the row clips it and
+    /// correct if it doesn't.
+    static let setRuleOverhang: CGFloat = 40
+
+    /// How far each set rule is nudged out of the Recents row, away from its
+    /// label.
+    ///
+    /// The rules hang on the row's edges, and a row edge is not the middle of the
+    /// gap between two rows' text: the Recents label fills its row, while a
+    /// mailbox row leaves a few points under its text. So a rule drawn exactly on
+    /// the boundary is flush against "Recents" and clear of "Trash". This offset
+    /// centres it in the space instead — and it moves only the line, so the text
+    /// spacing Stephen confirmed as correct doesn't change.
+    static let setRuleOffset: CGFloat = 3
+
+    /// Breathing room above and below the Recents label, which is what sets its
+    /// distance from the two rules.
+    ///
+    /// The rules hang on the row's edges, so padding the label pushes them away
+    /// from it without moving them relative to Trash and the first folder above
+    /// and below — a row grows downward from a fixed top edge. It does lengthen
+    /// the sidebar by twice this, which Stephen accepted for the clearance.
+    ///
+    /// This is the knob for "the rules crowd the word Recents"; `setRuleOffset`
+    /// is the one for "the rules aren't centred in the gap". They are easy to
+    /// confuse and they move different things.
+    static let recentsRowPadding: CGFloat = 2
+}
+
+/// The rule between sets in the sidebar: system mailboxes, Recents, and the
+/// user's own.
+///
+/// **Drawn on the edges of the Recents row, not as a row of its own — and that
+/// is the whole point.** Three attempts, worth recording so the next one starts
+/// from the end:
+///
+/// 1. `Divider()`. A `Divider` in a `List` is a row, so the list drew its own
+///    separator above *and* below it: three rules stacked where one was meant,
+///    and the only one that read as a set break was the faintest.
+/// 2. A drawn `Rectangle` row with `.listRowSeparator(.hidden)` and
+///    `.listRowInsets(EdgeInsets())`. Correct line, correct width, but ~20 pt of
+///    air around it — because it was still a row, and a row cannot be shorter
+///    than `defaultMinListRowHeight`, which the sidebar pins at 21 for the
+///    new-mail badge.
+/// 3. Writing `defaultMinListRowHeight` again on that one row, nested inside the
+///    one `MailboxTree` applies to its whole content. **Measured: no change.**
+///    So the key is read once for the list, not per row — one more entry for the
+///    list in `SidebarRowMetrics` of things that look like they should work here
+///    and don't.
+///
+/// Which leaves: don't have a row. These are `overlay`s on `RecentsRow`, so they
+/// occupy no vertical space at all and the gap is just the two neighbouring rows'
+/// own padding — about half what a dedicated row cost, which is what Stephen
+/// asked for. `RecentsRow` also hides its own list separators, or the hairlines
+/// would sit a point away from these.
+///
+/// The negative horizontal padding is what takes them full width: an overlay is
+/// bounded by the row's content, which the list insets. **If the rules come out
+/// short of the window edges**, the row is clipping the overlay and the answer is
+/// to zero `RecentsRow`'s `.listRowInsets` and re-add the same inset as padding
+/// on its `HStack` — which is only avoided here because guessing that inset wrong
+/// would misalign the Recents icon against In/Out/Trash, a worse fault than a
+/// short rule.
+///
+/// The within-set separators are untouched and should stay: they part rows that
+/// belong together, which is the one place a hairline reads correctly.
+struct SidebarSetRule: View {
+    var body: some View {
+        Rectangle()
+            .fill(SidebarRowMetrics.setDividerColor)
+            .frame(height: SidebarRowMetrics.setDividerThickness)
+            .padding(.horizontal, -SidebarRowMetrics.setRuleOverhang)
+    }
 }
 
 /// Traces the sidebar's disclosure state: every toggle, and every change to the

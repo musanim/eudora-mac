@@ -1131,6 +1131,14 @@ final class AppModel: ObservableObject {
     /// the reasoning in `loadListing` and `rememberScroll`.
     private var pendingMessageIsExplicitJump = false
 
+    /// Select the newest message once the mailbox now being listed has its rows.
+    ///
+    /// Separate from `pendingMessageID` because that carries an *index*, and
+    /// which index is newest cannot be known before the listing exists. Set only
+    /// by `openRecent`; consumed in `loadListing`'s completion alongside the
+    /// pending index, and mutually exclusive with it.
+    private var pendingSelectNewest = false
+
     /// Remembered selection for the open tree (see ViewState.swift). Held in
     /// memory and written on every selection change.
     private var viewState = ViewState()
@@ -1830,7 +1838,8 @@ final class AppModel: ObservableObject {
     ///   the same mailbox don't load twice — the second pass would find
     ///   `pendingMessageID` already consumed and clear the restored selection.
     func loadListing(force: Bool = false) {
-        guard force || listedMailboxID != selectedMailboxID || pendingMessageID != nil else {
+        guard force || listedMailboxID != selectedMailboxID || pendingMessageID != nil
+                || pendingSelectNewest else {
             return
         }
         PerfLog.mark("loadListing begins")
@@ -1849,8 +1858,10 @@ final class AppModel: ObservableObject {
 
         let pending = pendingMessageID
         let pendingIsJump = pendingMessageIsExplicitJump
+        let pendingNewest = pendingSelectNewest
         pendingMessageID = nil
         pendingMessageIsExplicitJump = false
+        pendingSelectNewest = false
         selectMessage(nil)
         // Clear immediately: the old mailbox's rows must not linger under the
         // new mailbox's name while the listing is built.
@@ -1860,6 +1871,10 @@ final class AppModel: ObservableObject {
         // listing is built off the main actor and lands later.
         rebuildRows { [weak self] in
             guard let self else { return }
+            // Where to centre the list when the row to select could only be
+            // identified after the rows existed — the Recents path. The pending
+            // *index* path below decides the same thing from `pendingIsJump`.
+            var newestPosition: Int?
             if let pending {
                 // The index may no longer exist — a restored selection can
                 // outlive the messages it pointed at (deleted, or a mailbox that
@@ -1878,6 +1893,16 @@ final class AppModel: ObservableObject {
                 } else {
                     self.selectMessage(nil)
                 }
+            } else if pendingNewest, let newest = Self.newestRowID(in: self.rows) {
+                // Same three steps the pending-index branch takes, for the same
+                // reasons: focus can only be asked for now the rows are real, and
+                // `loadMessage` is called directly because `onChange` won't fire
+                // when the newly selected index equals the previously selected
+                // one in another mailbox.
+                self.selectMessage(newest)
+                self.pendingListFocus = true
+                self.loadMessage()
+                newestPosition = self.rowPositionByID[newest]
             }
             self.rememberSelection()
 
@@ -1909,6 +1934,13 @@ final class AppModel: ObservableObject {
             // `pendingMessageID` too and must still restore the remembered
             // position rather than centre on it.
             if pendingIsJump, let pending, let pos = self.rowPositionByID[pending] {
+                self.pendingScrollTopRow = nil
+                self.revealCentered(row: pos)
+            } else if let pos = newestPosition {
+                // A Recents pick is an explicit jump too — the user named the
+                // mailbox and the message. Same treatment as a search hit: the
+                // remembered position describes where they last were, not what
+                // they just asked for.
                 self.pendingScrollTopRow = nil
                 self.revealCentered(row: pos)
             } else if let mailbox = self.selectedMailboxID, !self.rows.isEmpty,
@@ -3139,6 +3171,9 @@ final class AppModel: ObservableObject {
             body: draft.body,
             htmlBody: html,
             attachments: draft.attachments,
+            // The saved copy carries the pictures too, or reopening the draft
+            // would find `cid:` references pointing at parts that aren't there.
+            inlineImages: draft.content.images,
             inReplyTo: draft.inReplyTo,
             references: draft.references)
         // The draft's own ID, every time — that's what makes the record
@@ -4207,17 +4242,70 @@ final class AppModel: ObservableObject {
         // A styled draft that also carries attachments is multipart/mixed with the
         // alternative nested one level down — descend to it, so reopening such a
         // draft recovers its formatting instead of flattening to plain text.
+        // A draft with embedded images has a multipart/related in between, and
+        // one with both has all three: mixed ▸ related ▸ alternative.
         if part.contentType == "multipart/mixed",
-           let alt = part.children.first(where: { $0.contentType == "multipart/alternative" }) {
-            return styledBody(of: alt)
+           let inner = part.children.first(where: {
+               $0.contentType == "multipart/alternative" || $0.contentType == "multipart/related"
+           }) {
+            return styledBody(of: inner)
         }
+        // The images are siblings of the alternative, not inside it, so they are
+        // collected here — at the related level, the only place both are visible.
+        if part.contentType == "multipart/related" {
+            let images = embeddedImages(in: part)
+            guard let alt = part.children.first(where: {
+                $0.contentType == "multipart/alternative"
+            }) else { return nil }
+            return styledBody(of: alt, images: images)
+        }
+        return styledBody(of: part, images: [:])
+    }
+
+    /// The alternative's HTML as `RichText`, resolving `cid:` against `images`.
+    private static func styledBody(of part: MIMEPart,
+                                   images: [String: RichTextImage]) -> RichText? {
         guard part.contentType == "multipart/alternative" else { return nil }
         for p in part.walk() where !p.isMultipart && p.mainType == "text" && p.subType == "html" {
             let text = CharsetDecoder.smartDecode(p.decodedPayload(), declared: p.charset).text
-            let rich = RichTextHTML.parse(text)
+            let rich = RichTextHTML.parse(text) { src in
+                guard src.lowercased().hasPrefix("cid:") else { return nil }
+                return images[Self.normalizedCID(String(src.dropFirst(4)))]
+            }
             return rich.isStyled ? rich : nil
         }
         return nil
+    }
+
+    /// Every `Content-ID` part of a `multipart/related`, keyed by bare id.
+    ///
+    /// Keyed on the id with its angle brackets stripped, because that is the
+    /// form the HTML's `cid:` uses while the header carries `<…>`. Parts with no
+    /// Content-ID are skipped rather than guessed at — a `cid:` that matches
+    /// nothing drops the image, which shows as a gap, and is a better failure
+    /// than pairing the wrong picture with the wrong reference.
+    private static func embeddedImages(in related: MIMEPart) -> [String: RichTextImage] {
+        var out: [String: RichTextImage] = [:]
+        for p in related.walk() where !p.isMultipart && p.mainType == "image" {
+            guard let raw = p.header("Content-ID") else { continue }
+            let id = normalizedCID(raw)
+            guard !id.isEmpty, out[id] == nil else { continue }
+            let data = p.decodedPayload()
+            guard !data.isEmpty else { continue }
+            // Keyed by the id the message used, but carrying the id our own
+            // model derives from the bytes — so a re-save writes the same
+            // Content-ID it read, and the round trip is stable.
+            out[id] = RichTextImage(mimeType: p.contentType, data: data)
+        }
+        return out
+    }
+
+    /// A `Content-ID` reduced to comparable form: trimmed, angle brackets off.
+    private static func normalizedCID(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("<") { s.removeFirst() }
+        if s.hasSuffix(">") { s.removeLast() }
+        return s
     }
 
     /// A message's body as editable `RichText`, for forwarding.
@@ -4708,12 +4796,110 @@ final class AppModel: ObservableObject {
         let n = sel.indices.count
         do {
             try MailboxMutator.moveMany(from: sel.item.base, indices: sel.indices, to: dest.base)
+            recordRecentFiling(from: sel.item, to: destID)
             afterRemoval(veil: "Moving…",
                          notice: n == 1 ? "Moved to \(dest.display)."
                                         : "\(n) messages moved to \(dest.display).")
         } catch {
             showError("Move failed: \(error.localizedDescription)")
         }
+    }
+
+    // MARK: - Recents
+
+    /// The Recents menu's contents: the mailboxes mail has been filed into
+    /// lately, newest first, each with the display name the tree gives it *now*.
+    ///
+    /// Resolved against `itemsByID` at every call rather than stored alongside
+    /// the id, which is what makes a rename free and a deletion self-cleaning:
+    /// a renamed mailbox keeps its id (see `renameTreeItem`) and simply reads out
+    /// under its new name, and a deleted one fails to resolve and is skipped.
+    /// Folders are skipped too — a folder can't be a filing destination, and an
+    /// id can in principle be reused by one.
+    ///
+    /// Not `@Published`: like `savedSidebarExpansion`, this is read at the moment
+    /// the menu opens. Publishing it would re-render every view observing the
+    /// model on each move.
+    func recentFilings() -> [(id: MailboxItem.ID, display: String)] {
+        viewState.recentMailboxes.ids().compactMap { id in
+            guard let item = itemsByID[id], !item.isFolder else { return nil }
+            return (id, item.display)
+        }
+    }
+
+    /// Note a filing for the Recents list.
+    ///
+    /// **Only moves out of In and Out count.** Stephen's rule: filing incoming or
+    /// sent mail is the activity Recents is about, whereas moving a message from
+    /// one project mailbox to another is after-the-fact housekeeping and would
+    /// only dilute the list. Delete is not a move for this purpose either, and
+    /// doesn't reach here — `deleteSelected` calls `MailboxMutator.moveMany`
+    /// directly rather than going through `moveSelected`.
+    private func recordRecentFiling(from source: MailboxItem, to destID: MailboxItem.ID) {
+        guard source.type == .inbox || source.type == .outbox else { return }
+        viewState.recentMailboxes.record(destID)
+        if let root = rootURL?.path { ViewStateStore.save(viewState, forRoot: root) }
+    }
+
+    /// Open a mailbox from the Recents menu with its newest message selected.
+    ///
+    /// Modelled on `openHit`, and split the same way: if the mailbox is already
+    /// listed the rows are to hand and the selection can move immediately; if it
+    /// isn't, the row to select can't be named until the listing lands, so
+    /// `pendingSelectNewest` carries the intent into `loadListing`'s completion.
+    func openRecent(_ id: MailboxItem.ID) {
+        guard let item = itemsByID[id], !item.isFolder else {
+            // A mailbox that vanished between the menu being built and an item
+            // being picked. Rare enough not to warrant an alert; the list will
+            // have dropped it by the next open.
+            return
+        }
+        if listedMailboxID == id {
+            // Already listed — the rows are to hand, so no reload. Gated on
+            // `listedMailboxID` rather than `!rows.isEmpty` so that a mailbox
+            // which really is empty doesn't get torn down and re-read to arrive
+            // back at no rows.
+            guard let newest = Self.newestRowID(in: rows) else { return }
+            selectMessage(newest)
+            if let pos = rowPositionByID[newest] { revealCentered(row: pos) }
+        } else {
+            // Any pending index belongs to an older intent — a launch restore
+            // still resolving, or a search hit whose `loadListing` hasn't run
+            // yet. `loadListing` prefers the index over this flag, so leaving one
+            // set would consume the Recents pick and land on nothing.
+            pendingMessageID = nil
+            pendingMessageIsExplicitJump = false
+            pendingSelectNewest = true
+            if selectedMailboxID == id {
+                // Selected but not yet listed: `onChange` won't fire on a no-op
+                // assignment, so drive the load directly.
+                loadListing(force: true)
+            } else {
+                selectedMailboxID = id   // onChange → loadListing() applies the intent
+            }
+        }
+    }
+
+    /// The newest message in a listing — "the last item by date", which is what
+    /// a Recents pick selects.
+    ///
+    /// By `sortDate`, which `buildListing` fills from the TOC's cached date as
+    /// the row is constructed, so this doesn't wait on enrichment (the parse only
+    /// refines it later).
+    ///
+    /// **Ties and the no-date fallback both break by `id`, not by position in
+    /// `rows`.** `id` is the 1-based record index, and `.mbx` is append-only, so
+    /// the highest id is the most recently added message — a fact about the
+    /// mailbox. `rows` is in the mailbox's *remembered sort order*, which under
+    /// anything but mailbox order makes `rows.last` an arbitrary message. That
+    /// distinction is the whole difference between "the newest" and "whichever
+    /// one this mailbox happens to be sorted to the bottom".
+    static func newestRowID(in rows: [MessageRow]) -> MessageRow.ID? {
+        let dated = rows.compactMap { row in row.sortDate.map { (id: row.id, date: $0) } }
+        if let best = dated.max(by: { ($0.date, $0.id) < ($1.date, $1.id) }) { return best.id }
+        // No readable date anywhere in the mailbox: the last record is the best
+        // remaining answer.
+        return rows.map(\.id).max()
     }
 
     /// The selected message(s) left the current mailbox: clear the selection

@@ -248,7 +248,7 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
 /// it. That matters: a view that observed this would re-render on every model
 /// change, which is the cost this whole file exists to remove.
 @MainActor
-final class MoveToMenuController: ObservableObject {
+final class MoveToMenuController: ObservableObject, MenuAnchoring {
     private let menu = NSMenu()
 
     /// Retained because `NSMenu.delegate` is weak. Replaced on each pop rather
@@ -389,15 +389,26 @@ enum RenameDialog {
 }
 
 /// An empty `NSView` that exists only to give the menu somewhere to hang from.
-private final class MenuAnchorView: NSView {
+final class MenuAnchorView: NSView {
     /// See the positioning note in `MoveToMenuController.popUp`.
     override var isFlipped: Bool { false }
 }
 
+/// A controller that can be handed the view its menu hangs from.
+///
+/// Exists so `MenuAnchor` can serve more than one menu controller — the Move to
+/// button here, and the sidebar's Recents row (see `RecentsMenu.swift`) — without
+/// either of them duplicating the `isFlipped` subtlety above.
+@MainActor
+protocol MenuAnchoring: AnyObject {
+    /// Weak in every conformer: the view belongs to the SwiftUI hierarchy.
+    var anchor: NSView? { get set }
+}
+
 /// Puts a `MenuAnchorView` behind the button's label and hands it to the
 /// controller. Costs one empty view; nothing is drawn.
-private struct MenuAnchor: NSViewRepresentable {
-    let controller: MoveToMenuController
+struct MenuAnchor: NSViewRepresentable {
+    let target: any MenuAnchoring
 
     // `makeNSView`/`updateNSView` are protocol witnesses, so they inherit
     // `NSViewRepresentable`'s main-actor isolation and may touch the
@@ -405,14 +416,14 @@ private struct MenuAnchor: NSViewRepresentable {
     // note on `MessageContextMenuInstaller.install`.
     func makeNSView(context: Context) -> NSView {
         let view = MenuAnchorView(frame: .zero)
-        controller.anchor = view
+        target.anchor = view
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
         // Re-assigned rather than assumed: SwiftUI can hand back a different
         // view than the one made, and the controller holds this weakly.
-        controller.anchor = nsView
+        target.anchor = nsView
     }
 }
 
@@ -449,7 +460,7 @@ struct MoveToMenuButton<Label: View>: View {
                 // view's bottom-left, and a background that collapsed to zero
                 // would be *centred* on the label — putting that corner in the
                 // middle of the button and dropping the menu across it.
-                MenuAnchor(controller: controller)
+                MenuAnchor(target: controller)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             )
         }

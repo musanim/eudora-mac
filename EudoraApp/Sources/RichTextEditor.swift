@@ -173,9 +173,79 @@ final class BodyTextView: NSTextView {
     override func paste(_ sender: Any?) {
         if NSPasteboard.general.string(forType: Self.internalPasteType) == editorToken {
             super.paste(sender)          // copied here — keep its formatting
+        } else if NSPasteboard.general.string(forType: .string)?.isEmpty == false {
+            // Text wins whenever there is any. Excel, Word, Keynote, Preview and
+            // a selection in Safari all put a TIFF or PDF rendering on the
+            // pasteboard *beside* the text, so preferring the picture would mean
+            // copying a spreadsheet cell into a draft pasted a screenshot of it.
+            pasteAsPlainText(sender)
+        } else if pasteImage() {
+            return                       // a picture and nothing else — embed it
         } else {
             pasteAsPlainText(sender)     // from elsewhere — plain, matching the caret
         }
+    }
+
+    /// Embed an image from the clipboard, returning whether there was one.
+    ///
+    /// A deliberate exception to the rule above, not a hole in it. That rule is
+    /// about *formatting* — text arriving with a foreign font and size, which is
+    /// nearly always unwanted. An image has no formatting to inherit, and
+    /// `pasteAsPlainText` silently discards it: before this, pasting a
+    /// screenshot into a draft did nothing at all, with no indication why.
+    ///
+    /// Takes the bytes as they are. A screenshot is a PNG of whatever size the
+    /// screen made it, and re-encoding a picture of text to save bytes is
+    /// exactly where it looks worst. If a server ever refuses one for size, it
+    /// says so at send time and the draft survives — see `SMTPClient`.
+    private func pasteImage() -> Bool {
+        let pb = NSPasteboard.general
+        // File promises and copied files arrive as URLs; a screenshot or a copy
+        // out of Preview arrives as raw bytes. Try the typed data first, in the
+        // order that keeps the original encoding rather than a re-render.
+        var found: (data: Data, type: String)?
+        for type in [NSPasteboard.PasteboardType.png,
+                     NSPasteboard.PasteboardType("public.jpeg"),
+                     NSPasteboard.PasteboardType("com.compuserve.gif"),
+                     NSPasteboard.PasteboardType.tiff] {
+            if let data = pb.data(forType: type), !data.isEmpty,
+               let mime = RichTextAttributed.mimeType(forUTIOrExtension: type.rawValue)
+                        ?? RichTextAttributed.sniffedImageType(data) {
+                found = (data, mime)
+                break
+            }
+        }
+        if found == nil,
+           let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
+           let url = urls.first, let data = try? Data(contentsOf: url),
+           let mime = RichTextAttributed.mimeType(
+                forUTIOrExtension: url.pathExtension) ?? RichTextAttributed.sniffedImageType(data) {
+            found = (data, mime)
+        }
+        guard var found else { return false }
+
+        // TIFF is what Preview and most "Copy Image" commands give, and neither
+        // Gmail nor Outlook renders an `image/tiff` part inline — the recipient
+        // sees a broken picture. The conversion is lossless, so this is not the
+        // re-encoding the doc comment above declines to do.
+        if found.type == "image/tiff",
+           let png = NSBitmapImageRep(data: found.data)?
+            .representation(using: .png, properties: [:]) {
+            found = (png, "image/png")
+        }
+
+        let attachment = RichTextImageAttachment(RichTextImage(mimeType: found.type,
+                                                               data: found.data))
+        let piece = NSAttributedString(attachment: attachment)
+        let range = selectedRange()
+        // The placeholder, not nil: nil means "attributes only" to AppKit, which
+        // registers an attribute undo, and ⌘Z would then leave the picture in place.
+        guard shouldChangeText(in: range, replacementString: RichTextRun.imagePlaceholder)
+        else { return true }
+        textStorage?.replaceCharacters(in: range, with: piece)
+        didChangeText()
+        setSelectedRange(NSRange(location: range.location + piece.length, length: 0))
+        return true
     }
 
     // MARK: quick-add correction
@@ -248,6 +318,37 @@ final class BodyTextView: NSTextView {
 /// antialiasing on and adjusting the size resolved it.
 ///
 /// Switched off but kept intact, per CLAUDE.md's diagnostics convention.
+/// Where first responder actually went while a composer opened.
+///
+/// Added 2026aug06 for the reply-caret bug (see `focusBody`), and **left on**
+/// until Stephen confirms the caret lands in the body every time — the fix
+/// addresses the most likely cause of both symptoms but the cause was not
+/// provable from the code, and if the caret still misbehaves the log says which
+/// of them is really happening. Switch `enabled` to false once it has.
+///
+/// Reading the log: the line that matters is the last one. `settled` means the
+/// body has it. `lost it again` means something took it back — the following
+/// `makeFirstResponder -> true` should recover it. A trail ending in
+/// `makeFirstResponder -> false` twenty times over means the text view is
+/// refusing the responder outright, which is a different bug from this one.
+enum ComposeFocusDiagnostics {
+    static let enabled = true
+
+    static func note(_ label: String, _ window: NSWindow?, extra: String = "") {
+        guard enabled else { return }
+        let responder: String
+        switch window?.firstResponder {
+        case let v as BodyTextView where v.window === window: responder = "BODY"
+        case is NSTextView:                                   responder = "fieldEditor(a header field)"
+        case let w as NSWindow where w === window:            responder = "WINDOW — nobody, no caret, keys go nowhere"
+        case .none:                                           responder = "nil"
+        case .some(let r):                                    responder = "\(type(of: r))"
+        }
+        print("[compose focus] \(label) key=\(window?.isKeyWindow ?? false) "
+            + "firstResponder=\(responder) \(extra)")
+    }
+}
+
 enum FontDiagnostics {
     static let enabled = false
     private static var dumpedFamilies = false
@@ -387,8 +488,32 @@ final class RichTextEditorController: NSObject, ObservableObject, NSTextViewDele
     /// the first keystroke in the body) runs that pass. Without the handshake
     /// the caret jumps out of the body and into To after one character, and only
     /// sometimes, depending on whether the window became key first.
+    /// **A refusal used to be abandoned, and that was the bug of 2026aug06.**
+    /// `if window.makeFirstResponder(textView) { onFocused() }` did nothing at all
+    /// when the grab was refused — and AppKit's documented behaviour on refusal is
+    /// to leave the *window* as first responder, because the previous responder
+    /// has already resigned by then. That single line produced both of the
+    /// symptoms Stephen saw, separated only by whether another SwiftUI update pass
+    /// happened to follow: one did, `RecipientField.updateNSView` re-grabbed To
+    /// (caret back in To); none did, and nobody was first responder at all (no
+    /// caret anywhere, keystrokes swallowed). Two additions close it — a refusal
+    /// is retried rather than dropped, and a *success* is re-checked a turn later,
+    /// because AppKit hands first responder to the first key view when a window
+    /// becomes key and SwiftUI's focus machinery does the same when it rebuilds.
+    /// `ContentView.applyPendingFocus` re-checks the message table for exactly
+    /// that reason and is the precedent here.
+    ///
+    /// `window.initialFirstResponder` is kept but is close to decorative: it is
+    /// only consulted when a window becomes key while the *window itself* holds
+    /// first responder, and by the time this can run the grab below has usually
+    /// settled the matter. It costs nothing and covers the one ordering where the
+    /// window is not yet key.
     func focusBody(attemptsLeft: Int = 20, onFocused: @escaping () -> Void = {}) {
-        guard let textView, let window = textView.window else {
+        // `superview` as well as `window`: a text view SwiftUI has replaced can
+        // still answer a window while detached from its view tree, and the grab
+        // below would then succeed on a view that draws no caret and takes no
+        // keys — indistinguishable from the failure this exists to fix.
+        guard let textView, textView.superview != nil, let window = textView.window else {
             guard attemptsLeft > 0 else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
                 self?.focusBody(attemptsLeft: attemptsLeft - 1, onFocused: onFocused)
@@ -399,9 +524,38 @@ final class RichTextEditorController: NSObject, ObservableObject, NSTextViewDele
         textView.setSelectedRange(top)
         textView.scrollRangeToVisible(top)
         window.initialFirstResponder = textView
-        // Only on success: a refused first-responder change must not leave the
+
+        let took = window.makeFirstResponder(textView)
+        ComposeFocusDiagnostics.note("makeFirstResponder -> \(took)", window,
+                                     extra: "attempt=\(20 - attemptsLeft)")
+        guard took else {
+            // Retried, not abandoned. Leaving a refusal to stand is what stranded
+            // first responder on the window.
+            guard attemptsLeft > 0 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.focusBody(attemptsLeft: attemptsLeft - 1, onFocused: onFocused)
+            }
+            return
+        }
+        // Only on success, as before: a refused change must not leave the
         // recipient fields believing focus is nowhere.
-        if window.makeFirstResponder(textView) { onFocused() }
+        onFocused()
+
+        // Confirm it stuck. Budgeted deliberately short — `min(attemptsLeft, 6)`
+        // is at most 0.3s, over well before a freshly-opened window is usable — so
+        // this can re-assert against AppKit and SwiftUI without ever being able to
+        // fight a user who has deliberately clicked into To.
+        guard attemptsLeft > 0 else { return }
+        let budget = min(attemptsLeft, 6) - 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak textView, weak window] in
+            guard let self, let textView, let window else { return }
+            guard window.firstResponder !== textView else {
+                ComposeFocusDiagnostics.note("settled", window)
+                return
+            }
+            ComposeFocusDiagnostics.note("lost it again, re-asserting", window)
+            self.focusBody(attemptsLeft: budget, onFocused: onFocused)
+        }
     }
 
     // MARK: delegate

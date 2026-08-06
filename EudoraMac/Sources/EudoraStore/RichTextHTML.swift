@@ -44,9 +44,21 @@ public enum RichTextHTML {
     // this dialect, so drafts still round-trip.
 
     /// The complete HTML document for a styled body.
+    ///
+    /// An embedded image becomes `<img src="cid:…">`, referring to a part of
+    /// the same message — see `OutgoingMessage.rfc822`, which puts those parts
+    /// in a `multipart/related` alongside this HTML. No `width`/`height` is
+    /// written: the bytes carry the size the user pasted, and pinning it here
+    /// would fight every reader's own scaling.
     public static func html(from rich: RichText) -> String {
         var body = ""
-        for run in rich.runs { body += wrap(encode(run.text), style: run.style) }
+        for run in rich.runs {
+            if let image = run.image {
+                body += "<img src=\"cid:\(attrEscape(image.id))\" alt=\"\">"
+            } else {
+                body += wrap(encode(run.text), style: run.style)
+            }
+        }
         return prologue + body + epilogue
     }
 
@@ -167,7 +179,20 @@ public enum RichTextHTML {
     /// is the text with no styling, which is still the message. Everything
     /// outside `<body>` is dropped, as are `<head>`, `<style>`, `<script>` and
     /// `<title>` contents — this must never surface markup as if it were text.
+    /// Parse a body, resolving any `<img>` it contains through `image`.
+    ///
+    /// The resolver takes the raw `src` and returns the bytes, or nil to leave
+    /// the image out. It exists because a `cid:` reference can only be answered
+    /// by the *message* the HTML came from — the sibling MIME parts — which this
+    /// function cannot see. `AppModel.styledBody` supplies it; the no-argument
+    /// overload keeps every other caller (forwarding, the tests) unchanged, and
+    /// drops images rather than inventing them.
     public static func parse(_ source: String) -> RichText {
+        parse(source, image: { _ in nil })
+    }
+
+    public static func parse(_ source: String,
+                             image resolve: (String) -> RichTextImage?) -> RichText {
         // Fold line endings first: CR and CRLF in an HTML input stream are a
         // single line break (per the spec), and a part on the wire arrives with
         // CRLF endings, so this keeps a `<pre>`-mode read of foreign HTML from
@@ -267,6 +292,16 @@ public enum RichTextHTML {
                 continue
             }
 
+            // An image resolves to a run of its own. Before the `void` test
+            // below, which would otherwise skip it, and after the close-tag
+            // handling, since `</img>` carries no source.
+            if tag.name == "img", let src = tag.attributes["src"],
+               let resolved = resolve(src) {
+                flush()
+                out.append(RichTextRun(image: resolved))
+                continue
+            }
+
             if tag.name == "br" { appendBreak(); continue }
             if Self.block.contains(tag.name) { ensureBreak() }
             if Self.void.contains(tag.name) || tag.isSelfClosing { continue }
@@ -290,8 +325,14 @@ public enum RichTextHTML {
         // and flattening it would mean a draft came back different from how it
         // was saved.
         guard !preformatted else { return RichText(runs: out) }
-        return RichText(runs: out.map {
-            RichTextRun($0.text.replacingOccurrences(of: "\u{00A0}", with: " "), style: $0.style)
+        return RichText(runs: out.map { run in
+            // An image run passes through untouched. Rebuilding it with the
+            // text initialiser would drop its `image` and leave a bare U+FFFC
+            // behind — every picture lost on reopen, and a stray glyph in the
+            // plain alternative where it had been.
+            guard !run.isImage else { return run }
+            return RichTextRun(run.text.replacingOccurrences(of: "\u{00A0}", with: " "),
+                               style: run.style)
         })
     }
 

@@ -153,6 +153,24 @@ struct EudoraApp: App {
         model.openDrafts.isEmpty && model.canActOnMessage
     }
 
+    /// Reply, Reply to All and Forward — **not** gated on `openDrafts.isEmpty`.
+    ///
+    /// The paragraph above is about destructive commands and text-editing keys,
+    /// and neither argument reaches these. ⌘R means nothing to a field editor, so
+    /// there is no collision to avoid, and the worst a stray one can do is open a
+    /// window. Stephen wants several replies open at once — the same message
+    /// answered differently to different correspondents — and the model has always
+    /// been built for it: `openDrafts` is keyed by draft id and
+    /// `shiftDraftOffsets(after:by:except:)` exists precisely to keep other open
+    /// drafts' offsets right. The old gate greyed ⌘R out while leaving the
+    /// in-window menu's Reply live, so the two menus disagreed and the shortcut
+    /// looked broken; this is what puts them back in step.
+    ///
+    /// Mark as Read/Unread stay on `messageCommandsEnabled`: ⌘U is a text-editing
+    /// key, and a global one firing while you type in a composer is the very thing
+    /// that guard is for.
+    private var composeCommandsEnabled: Bool { model.canActOnMessage }
+
     /// Same draft-open guard, but for Delete, which acts on the whole
     /// multi-selection — `canActOnMessage` requires exactly one message and
     /// would grey Delete out the moment a second row was ⌘-clicked.
@@ -203,10 +221,17 @@ struct EudoraApp: App {
         // to stay in step, and this is the one that actually functions.
         CommandMenu("Message") {
             // `.disabled` on a `Group` inside the menu, not on the `CommandMenu`
-            // itself — `Commands` has no such modifier; these are Views. One
-            // guard for the single-message commands; Delete sits outside the
-            // Group because it acts on the whole multi-selection and has its
-            // own gate. See `messageCommandsEnabled` / `deleteCommandEnabled`.
+            // itself — `Commands` has no such modifier; these are Views. Three
+            // gates, not one: Reply/Forward only need a message
+            // (`composeCommandsEnabled`), Mark as Read/Unread additionally need no
+            // draft open because ⌘U is a text-editing key
+            // (`messageCommandsEnabled`), and the destructive commands act on the
+            // whole selection (`deleteCommandEnabled`).
+            //
+            // This menu is at `ViewBuilder`'s ten-child limit. The divider before
+            // Mark as Read lives *inside* its Group for that reason — a disabled
+            // divider looks no different — so adding an item here means grouping
+            // something, not appending.
             Group {
                 Button("Reply") { model.reply(all: false) }
                     .keyboardShortcut("r", modifiers: .command)
@@ -215,6 +240,9 @@ struct EudoraApp: App {
                 // No shortcut. Eudora's ⌘L was unmemorable; Forward is reached
                 // from this menu or the message's right-click menu.
                 Button("Forward") { model.forward() }
+            }
+            .disabled(!composeCommandsEnabled)
+            Group {
                 Divider()
                 Button("Mark as Read") { model.markSelected(read: true) }
                     .keyboardShortcut("u", modifiers: [.command, .shift])
