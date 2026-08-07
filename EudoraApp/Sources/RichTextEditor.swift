@@ -154,6 +154,49 @@ final class BodyTextView: NSTextView {
         NSPasteboard.PasteboardType("com.musanim.eudora.compose.internal")
     private let editorToken = UUID().uuidString
 
+    /// The image representations a paste will embed, in preference order — the
+    /// original encoding ahead of the TIFF rendering that sits beside it, so a
+    /// PNG travels as the PNG it already is.
+    ///
+    /// **Read in two places, and it must be the same list in both**: once to
+    /// decide whether ⌘V is even offered (`readablePasteboardTypes`) and once to
+    /// decide what to embed (`pasteImage`). Two lists that drifted apart would
+    /// give an enabled menu item and a paste that then declined — which is a
+    /// worse failure than the one this fixed, because it looks deliberate.
+    static let imagePasteTypes: [NSPasteboard.PasteboardType] = [
+        .png,
+        NSPasteboard.PasteboardType("public.jpeg"),
+        NSPasteboard.PasteboardType("com.compuserve.gif"),
+        .tiff,
+    ]
+
+    /// The pasteboard types Paste is offered for.
+    ///
+    /// **This is why pasting a picture did nothing whatever (2026aug06).** AppKit
+    /// validates the Paste menu item — and therefore ⌘V — against this list, and
+    /// an `NSTextView` with `importsGraphics` off includes no image type in it.
+    /// With only a picture on the pasteboard the menu item was *disabled*, so the
+    /// action was never sent and `paste(_:)` never ran. Every line of the image
+    /// path was correct and unreachable.
+    ///
+    /// The diagnostic is what settled it: pasting text logged its six types and
+    /// its branch, and pasting an image logged **nothing at all** — not a
+    /// declined branch, not an empty type list. A method that isn't called is a
+    /// different fact from a method that declines, and only the log tells them
+    /// apart. Inspection had already cleared every step inside `pasteImage`,
+    /// twice, which is exactly when to stop reading and start measuring.
+    ///
+    /// `importsGraphics` is deliberately left off rather than being the fix.
+    /// Turning it on also hands AppKit its own image handling — it inserts its
+    /// own attachment from RTFD and accepts image drags — which would bypass
+    /// `pasteImage`, and drag-and-drop is out of scope for now by Stephen's
+    /// instruction. Widening this list changes what is *offered* and nothing
+    /// about what happens next.
+    override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
+        let inherited = super.readablePasteboardTypes
+        return inherited + Self.imagePasteTypes.filter { !inherited.contains($0) }
+    }
+
     override func copy(_ sender: Any?) {
         super.copy(sender)
         tagPasteboardAsInternal()
@@ -170,18 +213,63 @@ final class BodyTextView: NSTextView {
         pb.setString(editorToken, forType: Self.internalPasteType)
     }
 
+    /// One-shot readout of what a paste actually saw. **Off. What it found is
+    /// recorded below; switch it on again if a paste ever misbehaves.**
+    ///
+    /// Written for the 2026aug06 report that pasting an image from Preview did
+    /// nothing at all, and it found the answer in one build: pasting text logged
+    /// six pasteboard types and its branch, and pasting an image logged
+    /// **nothing whatever** — not a declined branch, not an empty type list. The
+    /// method was never called. See `readablePasteboardTypes` for why.
+    ///
+    /// That is the whole value of it. Inspection had cleared every step inside
+    /// `pasteImage` twice and was right both times; a method that isn't called
+    /// and a method that declines look identical on screen and identical in the
+    /// source, and only the log tells them apart.
+    ///
+    /// Read it as: `[paste] types` is the ground truth in UTIs, which
+    /// `clipboard info`'s Carbon names are not; the branch line says which arm of
+    /// `paste(_:)` ran; `found` says whether a representation was accepted;
+    /// `insert` says whether the storage actually changed; `readBack` says
+    /// whether the model still had the image afterwards — the storage never
+    /// changing and the model losing it again being two different bugs with one
+    /// symptom. A healthy image paste prints `branch=image`, `found=image/png`,
+    /// `insert storage N -> N+1`, `readBack images=1`.
+    static var diagnosePaste = false
+
+    private static func diag(_ message: @autoclosure () -> String) {
+        if diagnosePaste { print("[paste] \(message())") }
+    }
+
     override func paste(_ sender: Any?) {
+        if Self.diagnosePaste {
+            let pb = NSPasteboard.general
+            // `types` is optional — an empty pasteboard has none.
+            let types = pb.types ?? []
+            Self.diag("types " + types.map(\.rawValue).joined(separator: ", "))
+            // Byte counts, so a type that is *declared* but carries nothing is
+            // distinguishable from one that was never there. A promised type
+            // reads as 0 or -1 here, and is exactly the case that would defeat
+            // the `!data.isEmpty` test in `pasteImage`.
+            for t in types {
+                Self.diag("  \(t.rawValue) = \(pb.data(forType: t)?.count ?? -1) bytes")
+            }
+        }
         if NSPasteboard.general.string(forType: Self.internalPasteType) == editorToken {
+            Self.diag("branch=internal")
             super.paste(sender)          // copied here — keep its formatting
         } else if NSPasteboard.general.string(forType: .string)?.isEmpty == false {
+            Self.diag("branch=text — string type present, image not attempted")
             // Text wins whenever there is any. Excel, Word, Keynote, Preview and
             // a selection in Safari all put a TIFF or PDF rendering on the
             // pasteboard *beside* the text, so preferring the picture would mean
             // copying a spreadsheet cell into a draft pasted a screenshot of it.
             pasteAsPlainText(sender)
         } else if pasteImage() {
+            Self.diag("branch=image — handled")
             return                       // a picture and nothing else — embed it
         } else {
+            Self.diag("branch=plain — pasteImage declined")
             pasteAsPlainText(sender)     // from elsewhere — plain, matching the caret
         }
     }
@@ -204,10 +292,9 @@ final class BodyTextView: NSTextView {
         // out of Preview arrives as raw bytes. Try the typed data first, in the
         // order that keeps the original encoding rather than a re-render.
         var found: (data: Data, type: String)?
-        for type in [NSPasteboard.PasteboardType.png,
-                     NSPasteboard.PasteboardType("public.jpeg"),
-                     NSPasteboard.PasteboardType("com.compuserve.gif"),
-                     NSPasteboard.PasteboardType.tiff] {
+        // The same list `readablePasteboardTypes` offers Paste for. Don't inline
+        // it back here — see the comment there.
+        for type in Self.imagePasteTypes {
             if let data = pb.data(forType: type), !data.isEmpty,
                let mime = RichTextAttributed.mimeType(forUTIOrExtension: type.rawValue)
                         ?? RichTextAttributed.sniffedImageType(data) {
@@ -222,7 +309,11 @@ final class BodyTextView: NSTextView {
                 forUTIOrExtension: url.pathExtension) ?? RichTextAttributed.sniffedImageType(data) {
             found = (data, mime)
         }
-        guard var found else { return false }
+        guard var found else {
+            Self.diag("found=none — no representation accepted, and no file URL")
+            return false
+        }
+        Self.diag("found=\(found.type) \(found.data.count) bytes")
 
         // TIFF is what Preview and most "Copy Image" commands give, and neither
         // Gmail nor Outlook renders an `image/tiff` part inline — the recipient
@@ -238,12 +329,35 @@ final class BodyTextView: NSTextView {
                                                                data: found.data))
         let piece = NSAttributedString(attachment: attachment)
         let range = selectedRange()
+        // Whether AppKit could decode the bytes into something drawable. A nil
+        // here means the run is in the storage and the cell has nothing to
+        // paint — which on screen is indistinguishable from the paste never
+        // having happened, and is the first thing to rule in or out.
+        Self.diag("attachment image=\(attachment.image.map { "\($0.size)" } ?? "nil")"
+                  + " editable=\(isEditable) range=\(range.location),\(range.length)")
         // The placeholder, not nil: nil means "attributes only" to AppKit, which
         // registers an attribute undo, and ⌘Z would then leave the picture in place.
         guard shouldChangeText(in: range, replacementString: RichTextRun.imagePlaceholder)
-        else { return true }
+        else {
+            Self.diag("insert=refused by shouldChangeText")
+            return true
+        }
+        let before = textStorage?.length ?? -1
         textStorage?.replaceCharacters(in: range, with: piece)
+        let after = textStorage?.length ?? -1
+        Self.diag("insert storage \(before) -> \(after)")
         didChangeText()
+        // After `didChangeText`, so it reports what the model kept once
+        // `readBack` had run — the storage changing and the model losing it
+        // again are two different bugs with one symptom.
+        if Self.diagnosePaste, let storage = textStorage {
+            // `arial12` rather than the real defaults, which this view doesn't
+            // hold — they affect text styling and not whether a run is an image,
+            // which is all this counts.
+            let images = RichTextAttributed.richText(storage, defaults: .arial12)
+                .runs.filter { $0.image != nil }.count
+            Self.diag("readBack images=\(images) storageLength=\(storage.length)")
+        }
         setSelectedRange(NSRange(location: range.location + piece.length, length: 0))
         return true
     }

@@ -251,6 +251,34 @@ struct ComposeDraft: Identifiable {
     var inReplyTo: String? = nil
     var references: [String] = []
 
+    /// Where the message being replied to was sitting when Reply was pressed, so
+    /// it can be marked `MS_REPLIED` once this draft is actually delivered.
+    ///
+    /// **In memory only, and deliberately.** A draft saved to Out and reopened
+    /// later is rebuilt from its stored headers (`openDraft`), and there is no
+    /// header to put a mailbox offset in — so a reply that is closed and reopened
+    /// before sending loses this and marks nothing. That is the benign failure:
+    /// a missing R is a message that looks unanswered, which costs a second
+    /// look, where a *false* R is a message that looks answered and gets
+    /// skipped. Nothing here may guess.
+    ///
+    /// Set only by `reply(all:)`. A forward leaves it nil — see
+    /// `MailboxMutator.statusReplied` for why forwards record nothing.
+    struct ReplyOrigin: Equatable {
+        /// The mailbox's tree id rather than its URL, so a rename between Reply
+        /// and Send is survived: renaming rewrites only the descmap display
+        /// field and an id is the path of *filenames*. A mailbox that has been
+        /// moved or deleted resolves to nothing, and nothing is written.
+        var mailboxID: String
+        /// The original's `Message-ID`, raw as read. Normalised at comparison
+        /// time by `MessageIDIndex`, never here.
+        var messageID: String
+        /// Byte offset of the original's record when Reply was pressed. Treated
+        /// as a hint, never as proof — see `markRepliedTo`.
+        var offset: Int
+    }
+    var replyOrigin: ReplyOrigin? = nil
+
     /// Byte offset of this draft's record in Out.
     ///
     /// An offset rather than an index, for the reason `ViewState` gives about
@@ -3380,6 +3408,118 @@ final class AppModel: ObservableObject {
                                   who: who, subject: subject)
         }
         refreshOutIfShowing()
+        // After the Out record is safely written, never before: the reply going
+        // out is the fact worth recording, and the mark on the original is a
+        // convenience on top of it. Failures here are reported quietly for the
+        // same reason — an error dialog immediately after a successful send
+        // reads as "your message didn't go", which would be false.
+        if let origin = draft.replyOrigin { markRepliedTo(origin) }
+    }
+
+    /// Mark the message a just-delivered reply was answering as `MS_REPLIED`, so
+    /// the list shows R against it.
+    ///
+    /// **The offset is a hint, not an address.** Between pressing Reply and
+    /// pressing Send — which can be a long time — anything earlier in that
+    /// mailbox may have been deleted or moved, and every later record slides.
+    /// A stale offset can still *resolve*, landing squarely on some other
+    /// message, so it is confirmed against the original's `Message-ID` before
+    /// anything is written; the same reasoning, and the same shape, as
+    /// `locateDraft`. Confirming costs a few kilobytes.
+    ///
+    /// When it doesn't confirm, one scan of that mailbox looks the message up by
+    /// `Message-ID`. That is the expensive path — a whole-mailbox read — and it
+    /// runs at most once per reply sent, only after the cheap check has failed.
+    ///
+    /// If the original has been moved to another mailbox or deleted outright,
+    /// nothing is found and nothing is written. Deliberate: chasing it across
+    /// the tree would mean reading every mailbox, and a missing R costs a second
+    /// look where a wrong one costs a message going unanswered. The scan is also
+    /// bounded by size (`MessageIDIndex.scanSizeLimit`), for the same reason —
+    /// it runs on the main actor straight after a send.
+    ///
+    /// Requiring the mailbox to report a current status has a second effect
+    /// worth knowing: a `.toc` with no entry at that offset — a mailbox being
+    /// read through the record-scan fallback rather than its index — stops this
+    /// before it can paint an R that the next listing would silently drop.
+    private func markRepliedTo(_ origin: ComposeDraft.ReplyOrigin) {
+        guard let store,
+              let item = itemsByID[origin.mailboxID], !item.isFolder,
+              let wanted = MessageIDIndex.normalized(origin.messageID) else { return }
+
+        let offset: Int
+        if let msg = store.message(at: item.base, offset: origin.offset),
+           MessageIDIndex.normalized(msg.part.header("Message-ID") ?? "") == wanted {
+            offset = origin.offset
+        } else if let found = MessageIDIndex.offset(of: origin.messageID, in: item.base) {
+            offset = found
+        } else {
+            return
+        }
+
+        // Never over a message on its way out. The status is one byte, so
+        // writing 2 over a draft's 9 would not annotate it — the record would
+        // stop being a draft and double-click would never reopen it again.
+        // `markSelected(read:)` guards this by asking the selected row; here the
+        // row may have been out of hand for hours, so the mailbox is asked
+        // instead. Nothing stops ⌘R on a message sitting in Out, so this is
+        // reachable, not theoretical.
+        //
+        // Any *reading* status may be overwritten, including Eudora 7's own F
+        // and →: answering a message outranks having forwarded it, which is the
+        // whole point of the mark.
+        guard let current = MailboxMutator.status(base: item.base, offset: offset),
+              !MailboxMutator.outgoingStatuses.contains(current) else { return }
+
+        do {
+            try MailboxMutator.setStatus(base: item.base, offset: offset,
+                                         status: MailboxMutator.statusReplied)
+        } catch {
+            showBanner("The reply was sent, but the original couldn't be marked.")
+            return
+        }
+
+        // Patch the one row rather than re-listing, for the reason `setRead`
+        // gives: a rebuild discards every enriched Who and attachment glyph and
+        // restarts the background parse. Written in place, so a list sorted by
+        // status doesn't yank the row out from under the pointer.
+        //
+        // `listedMailboxID`, not `selectedMailboxID`: the sidebar assigns the
+        // selection directly and the matching rows arrive a runloop hop later
+        // (see `scheduleMarkSelectedRead`), so during that window `rows` still
+        // belongs to the previous mailbox — and offsets are bare byte counts,
+        // with 0 being the first record of *every* mailbox. Matching there would
+        // paint an R on an unrelated row.
+        //
+        // No fallback when the row isn't there — unlike `markSelected(read:)`,
+        // which rebuilds. A missing row here means a listing is still in flight,
+        // and that listing will read the `.toc` this has already written; forcing
+        // a rebuild into the middle of it would be interference in exchange for
+        // nothing. Worst case the R appears the next time the mailbox is opened,
+        // which is the failure this whole design already accepts.
+        if listedMailboxID == origin.mailboxID {
+            if let pos = rows.firstIndex(where: { $0.offset == offset }) {
+                let r = rows[pos]
+                rows[pos] = MessageRow(id: r.id,
+                                       offset: r.offset,
+                                       statusGlyph: MailStore.statusGlyph(
+                                           MailboxMutator.statusReplied),
+                                       status: MailboxMutator.statusReplied,
+                                       priority: r.priority,
+                                       label: r.label,
+                                       size: r.size,
+                                       subject: r.subject,
+                                       who: r.who,
+                                       whoSort: r.whoSort,
+                                       direction: r.direction,
+                                       date: r.date,
+                                       hasAttachment: r.hasAttachment,
+                                       sortDate: r.sortDate)
+                refreshMailboxSummary()
+            }
+        }
+        // The original may have been unread, and writing 2 over 0 clears that.
+        reloadTree()
     }
 
     /// Throw away a draft's record. Used by Don't Save on a message that was
@@ -3619,7 +3759,8 @@ final class AppModel: ObservableObject {
 
     /// Build a reply (or reply-all) from the selected message.
     func reply(all: Bool) {
-        guard let part = selectedPart() else { return }
+        guard let selected = selectedMessage() else { return }
+        let part = selected.part
         let origFrom = part.header("From") ?? ""
         let origTo = part.header("To") ?? ""
         let origCc = part.header("Cc") ?? ""
@@ -3639,13 +3780,25 @@ final class AppModel: ObservableObject {
         var cc: [String] = []
         if all { cc = [Self.recipientFieldText(origTo), Self.recipientFieldText(origCc)] }
 
+        // Remembered now, acted on at send: the original is marked replied-to
+        // only when a reply actually goes out, so abandoning this window leaves
+        // no mark. Nil when the message has no `Message-ID` — without one there
+        // is no way to confirm at send time that the offset still names this
+        // message, and an unverifiable write is not worth making.
+        let origin = msgID.flatMap { id -> ComposeDraft.ReplyOrigin? in
+            id.isEmpty ? nil : ComposeDraft.ReplyOrigin(mailboxID: selected.mailboxID,
+                                                        messageID: id,
+                                                        offset: selected.record.offset)
+        }
+
         beginCompose(ComposeDraft(
             to: Self.recipientFieldText(origFrom),
             cc: cc.filter { !$0.isEmpty }.joined(separator: ", "),
             subject: subject.lowercased().hasPrefix("re:") ? subject : "Re: \(subject)",
             body: quotedReply(part, from: origFrom),
             inReplyTo: msgID,
-            references: refs))
+            references: refs,
+            replyOrigin: origin))
     }
 
     /// Offer a clicked link to the default browser, after showing where it
@@ -4114,14 +4267,23 @@ final class AppModel: ObservableObject {
         beginCompose(draft)
     }
 
-    private func selectedPart() -> MIMEPart? {
+    /// The selected message, with enough to say *which* message it is as well as
+    /// what it contains.
+    ///
+    /// Split out of `selectedPart` for Reply, which has to remember the message
+    /// it is answering — see `ComposeDraft.ReplyOrigin` — and cannot do that from
+    /// a `MIMEPart`, which carries content and no address.
+    private func selectedMessage()
+        -> (mailboxID: MailboxItem.ID, record: MboxRecord, part: MIMEPart)? {
         guard let store,
               let mid = selectedMailboxID,
               let item = itemsByID[mid], !item.isFolder,
               let idx = selectedMessageID,
               let msg = store.message(at: item.base, index: idx) else { return nil }
-        return msg.part
+        return (mid, msg.record, msg.part)
     }
+
+    private func selectedPart() -> MIMEPart? { selectedMessage()?.part }
 
     // MARK: blacklist a sender
 

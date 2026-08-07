@@ -202,6 +202,16 @@ public struct MailStore: Sendable {
         12: " ",  // MS_RECOVERED
     ]
 
+    /// The list glyph for one status byte.
+    ///
+    /// Exists so a caller that *changes* a status and patches its row in place —
+    /// rather than re-listing the mailbox, which on Trash discards minutes of
+    /// enrichment — derives the new glyph from the same table the listing used,
+    /// instead of hard-coding a letter that would then have two homes.
+    public static func statusGlyph(_ status: Int) -> String {
+        statusGlyphs[status] ?? "?"
+    }
+
     /// The dates Eudora cached in a mailbox's `.toc`, keyed by record offset.
     ///
     /// **A `.toc` read and nothing else** — no `.mbx`, no record scan. That is
@@ -269,7 +279,7 @@ public struct MailStore: Sendable {
                 let rows = matched.map { e -> ListingRow in
                     let idx = indexByOffset[e.offset]!
                     return ListingRow(index: idx,
-                                      statusGlyph: Self.statusGlyphs[e.status] ?? "?",
+                                      statusGlyph: Self.statusGlyph(e.status),
                                       status: e.status,
                                       priority: String(e.priority),
                                       date: e.date, size: recs[idx - 1].length,

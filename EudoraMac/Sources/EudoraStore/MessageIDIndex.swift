@@ -117,6 +117,71 @@ public struct MessageIDIndex {
 
     public mutating func insert(_ messageID: String) { ids.insert(messageID) }
 
+    // MARK: locating
+
+    /// The byte offset of the record in `<base>.mbx` carrying `wantedID`, or nil
+    /// if no record does.
+    ///
+    /// The same scan as `init(scanning:)` — one read, `findRecords`, and a
+    /// header parse bounded to `headerPrefix` per record — stopping at the first
+    /// match instead of collecting every id.
+    ///
+    /// **Only ever a fallback.** A caller that has an offset should use it and
+    /// verify, because that costs a few kilobytes; this costs a read of the
+    /// whole mailbox, which on one of the archives is hundreds of megabytes.
+    /// The one caller (`AppModel.markRepliedTo`) reaches it only when a reply is
+    /// sent *and* the original's remembered offset no longer holds it.
+    ///
+    /// First match wins. Two records with one `Message-ID` means the mailbox has
+    /// a duplicate, in which case either is as good an answer as the other.
+    //
+    // The internal parameter name is `wantedID`, not `messageID`, and must stay
+    // that way: unqualified lookup stops at the innermost declaration of a name,
+    // so a parameter called `messageID` shadows `messageID(inHeaderBytes:)`
+    // below and the call inside the loop tries to invoke a `String`.
+    public static func offset(of wantedID: String, in base: URL) -> Int? {
+        guard let wanted = normalized(wantedID) else { return nil }
+        let mbx = base.appendingPathExtension("mbx")
+        guard withinScanLimit(mbx) else { return nil }
+        guard let data = try? Data(contentsOf: mbx, options: .mappedIfSafe) else { return nil }
+        // Copies, because `findRecords` takes an array — the same compromise
+        // `init(scanning:)` documents, and the reason for the size limit above.
+        let bytes = [UInt8](data)
+        for rec in Mbox.findRecords(bytes) {
+            let end = min(rec.offset + rec.length, bytes.count)
+            guard rec.offset < end else { continue }
+            // Same window as `init(scanning:)`, allowance included, so the two
+            // agree about which bytes count as a record's headers.
+            let stop = min(rec.offset + headerPrefix + envelopeAllowance, end)
+            let head = Mbox.messageBytes(fromRecord: Array(bytes[rec.offset..<stop]))
+            if messageID(inHeaderBytes: head) == wanted { return rec.offset }
+        }
+        return nil
+    }
+
+    /// How large a mailbox this scan will read.
+    ///
+    /// It runs on the main actor, immediately after a message has been sent, and
+    /// it reads and copies the whole `.mbx`. On one of the archives — Trash is
+    /// 613 MB — that is a visible stall at the worst possible moment, in pursuit
+    /// of a message that by construction is no longer where it was. So it is
+    /// bounded, and over the bound the answer is "not found", which the one
+    /// caller already treats as "mark nothing".
+    ///
+    /// 64 MB comfortably covers the working mailboxes replies actually come
+    /// from. To lift it, the scan has to move off the main actor and
+    /// `findRecords` needs a `Data` form so the mapping isn't copied — do both
+    /// or neither.
+    static let scanSizeLimit = 64 * 1024 * 1024
+
+    private static func withinScanLimit(_ mbx: URL) -> Bool {
+        let size = (try? mbx.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+        // An unreadable size is treated as within the limit: the read below
+        // fails harmlessly if the file really isn't there, and refusing on a
+        // missing attribute would silently disable the fallback.
+        return (size ?? 0) <= scanSizeLimit
+    }
+
     // MARK: extraction
 
     /// The normalised `Message-ID` of a complete RFC-822 message, or nil when it
@@ -161,7 +226,10 @@ public struct MessageIDIndex {
     /// lowercasing would risk discarding real mail. An empty or unusable value
     /// yields nil — never the empty token, which would collide with every other
     /// unusable value.
-    static func normalized(_ value: String) -> String? {
+    /// Public so a caller comparing two ids from different sources — one read
+    /// from a mailbox record, one remembered from earlier — puts both through
+    /// the same normalisation rather than comparing raw header text.
+    public static func normalized(_ value: String) -> String? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         let body: String
         if let open = trimmed.firstIndex(of: "<"),

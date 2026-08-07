@@ -11,6 +11,21 @@ public enum MailboxMutator {
     // Eudora status bytes (from summary.h).
     public static let statusUnread = 0
     public static let statusRead = 1
+    /// Replied to. Eudora's own `MS_REPLIED`, written when a reply to this
+    /// message is actually delivered.
+    ///
+    /// **This replaces the read/unread state rather than annotating it**, because
+    /// the status is one byte and cannot hold both. That is deliberate here and
+    /// not a compromise: the question "have I answered this?" outranks "have I
+    /// opened it?", so a replied-to message shows R whether or not it was ever
+    /// read. It also means R survives nothing being written twice — a second
+    /// reply just writes 2 over 2.
+    ///
+    /// Nothing writes `MS_FORWARDED` (3). Eudora 7's own F values are still read
+    /// and still display, so the history it left behind is intact, but a forward
+    /// sent from this app records nothing — and replying to a message Eudora 7
+    /// marked F overwrites that F with R, which is the intended precedence.
+    public static let statusReplied = 2
     /// A message composed but not yet sent — a draft sitting in Out.
     public static let statusUnsent = 9
     /// Delivered. What an unsent message becomes once SMTP accepts it.
@@ -23,6 +38,33 @@ public enum MailboxMutator {
     /// meaning is close enough — Eudora used it for a message it would not send,
     /// this uses it for one it could not.
     public static let statusSendError = 5
+
+    /// The statuses that say "this record is a message of mine on its way out",
+    /// as against mail that arrived and has a reading history.
+    ///
+    /// Writing a reading status over one of these does not annotate it — the
+    /// byte is the *only* place the draft-ness lives, so the record would stop
+    /// being a draft and double-click would never reopen it again. `setRead`'s
+    /// caller guards this by asking the row; `markRepliedTo` cannot, because a
+    /// reply can be sent long after its origin row went out of hand, so it asks
+    /// the mailbox instead — see `status(base:offset:)`.
+    ///
+    /// `MS_SENDABLE` (6) and `MS_QUEUED` (7) have no constants of their own
+    /// because nothing in this app writes them. They are listed because Eudora 7
+    /// did, and a message it left in one of those states must be just as
+    /// untouchable as one of ours.
+    public static let outgoingStatuses: Set<Int> =
+        [statusSendError, 6, 7, statusSent, statusUnsent]
+
+    /// The status byte the `.toc` currently records for the message at `offset`,
+    /// or nil if the mailbox has no entry there.
+    ///
+    /// A `.toc` read and nothing else — the `.mbx` is never opened. Exists so a
+    /// caller can ask what it is about to overwrite before overwriting it.
+    public static func status(base: URL, offset: Int) -> Int? {
+        guard let entries = Toc.read(base.appendingPathExtension("toc")) else { return nil }
+        return entries.first(where: { $0.offset == offset })?.status
+    }
 
     /// Set the cached status byte for one message, addressed by its **byte
     /// offset** in the `.mbx`. TOC-only, and — unlike the index-based form
