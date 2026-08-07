@@ -2253,8 +2253,17 @@ final class MessageColumnResizeController: NSObject {
     static let slop: CGFloat = 6
 
     /// Trace the divider drag (install, header mouse-downs with the geometry
-    /// tested, and the drag). Off; flip on if the drag ever misbehaves again.
-    static let diagnose = false
+    /// tested, and the drag).
+    ///
+    /// **On, 2026aug06**, for the dead-list bug — see `RemovalVeilDiagnostics`.
+    /// This controller is a second candidate and a good one: `dragColumn` is left
+    /// set for the duration of a drag, and Stephen clicked a column header to
+    /// sort and then switched to another app. A `leftMouseUp` that lands in a
+    /// different application never reaches this monitor, so a drag can be left
+    /// open — and an open drag is exactly the state in which subsequent mouse
+    /// events are treated as continuation rather than passed on. What to look for
+    /// is a `[resize]` line reporting a drag begun with no matching end.
+    static let diagnose = true
 
     /// The drag in progress: which column's right edge, the pointer x where it
     /// began, and that column's width then.

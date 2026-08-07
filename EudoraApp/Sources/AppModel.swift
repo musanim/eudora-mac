@@ -364,6 +364,69 @@ let selectionSettleDelay: UInt64 = 150_000_000  // 150 ms
 /// measured every turn as ~0 ms. `sample $(pgrep -x Eudora) 10 -file out.txt`
 /// found the real cause — a toolbar menu building 2,657 items — in one shot.
 /// Reach for the OS sampler before writing more counters.
+/// Why the message list stops taking clicks after a move.
+///
+/// Stephen, 2026aug06: moved a message out of In by right-click, and afterwards
+/// no row in the list could be selected by clicking — while the column headers
+/// still sorted. Switching to another app and back cured it. The move itself
+/// succeeded.
+///
+/// The shape fits the removal veil not coming down: its overlay swallows clicks
+/// over the list and nothing else, which is exactly "the list is dead and the
+/// headers aren't". What doesn't fit is the duration — `afterRemoval` arms a
+/// 15-second backstop and this lasted minutes. So the question these probes exist
+/// to answer is *which*: a veil still up with its backstop disarmed, or a veil
+/// long gone and something else eating the clicks.
+///
+/// **Reading the log.** A healthy move is four lines:
+///
+///     VEIL UP (Moving…) gen=N
+///     scroll branch: remembered → pendingScrollTopRow=<row>
+///     clearPendingScroll hadPending=true veilUp=true
+///     VEIL DOWN (clearPendingScroll) gen=N
+///
+/// Two failures to look for. A branch line ending `NOTHING PENDING` means nobody
+/// will call `clearPendingScroll` with anything to clear, so only the backstop
+/// can lift the veil — and that is a hole in the design rather than a symptom,
+/// because three of the four arms of that chain set `pendingScrollTopRow` to nil
+/// while `clearPendingScroll` lifts the veil only when it finds one pending. And
+/// `backstop … disarmed` with no matching `VEIL DOWN` means the generation moved
+/// without the veil coming down, and it is stuck for good.
+///
+/// If the log shows `VEIL DOWN` and clicks are *still* dead, the veil is
+/// innocent. The next suspect is `MessageDoubleClickController` — the local
+/// `.leftMouseDown` monitor that returns nil to consume an event is the only
+/// other thing in the app that can swallow a click over the list but not over the
+/// header.
+enum RemovalVeilDiagnostics {
+    static let enabled = true
+
+    static func note(_ message: String) {
+        guard enabled else { return }
+        print("[veil] \(message)")
+    }
+
+    /// Which arm of `loadListing`'s scroll-restore chain ran, and so whether
+    /// anything is left pending to bring the veil down.
+    static func noteScrollBranch(jump: Bool, newest: Bool, atBottom: Bool,
+                                 remembered: Int?, rowsEmpty: Bool, veilUp: Bool) {
+        guard enabled else { return }
+        let outcome: String
+        if jump {
+            outcome = "explicit jump → reveal centred, nothing pending"
+        } else if newest {
+            outcome = "recents pick → reveal centred, nothing pending"
+        } else if atBottom && !rowsEmpty {
+            outcome = "at bottom → reveal last, nothing pending"
+        } else if let remembered, !rowsEmpty {
+            outcome = "remembered → pendingScrollTopRow=\(remembered)"
+        } else {
+            outcome = "NOTHING PENDING — only the backstop can lift the veil"
+        }
+        print("[veil] scroll branch: \(outcome) (veilUp=\(veilUp), rowsEmpty=\(rowsEmpty))")
+    }
+}
+
 enum PerfLog {
     static var enabled = false
 
@@ -1459,8 +1522,10 @@ final class AppModel: ObservableObject {
         // nil, because `afterRemoval` nils it when raising the veil, and must
         // not un-hide the very swap the veil exists to cover.
         let hadPending = pendingScrollTopRow != nil
+        RemovalVeilDiagnostics.note(
+            "clearPendingScroll hadPending=\(hadPending) veilUp=\(removalVeil != nil)")
         pendingScrollTopRow = nil
-        if hadPending { dropRemovalVeil(showNotice: true) }
+        if hadPending { dropRemovalVeil(showNotice: true, why: "clearPendingScroll") }
     }
 
     /// Non-nil from a delete/move until the re-listed rows are back *and*
@@ -1498,8 +1563,12 @@ final class AppModel: ObservableObject {
     /// label's spot (unless the veil is being superseded — a mailbox switch
     /// doesn't earn a notice about a list no longer showing) and stands the
     /// backstop timer down.
-    private func dropRemovalVeil(showNotice: Bool) {
-        guard removalVeil != nil else { return }
+    private func dropRemovalVeil(showNotice: Bool, why: String = "unspecified") {
+        guard removalVeil != nil else {
+            RemovalVeilDiagnostics.note("drop(\(why)) — already down")
+            return
+        }
+        RemovalVeilDiagnostics.note("VEIL DOWN (\(why)) gen=\(removalVeilGeneration)")
         removalVeil = nil                 // didSet drops the frozen picture
         removalVeilGeneration += 1        // disarm the backstop
         if showNotice, let notice = pendingRemovalNotice {
@@ -1933,6 +2002,15 @@ final class AppModel: ObservableObject {
             // `pendingIsJump` is what keeps this off the launch path, which sets
             // `pendingMessageID` too and must still restore the remembered
             // position rather than centre on it.
+            RemovalVeilDiagnostics.noteScrollBranch(
+                jump: pendingIsJump && pending != nil,
+                newest: newestPosition != nil,
+                atBottom: self.selectedMailboxID
+                    .map { self.viewState.atBottomByMailbox[$0] == true } ?? false,
+                remembered: self.selectedMailboxID
+                    .flatMap { self.viewState.scrollTopRowByMailbox[$0] },
+                rowsEmpty: self.rows.isEmpty,
+                veilUp: self.removalVeil != nil)
             if pendingIsJump, let pending, let pos = self.rowPositionByID[pending] {
                 self.pendingScrollTopRow = nil
                 self.revealCentered(row: pos)
@@ -4973,6 +5051,7 @@ final class AppModel: ObservableObject {
         removalVeil = veil
         removalVeilGeneration += 1
         let generation = removalVeilGeneration
+        RemovalVeilDiagnostics.note("VEIL UP (\(veil)) gen=\(generation)")
         // Backstop only: if the scroll bridge never applies (a mailbox that
         // fails to re-list, a torn-down table), the veil must not sit on a
         // stale picture forever. Generous on purpose — re-listing a large
@@ -4982,8 +5061,13 @@ final class AppModel: ObservableObject {
         // show the very swap-and-jump it exists to hide. Every normal removal
         // ends via `clearPendingScroll` long before this fires.
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
-            guard let self, self.removalVeilGeneration == generation else { return }
-            self.dropRemovalVeil(showNotice: true)
+            guard let self else { return }
+            guard self.removalVeilGeneration == generation else {
+                RemovalVeilDiagnostics.note(
+                    "backstop gen=\(generation) disarmed (now \(self.removalVeilGeneration))")
+                return
+            }
+            self.dropRemovalVeil(showNotice: true, why: "15s backstop")
         }
         // The tree refresh runs *after* the rows are back, not alongside them.
         //

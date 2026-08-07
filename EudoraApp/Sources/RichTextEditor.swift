@@ -320,19 +320,31 @@ final class BodyTextView: NSTextView {
 /// Switched off but kept intact, per CLAUDE.md's diagnostics convention.
 /// Where first responder actually went while a composer opened.
 ///
-/// Added 2026aug06 for the reply-caret bug (see `focusBody`), and **left on**
-/// until Stephen confirms the caret lands in the body every time — the fix
-/// addresses the most likely cause of both symptoms but the cause was not
-/// provable from the code, and if the caret still misbehaves the log says which
-/// of them is really happening. Switch `enabled` to false once it has.
+/// Added 2026aug06 for the reply-caret bug (see `focusBody`), and switched off
+/// the same day, once it had answered the question. Kept intact per CLAUDE.md.
 ///
-/// Reading the log: the line that matters is the last one. `settled` means the
-/// body has it. `lost it again` means something took it back — the following
-/// `makeFirstResponder -> true` should recover it. A trail ending in
-/// `makeFirstResponder -> false` twenty times over means the text view is
-/// refusing the responder outright, which is a different bug from this one.
+/// **Finding, and it was not the hypothesis the fix was written for.** The log
+/// read:
+///
+///     makeFirstResponder -> true   firstResponder=BODY     attempt=1
+///     lost it again, re-asserting  firstResponder=WINDOW — nobody
+///     makeFirstResponder -> true   firstResponder=BODY     attempt=15
+///     settled                      firstResponder=BODY
+///
+/// So the grab succeeds first time and is *undone* one runloop turn later,
+/// leaving first responder on the window — the caretless, keyless state, arrived
+/// at from a success rather than from the refusal the fix was aimed at. The
+/// culprit is the handshake's own `focus = nil`: `@FocusState` is bidirectional,
+/// SwiftUI applies the nil on its own schedule, and it reads as "unfocus
+/// everything". **The re-assert in `focusBody` is therefore load-bearing — do not
+/// remove it as belt-and-braces.**
+///
+/// Reading the log if it is turned back on: the last line is the one that
+/// matters. `settled` is working. A trail ending in `makeFirstResponder -> false`
+/// twenty times over is the text view refusing the responder outright, which
+/// would be a different bug.
 enum ComposeFocusDiagnostics {
-    static let enabled = true
+    static let enabled = false
 
     static func note(_ label: String, _ window: NSWindow?, extra: String = "") {
         guard enabled else { return }
@@ -707,19 +719,43 @@ final class RichTextEditorController: NSObject, ObservableObject, NSTextViewDele
         return storage.attributes(at: sel.location, effectiveRange: nil)
     }
 
+    /// Republish the format strip's state from wherever the caret now is.
+    ///
+    /// **Every write here is guarded, and that is a performance fix, not tidiness
+    /// (2026aug06).** This runs from `textViewDidChangeSelection`, so it runs on
+    /// every arrow key — and an arrow key inside a run of uniform text changes
+    /// none of these five values. Assigning a `@Published` fires
+    /// `objectWillChange` whether or not the value differs, and `ComposeView.body`
+    /// observes this controller, so each no-op write was re-running the whole
+    /// composer body: the recipient fields, `isDirty` (which compares the entire
+    /// `RichText`), and `reviewSnapshot`. Stephen measured the consequence as
+    /// arrow-key repeat of about 10 characters a second in the composer against
+    /// about 30 in TextEdit and in a browser, with the system key-repeat rate at
+    /// maximum — so it was not the global setting, which is what I had wrongly
+    /// told him. Comparing first turns the common case into no republish at all.
+    ///
+    /// The colour conversion is done last and only when needed: `usingColorSpace`
+    /// allocates, and it was previously run on every caret move.
     private func refreshSelection() {
         let attrs = currentAttributes()
         let font = (attrs[.font] as? NSFont) ?? defaultFont
-        selectionBold = font.fontDescriptor.symbolicTraits.contains(.bold)
+
+        let bold = font.fontDescriptor.symbolicTraits.contains(.bold)
+        if selectionBold != bold { selectionBold = bold }
+
         let obliqueness = (attrs[.obliqueness] as? NSNumber)?.doubleValue ?? 0
-        selectionItalic = font.fontDescriptor.symbolicTraits.contains(.italic) || obliqueness > 0
-        selectionFontName = font.familyName ?? defaults.family
-        selectionFontSize = Double(font.pointSize)
-        if let color = (attrs[.foregroundColor] as? NSColor)?.usingColorSpace(.sRGB) {
-            selectionColor = Color(nsColor: color)
-        } else {
-            selectionColor = Color(nsColor: .textColor)
-        }
+        let italic = font.fontDescriptor.symbolicTraits.contains(.italic) || obliqueness > 0
+        if selectionItalic != italic { selectionItalic = italic }
+
+        let family = font.familyName ?? defaults.family
+        if selectionFontName != family { selectionFontName = family }
+
+        let size = Double(font.pointSize)
+        if selectionFontSize != size { selectionFontSize = size }
+
+        let nsColor = (attrs[.foregroundColor] as? NSColor)?.usingColorSpace(.sRGB)
+        let color = Color(nsColor: nsColor ?? .textColor)
+        if selectionColor != color { selectionColor = color }
     }
 
     // MARK: mutators, called by the strip
