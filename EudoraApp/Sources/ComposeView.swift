@@ -100,7 +100,27 @@ struct ComposeView: View {
         VStack(spacing: 0) {
             headerFields
             Divider()
-            FormatStrip(controller: editor)
+            // `.equatable()` is load-bearing, not decoration: it is what lets
+            // SwiftUI skip this strip's body when only the text changed. Without
+            // it the `Equatable` conformance is never consulted and every
+            // keystroke rebuilds a `Text` per installed font family. Measured —
+            // see `FormatStrip`.
+            //
+            // The closures are made here, in `body`, and passed down as values,
+            // which is the same rule `MailboxTree.setExpanded` follows for a
+            // different reason: a child holding the parent is the shape that
+            // causes trouble.
+            FormatStrip(fontName: editor.selectionFontName,
+                        fontSize: editor.selectionFontSize,
+                        color: editor.selectionColor,
+                        bold: editor.selectionBold,
+                        italic: editor.selectionItalic,
+                        setFamily: { editor.setFontFamily($0) },
+                        setSize: { editor.setFontSize($0) },
+                        setColor: { editor.setColor($0) },
+                        onToggleBold: { editor.toggleBold() },
+                        onToggleItalic: { editor.toggleItalic() })
+                .equatable()
             Divider()
             RichTextEditor(controller: editor,
                            seed: seedContent,

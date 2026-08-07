@@ -141,9 +141,55 @@ public struct MessageIDIndex {
     // below and the call inside the loop tries to invoke a `String`.
     public static func offset(of wantedID: String, in base: URL) -> Int? {
         guard let wanted = normalized(wantedID) else { return nil }
+        var hit: Int?
+        scanHeaders(in: base) { offset, head in
+            guard messageID(inHeaderBytes: head) == wanted else { return true }
+            hit = offset
+            return false      // first match wins; stop reading
+        }
+        return hit
+    }
+
+    /// The byte offsets of every record in `<base>.mbx` whose `In-Reply-To`
+    /// names `wantedID`, **in mailbox order**.
+    ///
+    /// This is the link from a message to the answers to it. Nothing stores that
+    /// link — the R mark is one status byte and says only *that* a reply was
+    /// sent — but every reply carries the original's id in its `In-Reply-To`, so
+    /// the relation is derivable rather than remembered. Which is the better
+    /// side to hold it on: it needs no new state, survives the reply being
+    /// filed or the original being moved, and works for replies Eudora 7 sent
+    /// years ago, none of which a side-car written today could know about.
+    ///
+    /// All of them rather than the first, because the caller wants the *last*
+    /// one — "where did we leave this?" — and mailbox order is not send order
+    /// once a reply has been filed. The caller compares dates.
+    ///
+    /// Same scan, same bound, same caveats as `offset(of:in:)`.
+    public static func offsets(replyingTo wantedID: String, in base: URL) -> [Int] {
+        guard let wanted = normalized(wantedID) else { return [] }
+        var hits: [Int] = []
+        scanHeaders(in: base) { offset, head in
+            if normalizedHeader("In-Reply-To", inHeaderBytes: head) == wanted {
+                hits.append(offset)
+            }
+            return true
+        }
+        return hits
+    }
+
+    /// Walk a mailbox's records, handing each one's offset and header bytes to
+    /// `visit`. Returning false from `visit` stops the walk.
+    ///
+    /// The one implementation of the scan, shared so the two public readers
+    /// above cannot drift apart about which bytes count as a record's headers —
+    /// the window and its envelope allowance have to match `init(scanning:)`
+    /// exactly, and that is the sort of agreement that decays silently when it
+    /// is written out twice.
+    private static func scanHeaders(in base: URL, visit: (Int, [UInt8]) -> Bool) {
         let mbx = base.appendingPathExtension("mbx")
-        guard withinScanLimit(mbx) else { return nil }
-        guard let data = try? Data(contentsOf: mbx, options: .mappedIfSafe) else { return nil }
+        guard withinScanLimit(mbx),
+              let data = try? Data(contentsOf: mbx, options: .mappedIfSafe) else { return }
         // Copies, because `findRecords` takes an array — the same compromise
         // `init(scanning:)` documents, and the reason for the size limit above.
         let bytes = [UInt8](data)
@@ -154,9 +200,8 @@ public struct MessageIDIndex {
             // agree about which bytes count as a record's headers.
             let stop = min(rec.offset + headerPrefix + envelopeAllowance, end)
             let head = Mbox.messageBytes(fromRecord: Array(bytes[rec.offset..<stop]))
-            if messageID(inHeaderBytes: head) == wanted { return rec.offset }
+            if !visit(rec.offset, head) { return }
         }
-        return nil
     }
 
     /// How large a mailbox this scan will read.
@@ -191,9 +236,20 @@ public struct MessageIDIndex {
     }
 
     static func messageID(inHeaderBytes bytes: [UInt8]) -> String? {
+        normalizedHeader("Message-ID", inHeaderBytes: bytes)
+    }
+
+    /// One header's value out of a record's header bytes, normalised as an id.
+    ///
+    /// Generalised from the `Message-ID` reader above so `In-Reply-To` — which
+    /// carries an id in exactly the same syntax — is read by the same code and
+    /// normalised the same way. A reply's `In-Reply-To` and its original's
+    /// `Message-ID` must compare equal, and they only reliably do if one
+    /// function decides what a bracketed, folded or bare id reduces to.
+    static func normalizedHeader(_ name: String, inHeaderBytes bytes: [UInt8]) -> String? {
         let (head, _) = MIMEParser.splitHeaderBody(bytes)
         for entry in MIMEParser.parseHeaders(head)
-        where entry.name.trimmingCharacters(in: .whitespaces).caseInsensitiveCompare("Message-ID")
+        where entry.name.trimmingCharacters(in: .whitespaces).caseInsensitiveCompare(name)
             == .orderedSame {
             // First match wins, matching `MIMEPart.header`. A message with two
             // Message-ID headers is malformed; agreeing with the rest of the

@@ -1,5 +1,13 @@
 # Enlarge mode — feasibility and practicality
 
+**CLOSED 2026aug07. Not being built.** Stephen found the enlargement can be done
+at the other end of a remote-desktop viewer, with little trouble and no change to
+Eudora. That solves the actual need, so the work below is not scheduled. The
+study is kept because its findings are worth not re-deriving — in particular §3's
+result that `.scaleEffect` breaks the message list's window-coordinate
+hit-testing, and that there is no whole-app scaling trick available here. Read
+the rest as "what it would take", not as a queue item.
+
 A study, not a plan. Written 2026aug06 by inspection only; nothing here has been
 compiled or measured on screen. Where a claim rests on a measurement someone else
 made, it cites the comment that records it.
@@ -240,3 +248,7 @@ inspection:
 - Where does the control live — Settings, next to the existing font size, and
   with a "restart to take effect" note?
 - Is the splash staying at 1x acceptable?
+
+**All moot as of the close above — don't ask them.** The scale-factor question in
+particular (120/130/140) no longer needs answering, since nothing gets baked into
+a retune of the column widths.

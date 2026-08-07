@@ -3687,6 +3687,172 @@ final class AppModel: ObservableObject {
         return rows[pos].isSent
     }
 
+    /// Whether a row carries the R mark — a message a reply has been sent to.
+    ///
+    /// Gates "View Response" in the context menu. The status byte only, not a
+    /// search: the point of showing the item conditionally is that it costs
+    /// nothing to decide, and building a right-click menu is not the place to
+    /// read mailboxes. Whether a response can actually be *found* is settled
+    /// when the item is chosen.
+    func isRepliedMessage(_ id: MessageRow.ID) -> Bool {
+        guard let pos = rowPositionByID[id], pos < rows.count else { return false }
+        return rows[pos].status == MailboxMutator.statusReplied
+    }
+
+    /// Go to the most recent reply to the selected message.
+    ///
+    /// **Nothing stores this link, and nothing should.** The R mark is one status
+    /// byte and says only *that* a reply went out. But every reply carries the
+    /// original's id in its `In-Reply-To`, so the relation is derivable — which
+    /// is the better side to hold it on, as `AppModel.inboxNewestIsUnread` found
+    /// for the In badge: derived state cannot go stale, survives the reply being
+    /// filed or the original being moved, and knows about replies sent long
+    /// before any bookkeeping we might have added.
+    ///
+    /// Two places are asked, and both are needed. **Out** catches a reply sent
+    /// minutes ago, which the search index will not have seen yet — and that is
+    /// the common case for this question. **The index** catches one that has
+    /// since been filed somewhere else, which is the other common case, given
+    /// how Stephen files. Their answers are pooled rather than tried in turn, so
+    /// "the most recent" means the most recent of everything found and not
+    /// merely the newest in whichever place was consulted first.
+    ///
+    /// The index can only narrow, never decide: FTS5 tokenises `<a1@example.com>`
+    /// into four words, so a match cannot tell `In-Reply-To` from `References`,
+    /// and the original message — which carries that id as its own `Message-ID` —
+    /// matches too. Every candidate is therefore confirmed by reading its actual
+    /// headers, a few kilobytes each, and there are only ever a handful.
+    func viewResponse(to id: MessageRow.ID) {
+        // `originalMailbox`, not `item`: a local called `item` would shadow the
+        // `item(ofType:)` method used below, and unqualified lookup stops at the
+        // innermost declaration of a name. The same trap cost a build in
+        // `MessageIDIndex.offset(of:in:)` on the same day.
+        guard let store,
+              let mailboxID = selectedMailboxID,
+              let originalMailbox = itemsByID[mailboxID],
+              let pos = rowPositionByID[id], pos < rows.count,
+              let msg = store.message(at: originalMailbox.base, offset: rows[pos].offset),
+              let originalID = msg.part.header("Message-ID")?
+                .trimmingCharacters(in: .whitespaces),
+              !originalID.isEmpty
+        else {
+            // Deliberately vague about which of the several things went wrong:
+            // every one of them means the same thing to the person reading it,
+            // and the common one by far is a message with no `Message-ID`.
+            showBanner("That message can't be traced to a reply — it carries no Message-ID.")
+            return
+        }
+
+        // Normalised once, here. `MessageIDIndex.offsets` normalises internally
+        // but `indexCandidates` tokenises whatever it is handed, so a raw
+        // `<a@b> (comment)` would build a phrase containing the comment and
+        // match nothing — an asymmetry that would have shown as the index half
+        // silently never contributing.
+        guard let wanted = MessageIDIndex.normalized(originalID) else {
+            showBanner("That message's Message-ID can't be read, so its reply can't be traced.")
+            return
+        }
+
+        var candidates: [(mailboxID: MailboxItem.ID, offset: Int)] = []
+        // `item(ofType:)`, not a scan of `itemsByID.values` — a dictionary's
+        // values have no order and the id and the base must come from the *same*
+        // item. Two lookups that disagreed would label one mailbox's offsets with
+        // another's id, and the confirmation below would then read that file at
+        // these offsets: the wrong-message failure, arriving quietly.
+        if let out = item(ofType: .outbox) {
+            for offset in MessageIDIndex.offsets(replyingTo: wanted, in: out.base) {
+                candidates.append((out.id, offset))
+            }
+        }
+        for hit in indexCandidates(referencing: wanted)
+        where !candidates.contains(where: { $0.mailboxID == hit.mailboxID
+                                            && $0.offset == hit.offset }) {
+            candidates.append(hit)
+        }
+
+        // Confirm each, and date it. A candidate whose record has gone — the
+        // index outliving a delete — simply drops out.
+        var confirmed: [(mailboxID: MailboxItem.ID, offset: Int, epoch: Int)] = []
+        var cachedDatesByMailbox: [MailboxItem.ID: [Int: String]] = [:]
+        for c in candidates {
+            guard let base = itemsByID[c.mailboxID]?.base,
+                  let m = store.message(at: base, offset: c.offset),
+                  let replyTo = m.part.header("In-Reply-To"),
+                  MessageIDIndex.normalized(replyTo) == wanted
+            else { continue }
+
+            // **Skip a reply that hasn't gone out.** `MessageBuilder` writes
+            // `In-Reply-To` and a fresh `Date:` into the Out record on every
+            // save, so a reply merely *begun* — or a Send Again copy, which
+            // carries the header across — confirms exactly like a sent one and,
+            // being newer than the real answer, would win. The menu item only
+            // appears because a reply was already sent, so jumping to an
+            // unfinished draft is never the right answer.
+            //
+            // Not `outgoingStatuses`, which contains `statusSent` and would
+            // exclude every genuine reply.
+            let status = MailboxMutator.status(base: base, offset: c.offset)
+            if let status, [6, 7, MailboxMutator.statusUnsent,
+                            MailboxMutator.statusSendError].contains(status) { continue }
+
+            // The `Date:` header, or the date Eudora cached in the `.toc` when
+            // there isn't one. **Eudora 7 wrote no `Date:` into the copy it
+            // kept** — measured at 694 of 694 in one real mailbox — so without
+            // this fallback every reply it sent scores 0, they all tie, and
+            // "most recent" silently becomes "first one found".
+            var epoch = RFC822Date.epoch(m.part.header("Date") ?? "")
+            if epoch == 0 {
+                let dates = cachedDatesByMailbox[c.mailboxID]
+                    ?? store.cachedDates(at: base)
+                cachedDatesByMailbox[c.mailboxID] = dates
+                if let cached = dates[c.offset], let d = EudoraDateFormat.tocDate(cached) {
+                    epoch = Int(d.timeIntervalSince1970)
+                }
+            }
+            confirmed.append((c.mailboxID, c.offset, epoch))
+        }
+
+        // Newest wins — the question this answers is "where did we leave this?".
+        //
+        // `reduce`, not `max(by:)`: `max` keeps the *first* of equal elements,
+        // and equal is what undateable records are. Ties go to the later
+        // candidate instead, which is the later record in Out, which is the
+        // later reply.
+        guard let best = confirmed.dropFirst().reduce(confirmed.first, { best, c in
+            guard let best else { return c }
+            return c.epoch >= best.epoch ? c : best
+        }) else {
+            showBanner(searchIndex == nil
+                       ? "No reply found. The search index hasn't been built, so only Out was searched."
+                       : "No reply to that message could be found.")
+            return
+        }
+        openMessage(mailboxID: best.mailboxID, offset: best.offset)
+    }
+
+    /// Messages the search index thinks mention `messageID` anywhere in their
+    /// headers. Candidates only — see `viewResponse`.
+    ///
+    /// Takes an id already through `MessageIDIndex.normalized` — a raw header
+    /// value may carry a trailing comment, whose words would go into the phrase
+    /// and stop it matching anything.
+    private func indexCandidates(referencing messageID: String)
+        -> [(mailboxID: MailboxItem.ID, offset: Int)] {
+        guard let searchIndex else { return [] }
+        // The id reduced to the words FTS5 actually stored. Anything that isn't
+        // a letter or digit is a token separator to `unicode61`, so `<` and `>`
+        // and the `@` and the dots all vanish and the id becomes a phrase. Quoted,
+        // so the words must appear together and in order rather than scattered
+        // through a long header block.
+        let words = messageID.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        guard !words.isEmpty else { return [] }
+        let phrase = words.joined(separator: " ")
+        guard let hits = try? searchIndex.search("headers : \"\(phrase)\"", limit: 50) else {
+            return []
+        }
+        return hits.map { (mailboxID: $0.mailbox, offset: $0.offset) }
+    }
+
     /// Open a fresh copy of an already-sent message in the composer — same
     /// recipients, subject and body (styling included), ready to send again.
     ///
@@ -6247,8 +6413,19 @@ final class AppModel: ObservableObject {
     /// Open a search hit in the main window: select its mailbox, map the hit's
     /// byte offset to a 1-based index, and select that message.
     func openHit(_ hit: SearchHit) {
-        guard let store, let item = itemsByID[hit.mailbox],
-              let index = store.indexOfRecord(at: item.base, offset: hit.offset) else {
+        openMessage(mailboxID: hit.mailbox, offset: hit.offset)
+    }
+
+    /// Go to one message, wherever it is: select its mailbox, select the message,
+    /// and bring it to the middle of the list.
+    ///
+    /// Split out of `openHit` so "View Response" reaches the same behaviour
+    /// rather than a second implementation of it. Everything here was learned
+    /// from Find's "View in Mailbox" and none of it is obvious — which window to
+    /// raise, when the rows are and aren't in hand, why the reveal is centred.
+    func openMessage(mailboxID: MailboxItem.ID, offset: Int) {
+        guard let store, let item = itemsByID[mailboxID],
+              let index = store.indexOfRecord(at: item.base, offset: offset) else {
             showError("Couldn't locate that message (index may be stale — try Rebuild Index).")
             return
         }
@@ -6260,7 +6437,7 @@ final class AppModel: ObservableObject {
         // recorded when it appeared; never guessed at by scanning `NSApp.windows`
         // or matching a title, both of which this codebase has been burned by.
         MainWindowAccessor.resolved?.makeKeyAndOrderFront(nil)
-        if selectedMailboxID == hit.mailbox {
+        if selectedMailboxID == mailboxID {
             // Mailbox already listed; just move the selection (onChange renders it).
             selectMessage(index)
             // And bring it to the middle of the list. `keepSelectionVisible`
@@ -6283,7 +6460,7 @@ final class AppModel: ObservableObject {
         } else {
             pendingMessageID = index
             pendingMessageIsExplicitJump = true
-            selectedMailboxID = hit.mailbox   // onChange → loadListing() applies pending
+            selectedMailboxID = mailboxID   // onChange → loadListing() applies pending
         }
     }
 }

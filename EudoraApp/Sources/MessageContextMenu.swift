@@ -451,6 +451,14 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         if n == 1, let id = clickedPrimary, model.isSentMessage(id) {
             add("Send Again", #selector(sendAgain))
         }
+        // "View Response" only on a message showing R, and shown rather than
+        // greyed for the same reason as Send Again: on a message never replied
+        // to it isn't disabled, it's meaningless. The test is the status byte
+        // alone — whether a reply can actually be found is settled when the item
+        // is chosen, not while a right-click menu is being built.
+        if n == 1, let id = clickedPrimary, model.isRepliedMessage(id) {
+            add("View Response", #selector(viewResponse))
+        }
 
         menu.addItem(.separator())
         add("Delete", #selector(deleteMessage))
@@ -570,6 +578,17 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
     @objc private func sendAgain() {
         guard let id = clickedPrimary else { return }
         model.sendAgain(messageIndex: id)
+    }
+
+    /// Jump to the most recent reply to the clicked message.
+    ///
+    /// Not through `actOnClickedRows`: that installs the clicked rows as the
+    /// selection so a model operation can act on it, and this one is about to
+    /// move the selection somewhere else entirely. `menuNeedsUpdate` has already
+    /// selected the clicked row anyway, which is what `viewResponse` reads.
+    @objc private func viewResponse() {
+        guard let id = clickedPrimary else { return }
+        model.viewResponse(to: id)
     }
     @objc private func deleteMessage() { actOnClickedRows { model.deleteSelected() } }
 

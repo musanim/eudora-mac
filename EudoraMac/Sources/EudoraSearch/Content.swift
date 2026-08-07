@@ -74,7 +74,11 @@ enum ContentExtractor {
 /// Parses an RFC-822 `Date:` header into seconds-since-1970 for range queries.
 /// Returns 0 when the header is missing or in a form we don't recognise; such
 /// messages are simply excluded from date-based search predicates.
-enum RFC822Date {
+/// Public because "which of these replies is the most recent?" is asked from
+/// the app, over messages it has just read itself rather than over search hits.
+/// The parser is the same one the index sorts by, which is the point: two
+/// orderings of the same messages should not come from two date readers.
+public enum RFC822Date {
     // Common on-the-wire variants: with/without the leading weekday, a numeric
     // offset or an obsolete alphabetic zone (GMT/UT/EST…), and no-timezone forms
     // (assumed GMT). en_US_POSIX keeps month/day names locale-stable.
@@ -101,7 +105,7 @@ enum RFC822Date {
         return f
     }
 
-    static func epoch(_ header: String) -> Int {
+    public static func epoch(_ header: String) -> Int {
         var h = header.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !h.isEmpty else { return 0 }
         // Strip a trailing zone comment like "+0000 (GMT)" or "-0800 (PST)",
