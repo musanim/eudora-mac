@@ -367,23 +367,45 @@ final class BodyTextView: NSTextView {
     // Extends — never replaces — AppKit's default editing menu, so the built-in
     // spell-check items (Learn / Ignore / suggestions) stay put; we just add a
     // "Correct 'word' to…" entry at the top for the word under the click (or the
-    // current selection). The rule itself is saved by the controller.
+    // current selection), plus any case-variant guesses (see `caseGuesses`).
+    // The rule itself is saved by the controller.
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = super.menu(for: event)
-        guard let menu, let word = correctionTarget(for: event) else { return menu }
-        let item = NSMenuItem(title: "Correct “\(word)” to…",
+        // This class is also the read-only plain-text *reader* (`PlainMailView`),
+        // where both of these items are wrong: nothing there should be rewritten,
+        // and the quick-add has no controller to save through anyway.
+        guard isEditable else { return menu }
+        guard let menu, let target = correctionTarget(for: event) else { return menu }
+        let item = NSMenuItem(title: "Correct “\(target.word)” to…",
                               action: #selector(addCorrection(_:)), keyEquivalent: "")
         item.target = self
-        item.representedObject = word
+        item.representedObject = target.word
         menu.insertItem(NSMenuItem.separator(), at: 0)
         menu.insertItem(item, at: 0)
+
+        // Case guesses sit above that, at the very top, so they read the way the
+        // built-in suggestions do. Inserted in reverse because each goes to 0.
+        let guesses = caseGuesses(for: target.word, in: target.range)
+        if !guesses.isEmpty {
+            menu.insertItem(NSMenuItem.separator(), at: 0)
+            for guess in guesses.reversed() {
+                let g = NSMenuItem(title: guess.replacement,
+                                   action: #selector(applyCaseGuess(_:)), keyEquivalent: "")
+                g.target = self
+                g.representedObject = guess
+                menu.insertItem(g, at: 0)
+            }
+        }
         return menu
     }
 
     /// The word to offer a correction for: the selection if there is one, else
     /// the word under the click. Nil when neither yields a non-empty word.
-    private func correctionTarget(for event: NSEvent) -> String? {
+    ///
+    /// The range is the raw one — untrimmed, so it may be wider than `word`.
+    /// Anything that *replaces* text must check the two still agree.
+    private func correctionTarget(for event: NSEvent) -> (word: String, range: NSRange)? {
         let ns = string as NSString
         let range: NSRange
         let selected = selectedRange()
@@ -405,12 +427,83 @@ final class BodyTextView: NSTextView {
                                    granularity: .selectByWord)
         }
         let word = ns.substring(with: range).trimmingCharacters(in: .whitespacesAndNewlines)
-        return word.isEmpty ? nil : word
+        return word.isEmpty ? nil : (word, range)
     }
 
     @objc private func addCorrection(_ sender: NSMenuItem) {
         guard let word = sender.representedObject as? String else { return }
         (delegate as? RichTextEditorController)?.promptAddCorrection(for: word)
+    }
+
+    // MARK: case guesses
+    //
+    // macOS's spell checker will not offer a *case* change as a guess: type
+    // "ritalin" and it flags the word, but "Ritalin" — which is in the
+    // dictionary — is nowhere in the list. Eudora 7 offered it, so we do too, by
+    // testing the capitalized and all-caps forms ourselves and adding whichever
+    // ones the dictionary accepts. Picking one replaces just that occurrence; it
+    // records nothing, unlike the "Correct … to…" item below it.
+
+    /// One offered case change, carrying enough to verify the text hasn't moved
+    /// between building the menu and picking from it.
+    private struct CaseGuess {
+        let original: String
+        let replacement: String
+        let range: NSRange
+    }
+
+    /// Case-only variants of `word` that the dictionary accepts, when `word`
+    /// itself is misspelled. Empty for a correctly spelled word, and empty
+    /// unless `range` holds exactly `word` — the replacement uses that range.
+    private func caseGuesses(for word: String, in range: NSRange) -> [CaseGuess] {
+        // The length cap is not cosmetic: a selection with no whitespace in it can
+        // be a whole base64 blob or a long URL, and each `isMisspelled` is a
+        // synchronous round-trip to AppleSpell on the main thread.
+        guard (string as NSString).substring(with: range) == word,
+              word.count <= 64,
+              word.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              isMisspelled(word) else { return [] }
+
+        var seen: Set<String> = [word]
+        var guesses: [CaseGuess] = []
+        let candidates = [word.prefix(1).uppercased() + String(word.dropFirst()),
+                          word.uppercased()]
+        for candidate in candidates where seen.insert(candidate).inserted {
+            guard !isMisspelled(candidate) else { continue }
+            guesses.append(CaseGuess(original: word, replacement: candidate, range: range))
+        }
+        return guesses
+    }
+
+    /// Whether the spell checker rejects `word`, honouring what has been learned
+    /// or ignored in *this* document via the view's spell-checker tag.
+    private func isMisspelled(_ word: String) -> Bool {
+        let bad = NSSpellChecker.shared.checkSpelling(
+            of: word, startingAt: 0, language: nil, wrap: false,
+            inSpellDocumentWithTag: spellCheckerDocumentTag, wordCount: nil)
+        return bad.location != NSNotFound
+    }
+
+    @objc private func applyCaseGuess(_ sender: NSMenuItem) {
+        guard let guess = sender.representedObject as? CaseGuess,
+              let storage = textStorage else { return }
+        // The menu was built on right-click; don't write to a range whose text
+        // has changed underneath it.
+        let ns = storage.string as NSString
+        guard NSMaxRange(guess.range) <= ns.length,
+              ns.substring(with: guess.range) == guess.original else { return }
+
+        let attrs = storage.attributes(at: guess.range.location, effectiveRange: nil)
+        // A distinct undo step, so one ⌘Z puts the original spelling back.
+        breakUndoCoalescing()
+        guard shouldChangeText(in: guess.range, replacementString: guess.replacement) else { return }
+        storage.replaceCharacters(
+            in: guess.range,
+            with: NSAttributedString(string: guess.replacement, attributes: attrs))
+        didChangeText()
+        setSelectedRange(NSRange(location: guess.range.location
+                                     + (guess.replacement as NSString).length,
+                                 length: 0))
     }
 }
 

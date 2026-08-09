@@ -49,11 +49,12 @@ public struct MessageIDIndex {
     /// two servers stamp different `Received:` headers on the same message, so
     /// the bytes legitimately differ and any such test would defeat the guard
     /// entirely. `Message-ID` is the only thing that survives the trip.
-    /// **Currently ON, for the cut-over.** The Check Mail notice is transient and
-    /// easy to miss, and during the cut-over the one thing worth not missing is
-    /// this guard firing. Set back to `false` once the dust settles — nothing
-    /// depends on it either way.
-    public static var diagnose = true
+    ///
+    /// It was ON through the cut-over, when the transient Check Mail notice was
+    /// too easy to miss and this guard firing was the thing worth not missing.
+    /// **Off again 2026aug08**, the dust having settled: it reported nothing that
+    /// needed acting on. Nothing depends on it either way.
+    public static var diagnose = false
 
     /// Room for the `From ???@??? Thu Nov 19 17:23:56 2009` envelope line that
     /// precedes every record's real headers — 13 bytes of separator, 24 of
