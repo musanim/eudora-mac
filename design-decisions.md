@@ -248,7 +248,10 @@ fixed). Not yet compiled on Stephen's Mac or tested against real HTML mail.
 Stephen has two addresses. `stephen@musanim.com` is the main one and the home of
 a 30-year permanent archive, reached until now through Windows Eudora 7 in
 emulation on a dedicated MacBook, viewed remotely from the main MacBook Pro and
-an iPad. `stephen.malinowski@gmail.com` is secondary and readable natively
+an iPad — a 12.9-inch iPad Pro (5th generation), 2732x2048 pixels, 1366x1024
+points at 2x, so exactly 4:3. A remote display sized to that ratio fills it
+without letterboxing, which is the target for the BetterDisplay virtual-display
+experiment. `stephen.malinowski@gmail.com` is secondary and readable natively
 everywhere. Gmail is currently configured to **forward a copy of everything to
 musanim**, purely so the archive sees it.
 
@@ -405,6 +408,43 @@ Still open, deliberately not built:
   delivered. Fine for a daily check, not for a first sync of a large account.
 - **Editing a saved account orphans its old Keychain entry** in every case
   except the trimming one handled above.
+
+---
+
+## 8. Reading mail from the iPad — solved outside the app
+
+**Decided 2026-08-11. Working; one overnight test still owed.**
+
+Stephen reads in bed and wants to read and reply from the iPad. The obstacle was
+never the Mac sleeping — it doesn't — but that turning the external displays off
+reflows their windows onto the built-in display, so a Screens session found a
+rearranged desktop every morning.
+
+**The arrangement that works**, and it needs nothing from Eudora:
+
+- A **BetterDisplay virtual display**, "Virtual 16:12" at 1920x1440. The iPad is
+  a 12.9-inch iPad Pro (5th generation) — 2732x2048 pixels, exactly 4:3 — so a
+  4:3 display fills it without letterboxing. The virtual display exists whether
+  or not the physical ones are awake, which is the whole point.
+- **Screens pinned to that display.** Display Selection lives in the Actions
+  menu of the interactive toolbar during a session, and Screens remembers the
+  last display chosen.
+- **`scripts/eudora-park.lua`**, a Hammerspoon script that moves Eudora's main
+  window onto the virtual display when the DELL U4320Q is powered off and
+  restores it when it returns. Confirmed working in both directions, with a
+  delay of ten seconds or so that doesn't matter.
+
+**What was ruled out along the way.** The hoped-for arrangement — Eudora visible
+at the desk *and* independently on the iPad, nothing moving — is not something
+macOS can do. A window lives on exactly one display in exactly one Space, and
+mirroring copies a whole display, not a window. Given that, moving the window on
+a schedule is the honest version of the idea.
+
+**Consequences for the iPad client** (a small HTTP server inside the running app,
+web client first): it stays parked, now for a reason rather than by neglect. The
+display route costs no code in Eudora and no second writer to the mail files. It
+is worth revisiting only if the nightly window move proves fragile, or if
+Stephen wants mail from somewhere the Mac's displays aren't.
 
 ---
 
