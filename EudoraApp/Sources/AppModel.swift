@@ -1610,6 +1610,9 @@ final class AppModel: ObservableObject {
             }
         }
         pendingRemovalNotice = nil
+        // The veil is the last thing a move waits on, so this is the earliest
+        // moment a rebuild owed to that move can start without competing with it.
+        maybeRelearnFiling()
     }
 
     /// Installed by the message table's AppKit bridge (`TableScrollStateSyncer.
@@ -4132,6 +4135,30 @@ final class AppModel: ObservableObject {
     /// Costs one bounded read per selected message (offset and length come from
     /// the listing) plus one indexed query. Nothing here reads a whole `.mbx`.
     func filingSuggestions() -> [FilingSuggestion] {
+        guard let counts = filingCounts() else { return [] }
+        return counts.compactMap { hit in
+            // Dropped rather than shown when the mailbox no longer exists: the
+            // index is a snapshot and a mailbox may have been renamed or deleted
+            // since. Also drops the mailbox the messages are already in — moving
+            // something to where it already is isn't a suggestion.
+            guard hit.mailbox != selectedMailboxID,
+                  let item = itemsByID[hit.mailbox], !item.isFolder else { return nil }
+            return FilingSuggestion(id: hit.mailbox,
+                                    path: readablePath(of: hit.mailbox),
+                                    count: hit.count)
+        }
+    }
+
+    /// The unfiltered ranking behind `filingSuggestions` — which mailboxes the
+    /// index has seen this correspondence filed into, and how often.
+    ///
+    /// **`nil` and `[]` mean different things, and the caller must care.** `nil`
+    /// is "the question could not be asked" — no index yet, a Find in flight, no
+    /// selection. `[]` is a real answer: asked, and the index knows of no mail
+    /// with these addresses anywhere. `filingSuggestions` treats both as "show
+    /// nothing", but `filingIsUnfamiliar` must not, since `[]` is precisely the
+    /// new-correspondent case it exists to catch.
+    private func filingCounts() -> [SearchIndex.FilingCount]? {
         // Not while a Find is running. `SearchIndex` is `@unchecked Sendable` on
         // the stated grounds that its one SQLite connection is never used from
         // two threads at once, and `runSearch` moved the search to a detached
@@ -4139,13 +4166,13 @@ final class AppModel: ObservableObject {
         // invariant forbids. It would also block the main thread for the length
         // of the search, with a menu half-open.
         guard !isSearching, let index = searchIndex,
-              let sel = currentSelectionSet() else { return [] }
+              let sel = currentSelectionSet() else { return nil }
         // Sampled, not surveyed. This runs synchronously while the menu is
         // opening, and every extra message costs a file read plus a parse; a
         // 500-message selection would hold the menu shut for a visible moment to
         // refine a ranking that the first twenty already settle.
         let chosen = rows.filter { selectedMessageIDs.contains($0.id) }.prefix(20)
-        guard !chosen.isEmpty, let store else { return [] }
+        guard !chosen.isEmpty, let store else { return nil }
 
         // Every address in From/To/Cc that isn't me. Not `CorrespondentResolver`,
         // which answers "whose name goes in the Who column" — one party, for
@@ -4224,17 +4251,7 @@ final class AppModel: ObservableObject {
             }
             counts = query(fromBody)
         }
-        return counts.compactMap { hit in
-            // Dropped rather than shown when the mailbox no longer exists: the
-            // index is a snapshot and a mailbox may have been renamed or deleted
-            // since. Also drops the mailbox the messages are already in — moving
-            // something to where it already is isn't a suggestion.
-            guard hit.mailbox != selectedMailboxID,
-                  let item = itemsByID[hit.mailbox], !item.isFolder else { return nil }
-            return FilingSuggestion(id: hit.mailbox,
-                                    path: readablePath(of: hit.mailbox),
-                                    count: hit.count)
-        }
+        return counts
     }
 
     /// A mailbox id rendered as its display path, for a menu label.
@@ -5200,14 +5217,81 @@ final class AppModel: ObservableObject {
         // already is should do nothing rather than rewrite two mailboxes.
         guard destID != selectedMailboxID else { return }
         let n = sel.indices.count
+        // Asked *before* the move: `filingCounts` reads the messages out of the
+        // source mailbox at the offsets the current listing gives, and the move
+        // invalidates both.
+        let unfamiliar = filingIsUnfamiliar(destID: destID)
         do {
             try MailboxMutator.moveMany(from: sel.item.base, indices: sel.indices, to: dest.base)
             recordRecentFiling(from: sel.item, to: destID)
             afterRemoval(veil: "Moving…",
                          notice: n == 1 ? "Moved to \(dest.display)."
                                         : "\(n) messages moved to \(dest.display).")
+            if unfamiliar { relearnPending = true }
         } catch {
             showError("Move failed: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - learning a new filing habit
+
+    /// Whether the index knows of no mail from these correspondents in `destID`.
+    ///
+    /// True in the two cases worth learning from: a mailbox this correspondence
+    /// has never been filed into, and a correspondent the index has never seen at
+    /// all — which includes every mailbox created on the spot to hold them.
+    ///
+    /// False when the question couldn't be asked (see `filingCounts`), because a
+    /// whole-tree rebuild is far too expensive to spend on a shrug.
+    ///
+    /// One known false positive, left alone deliberately: `mailboxesFiledInto`
+    /// ranks and cuts at 50, so filing to a mailbox that holds this
+    /// correspondence but sits below the top 50 reads as unfamiliar. The cost is
+    /// one rebuild that changes nothing.
+    private func filingIsUnfamiliar(destID: MailboxItem.ID) -> Bool {
+        guard let counts = filingCounts() else { return false }
+        return !counts.contains { $0.mailbox == destID }
+    }
+
+    /// A filing has been made that the index doesn't know about, and a rebuild is
+    /// owed. Set at the move; spent by `maybeRelearnFiling`.
+    private var relearnPending = false
+
+    /// Rebuild the search index so the filing just made becomes a hint for the
+    /// next message from the same people.
+    ///
+    /// Stephen's, 2026aug11, and it automates the habit it was described from: he
+    /// was already reaching for Tools ▸ Rebuild Search Index by hand after filing
+    /// somewhere new, to save hunting for that mailbox again next time.
+    ///
+    /// A full rebuild, because there is no incremental path — `SearchIndex` is
+    /// wipe-and-rebuild, and the incremental update named in
+    /// `eudora-mac-architecture.md` has never been built. That is minutes of disk
+    /// work, affordable only because of how `startIndexing` does it: off the main
+    /// thread, into a scratch file swapped in atomically at the end, with the old
+    /// index staying queryable throughout. Nothing is blocked, and nothing is
+    /// lost if it is interrupted.
+    ///
+    /// **Never during the removal veil, which is why this is deferred rather than
+    /// called from `moveSelected`.** The veil comes down when the re-listing read
+    /// lands, and its 15-second backstop exists because that read is slow on a
+    /// large mailbox. A rebuild reads the whole 12 GB tree, so starting one in the
+    /// same turn puts a competing `.userInitiated` disk load against the one read
+    /// that lifts the veil — and "the message list goes dead after a move" is an
+    /// open, unreproduced bug on exactly that path. Waiting for `dropRemovalVeil`
+    /// costs nothing and keeps the two off each other.
+    ///
+    /// No banner. The move's own notice ("Moved to X.") is the useful message at
+    /// that moment; the rebuild reports itself through `searchStatus` and
+    /// `indexProgress` like every other one.
+    private func maybeRelearnFiling() {
+        guard relearnPending, !isIndexing, let rootURL else { return }
+        relearnPending = false
+        // One turn later again: `dropRemovalVeil` calls this from inside the
+        // list-restore path, and the scroll restore it is part of should finish
+        // before minutes of disk work begin.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.startIndexing(for: rootURL)
         }
     }
 
@@ -6191,7 +6275,14 @@ final class AppModel: ObservableObject {
         let path = indexURL(for: root)?.path ?? ":memory:"
         // Already building this same index file? Let it finish — don't open a
         // second writer to the same path.
-        if isIndexing, indexingPath == path { return }
+        //
+        // On `indexingPath` alone, deliberately. It used to test `isIndexing`
+        // too, and that flag is set *inside* the Task below while `indexingPath`
+        // is set synchronously here — so two calls in one main-actor turn both
+        // passed, both cleared the scratch file and both opened a SQLite writer
+        // on it. `indexingPath` is nil'd on every exit that owns it (below), so
+        // testing it alone is both sufficient and tighter.
+        if indexingPath == path { return }
         indexGeneration += 1
         let gen = indexGeneration
         indexingPath = path
@@ -6277,6 +6368,11 @@ final class AppModel: ObservableObject {
             self.isIndexing = false
             self.indexingPath = nil
             self.lastIndexBuilt = Date()
+            // A filing made *during* this rebuild asked for one of its own and
+            // was refused by the guard above. Honour it now — otherwise the
+            // second of two new mailboxes filed to in quick succession is
+            // silently never learned.
+            self.maybeRelearnFiling()
         }
     }
 

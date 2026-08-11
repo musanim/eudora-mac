@@ -370,34 +370,161 @@ final class BodyTextView: NSTextView {
     // current selection), plus any case-variant guesses (see `caseGuesses`).
     // The rule itself is saved by the controller.
 
+    /// Why the composer appeared to flag nothing — no red underline, no spelling
+    /// section in the context menu — while the same words were flagged in every
+    /// other app and "Check Spelling While Typing" read as ticked.
+    ///
+    /// **Off, 2026aug11, with its answer.** Inspection had cleared everything:
+    /// `makeNSView` sets `isContinuousSpellCheckingEnabled = true`, the view is
+    /// editable, and the case-guess code only runs on right-click — yet a fresh
+    /// launch with no right-click still underlined nothing. The probe printed
+    /// `continuous=true editable=true rich=true docTag=1 teh: viewTag=false
+    /// tag0=false lang=en automatic=true`: the checker itself declared the typo
+    /// correct, under both tags, so neither the view nor this class was involved.
+    ///
+    /// The cause was **automatic language identification with nothing to identify
+    /// from**. A bare word in an otherwise empty compose window gives the checker
+    /// three characters to work with; it guesses, lands on a language with no
+    /// installed dictionary, and such a language accepts every word. Typing the
+    /// same typo inside an ordinary English sentence underlined it immediately.
+    /// Two consequences, one for the test and one for the code: a one-word
+    /// document is not a valid way to test spelling, and `isMisspelled` must name
+    /// its language rather than let one be identified — see the note there.
+    ///
+    /// Kept intact. If spelling ever looks wrong here again, this line is what to
+    /// switch on, and `continuous=false` would be a different answer entirely.
+    static var diagnoseSpelling = false
+
+    private func diagnoseSpellingState() {
+        guard Self.diagnoseSpelling else { return }
+        let checker = NSSpellChecker.shared
+        func bad(_ word: String, tag: Int) -> Bool {
+            checker.checkSpelling(of: word, startingAt: 0, language: nil, wrap: false,
+                                  inSpellDocumentWithTag: tag, wordCount: nil).location != NSNotFound
+        }
+        print("[spell] continuous=\(isContinuousSpellCheckingEnabled)"
+              + " editable=\(isEditable) rich=\(isRichText)"
+              + " docTag=\(spellCheckerDocumentTag)"
+              + " teh: viewTag=\(bad("teh", tag: spellCheckerDocumentTag))"
+              + " tag0=\(bad("teh", tag: 0))"
+              + " lang=\(checker.language())"
+              + " automatic=\(checker.automaticallyIdentifiesLanguages)")
+        // The same question with the language forced rather than identified from
+        // three characters — what `caseGuesses` actually asks. This is the line
+        // that showed the fix working: `Ritalin` accepted, `RITALIN` not, which
+        // is also the evidence that AppleSpell does *not* wave through arbitrary
+        // all-caps as acronyms.
+        print("[spell] forced(\(checker.language())):"
+              + " teh=\(isMisspelled("teh"))"
+              + " ritalin=\(isMisspelled("ritalin"))"
+              + " Ritalin=\(isMisspelled("Ritalin"))"
+              + " RITALIN=\(isMisspelled("RITALIN"))"
+              + " available=\(checker.availableLanguages)")
+    }
+
     override func menu(for event: NSEvent) -> NSMenu? {
-        let menu = super.menu(for: event)
+        diagnoseSpellingState()
+        return super.menu(for: event)
+    }
+
+    /// Marks the items this class adds, so a reused menu can be cleared of them.
+    private static let addedItemTag = 0x45554431   // 'EUD1'
+
+    /// Our additions go in here rather than in `menu(for:)`, and the reason is
+    /// worth keeping: **`NSTextView` fills the spelling guesses in lazily**, when
+    /// the menu is about to open rather than when it is built. Items inserted at
+    /// index 0 in `menu(for:)` are therefore pushed *below* the guesses by the
+    /// time the menu is on screen — observed 2026aug11, with "Ritalin" arriving
+    /// under half a dozen of AppKit's suggestions instead of above them. Adding
+    /// after `super.willOpenMenu` is the only way to sit above a list that does
+    /// not yet exist when the menu is constructed. (It is also correct if AppKit
+    /// ever changes and adds them earlier, so it costs nothing to prefer.)
+    /// Whether AppKit's spelling guesses are in the menu by the time
+    /// `willOpenMenu` runs.
+    ///
+    /// **Off, 2026aug11 — settled by outcome rather than by the log.** Stephen
+    /// confirmed the items land at the top of the menu, which is what the change
+    /// was for. The printed list itself was never captured, so *which* mechanism
+    /// places AppKit's guesses is still formally unknown: inside
+    /// `super.willOpenMenu` (what this assumes), during the menu's own update pass
+    /// afterwards, or asynchronously once it is on screen. The last two would
+    /// have left ours below, and they didn't, so the assumption is at least
+    /// consistent with what happened.
+    ///
+    /// That matters because Apple's note introducing `willOpenMenu` says it
+    /// "should not be used to make modifications to the passed in menu object" —
+    /// so the ordering is not contractual and a future macOS could move it. If
+    /// the guesses ever appear above ours again, switch this on: a list holding
+    /// only Cut/Copy/Paste/Look Up means the insertion must move once more, to an
+    /// `NSMenuDelegate` on the menu itself, whose `menuNeedsUpdate` runs last
+    /// before display.
+    static var diagnoseMenuOrder = false
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+        if Self.diagnoseMenuOrder {
+            print("[menu] " + menu.items
+                .map { $0.isSeparatorItem ? "—" : $0.title }
+                .joined(separator: " | "))
+        }
+        // AppKit may hand back the same menu on a later right-click; ours have to
+        // come off before they go back on, or they accumulate.
+        for item in menu.items where item.tag == Self.addedItemTag {
+            menu.removeItem(item)
+        }
         // This class is also the read-only plain-text *reader* (`PlainMailView`),
         // where both of these items are wrong: nothing there should be rewritten,
         // and the quick-add has no controller to save through anyway.
-        guard isEditable else { return menu }
-        guard let menu, let target = correctionTarget(for: event) else { return menu }
-        let item = NSMenuItem(title: "Correct “\(target.word)” to…",
-                              action: #selector(addCorrection(_:)), keyEquivalent: "")
-        item.target = self
-        item.representedObject = target.word
-        menu.insertItem(NSMenuItem.separator(), at: 0)
-        menu.insertItem(item, at: 0)
+        guard isEditable, let target = correctionTarget(for: event) else { return }
 
-        // Case guesses sit above that, at the very top, so they read the way the
-        // built-in suggestions do. Inserted in reverse because each goes to 0.
+        var added: [NSMenuItem] = []
+        // The case guesses read as ordinary suggestions, so they go first — and
+        // the leading one is bold, the convention for "this is probably the one".
         let guesses = caseGuesses(for: target.word, in: target.range)
-        if !guesses.isEmpty {
-            menu.insertItem(NSMenuItem.separator(), at: 0)
-            for guess in guesses.reversed() {
-                let g = NSMenuItem(title: guess.replacement,
-                                   action: #selector(applyCaseGuess(_:)), keyEquivalent: "")
-                g.target = self
-                g.representedObject = guess
-                menu.insertItem(g, at: 0)
+        for (i, guess) in guesses.enumerated() {
+            let item = NSMenuItem(title: guess.replacement,
+                                  action: #selector(applyCaseGuess(_:)), keyEquivalent: "")
+            item.representedObject = guess
+            if i == 0 {
+                let bold = NSFontManager.shared.convert(NSFont.menuFont(ofSize: 0),
+                                                        toHaveTrait: .boldFontMask)
+                item.attributedTitle = NSAttributedString(string: guess.replacement,
+                                                          attributes: [.font: bold])
             }
+            added.append(item)
         }
-        return menu
+        if !added.isEmpty { added.append(.separator()) }
+
+        let correct = NSMenuItem(title: "Correct “\(target.word)” to…",
+                                 action: #selector(addCorrection(_:)), keyEquivalent: "")
+        correct.representedObject = target.word
+        added.append(correct)
+        added.append(.separator())
+
+        for (i, item) in added.enumerated() {
+            item.tag = Self.addedItemTag
+            // Separators can't have a target, and setting one on them is
+            // harmless, but the action items must have one to be enabled.
+            if item.action != nil { item.target = self }
+            menu.insertItem(item, at: i)
+        }
+    }
+
+    /// Take our items back out when the menu closes.
+    ///
+    /// `NSTextView` builds its context menu from a class-level `defaultMenu`, so
+    /// the same `NSMenu` can be reachable from another text view — the recipient
+    /// field editor, or the read-only reader. Left in place, ours would surface
+    /// there as greyed-out ghosts offering to correct a word that view has never
+    /// seen. Removing on open covers the same view twice; removing on close
+    /// covers every other view as well.
+    ///
+    /// The event is optional here, unlike `willOpenMenu`.
+    override func didCloseMenu(_ menu: NSMenu, with event: NSEvent?) {
+        for item in menu.items where item.tag == Self.addedItemTag {
+            menu.removeItem(item)
+        }
+        super.didCloseMenu(menu, with: event)
     }
 
     /// The word to offer a correction for: the selection if there is one, else
@@ -477,9 +604,22 @@ final class BodyTextView: NSTextView {
 
     /// Whether the spell checker rejects `word`, honouring what has been learned
     /// or ignored in *this* document via the view's spell-checker tag.
+    ///
+    /// **The language is forced, and that is the point.** Passing nil lets the
+    /// checker identify the language from the string it is given, and the string
+    /// here is one word — far too little to identify anything from. It guesses,
+    /// often lands on a language with no installed dictionary, and a language
+    /// with no dictionary accepts every word: `checkSpelling` returns "fine" for
+    /// "teh". Measured 2026aug11 — `[spell]` reported `teh: viewTag=false
+    /// tag0=false lang=en automatic=true`, i.e. the checker itself declared the
+    /// typo correct, in both tags, while the same word underlined normally inside
+    /// a real sentence. Continuous checking is unaffected by this, because it
+    /// sees the whole document and can identify the language properly; only these
+    /// isolated questions need to say which language they mean.
     private func isMisspelled(_ word: String) -> Bool {
-        let bad = NSSpellChecker.shared.checkSpelling(
-            of: word, startingAt: 0, language: nil, wrap: false,
+        let checker = NSSpellChecker.shared
+        let bad = checker.checkSpelling(
+            of: word, startingAt: 0, language: checker.language(), wrap: false,
             inSpellDocumentWithTag: spellCheckerDocumentTag, wordCount: nil)
         return bad.location != NSNotFound
     }

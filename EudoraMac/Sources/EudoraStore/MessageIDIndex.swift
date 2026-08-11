@@ -52,7 +52,7 @@ public struct MessageIDIndex {
     ///
     /// It was ON through the cut-over, when the transient Check Mail notice was
     /// too easy to miss and this guard firing was the thing worth not missing.
-    /// **Off again 2026aug08**, the dust having settled: it reported nothing that
+    /// **Off again 2026aug11**, the dust having settled: it reported nothing that
     /// needed acting on. Nothing depends on it either way.
     public static var diagnose = false
 
