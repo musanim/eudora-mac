@@ -87,22 +87,29 @@ exactly as it applies to Swift, and the probe that finally worked
 
 See Current state. The blacklist change is the only unbuilt thing.
 
-### 2. Tonight's night-mode run is the real test
+### 2. Night mode has had one real night; two things are still unproven
 
-Everything so far was tested at the desk in daylight. What has never happened:
-night mode on, an evening's mail read and answered from the iPad, and the desk
-woken in the morning by touching the mouse. Things to watch:
+It ran overnight on 2026aug12 and behaved: the sweep pulled Eudora back to the
+built-in each time the Mac woke on its own (roughly every 100 minutes — watch for
+`activated loginwindow` in the log), and the 07:00 automatic restore fired.
+
+**One thing was found and fixed in the morning.** The wake trigger used to
+include pointer events, and night mode ended twice with nobody at the desk, both
+times while the iPad was in use. Screens appears to warp the remote cursor rather
+than post an event, and a warp reports `pid=0` like a hand on the desk.
+Keystrokes discriminate reliably, so the trigger is now a keypress only. **That
+change is in the repo copy and needs copying to `~/.hammerspoon/` and a reload
+before it does anything.**
+
+Still unproven:
 
 - **A compose window opened from bed.** `sweepStrays` should pull it onto the
-  built-in within five seconds. This is the failure that made the first night
-  unusable, and it is the one thing that has not been exercised end to end.
-- **Whether the morning restore returns Eudora to where it was.** The frame is
-  saved as a screen UUID plus an offset from that screen's origin.
-- **Whether the two DDC displays come back to their previous brightness.** If one
-  doesn't, the script keeps its record and says so rather than clearing it.
+  built-in within five seconds. This is the failure that made the very first
+  night unusable, and it has not been exercised end to end.
+- **Whether the morning restore returns Eudora to where it was**, since the last
+  two mornings ended with the automatic 07:00 restore rather than a keypress.
 
 `nightMode.status()` in the Hammerspoon console reports everything relevant.
-There is also an automatic restore at 07:00 whatever else fails.
 
 ### 3. The filing-triggered reindex is still untested
 

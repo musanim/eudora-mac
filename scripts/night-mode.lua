@@ -34,21 +34,19 @@
 --
 -- Getting back out is the part that has to be bulletproof, because a failure
 -- means a desk that cannot be seen. Four independent ways:
---   1. Any input from a device in the office — either keyboard, the numeric
---      keypad, the trackpad, the mouse. Touching any of them means wanting the
---      computer normally again; nothing else would touch them. Only *hardware*
---      events count: Screens injects keystrokes and pointer moves as though
---      they were made here, and those must not end night mode in the middle of
+--   1. A keypress on a keyboard in the office — either keyboard, or the numeric
+--      keypad. Only *hardware* keystrokes count: Screens injects keys as though
+--      they were typed here, and those must not end night mode in the middle of
 --      answering a message. The discriminator is the event's source — hardware
 --      reports process 0 and the HID system state, injected events do not.
+--      Pointer events are deliberately not included; see the tap.
 --   2. ctrl-alt-cmd-D, as a backup.
 --   3. The menu-bar item, which is still clickable: the covers carry no mouse
 --      callback, and the built-in at brightness 0 is faintly readable.
 --   4. Failing all of that, night mode ends by itself at RESTORE_AT.
 --
--- Hence GRACE: the moon is clicked with the mouse, and the hand coming off it
--- is itself local input. Night mode ignores the office for that long first,
--- which is also about how long it takes to leave the room.
+-- Hence GRACE: night mode ignores the office's keyboards for that long first,
+-- which is about how long it takes to leave the room.
 -- Every DDC call is asynchronous, because hs.execute blocks Hammerspoon's main
 -- thread and a monitor that doesn't answer would wedge routes 1, 2 and 3 at
 -- once. That is the suspected cause of the night the hotkey did nothing.
@@ -88,9 +86,8 @@ local NIGHT_LEVEL  = 0      -- built-in brightness at night: fully off
 local PANIC_LEVEL  = 0.6    -- built-in brightness when there is nothing to restore
 local PANIC_FRAC   = 0.75   -- fraction of max luminance/contrast, likewise
 local RESTORE_AT   = "07:00"  -- night mode ends by itself, whatever else failed
-local GRACE        = 45     -- seconds of ignoring the office's input devices
-                            -- after night mode starts — time to let go of the
-                            -- mouse and walk out
+local GRACE        = 45     -- seconds of ignoring the office's keyboards after
+                            -- night mode starts — time to walk out
 
 local EXIT_MODS, EXIT_KEY = { "cmd", "alt", "ctrl" }, "D"   -- D for Day
 
@@ -392,7 +389,7 @@ function M.night()
     M.armedAt = hs.timer.secondsSinceEpoch() + GRACE
     if M.tap then M.tap:start() end
     M.updateMenu()
-    log(string.format("night mode on; anything done at the desk after %d seconds restores it (tap enabled=%s)",
+    log(string.format("night mode on; a keypress at the desk after %d seconds restores it (tap enabled=%s)",
                       GRACE, tostring(M.tap and M.tap:isEnabled())))
   end)
 end
@@ -553,22 +550,23 @@ end
 
 M.armedAt = 0
 
-M.tap = hs.eventtap.new({
-  types.keyDown, types.flagsChanged,                 -- either keyboard, the keypad
-  types.leftMouseDown, types.rightMouseDown, types.otherMouseDown,
-  types.leftMouseDragged, types.rightMouseDragged,
-  types.mouseMoved, types.scrollWheel,               -- trackpad and mouse
-}, function(e)
+-- Keystrokes only, and this is a retreat from something that seemed better.
+-- Pointer events were included — a mouse twitch was meant to be enough — and
+-- night mode then ended twice on evenings when nobody was at the desk, both
+-- times while the iPad was in use. The likely mechanism is that Screens moves
+-- the remote cursor with CGWarpMouseCursorPosition rather than by posting an
+-- event, and a warp produces a mouseMoved that the system attributes to the HID
+-- layer: pid 0, state 1, indistinguishable from a hand on the desk. Keystrokes
+-- carry Screens' own pid and are told apart reliably, so keystrokes it is.
+M.tap = hs.eventtap.new({ types.keyDown }, function(e)
   -- Everything on this path is a plain memory read or a C call. Nothing here
   -- may touch hs.settings, the file system, or anything else that can block.
   if not isNight then return false end
   if hs.timer.secondsSinceEpoch() < M.armedAt then return false end
   if not fromTheDesk(e) then return false end
-  log("restore: local input")
+  log("restore: key pressed at the desk")
   M.day()
-  -- A keystroke is swallowed so it isn't typed into whatever had focus;
-  -- pointer events pass through, being harmless and awkward to suppress.
-  return e:getType() == types.keyDown
+  return true            -- swallowed, so it isn't typed into whatever had focus
 end)
 
 -- macOS disables an event tap that takes too long to answer. Nothing here
@@ -597,7 +595,7 @@ M.menu = hs.menubar.new()
 function M.updateMenu()
   if not M.menu then return end
   M.menu:setTitle(active() and "☀" or "☾")
-  M.menu:setTooltip(active() and "Night mode is on — touch the keyboard or mouse to restore"
+  M.menu:setTooltip(active() and "Night mode is on — press a key at the desk to restore"
                               or "Click for night mode")
 end
 if M.menu then

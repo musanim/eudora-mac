@@ -430,9 +430,17 @@ onto the built-in and it is sized to fill. From the iPad the whole four-display
 desktop is visible, three of the four as black rectangles, and Stephen works in
 the built-in's area of it.
 
-It is turned on by a menu-bar click and turned off by **anything done on an
-office input device** — either keyboard, the keypad, the trackpad, the mouse.
-Touching one of those means wanting the computer normally again.
+It is turned on by a menu-bar click and turned off by **a keypress on a keyboard
+in the office** — either keyboard, or the numeric keypad. Sitting down and typing
+means wanting the computer normally again.
+
+Pointer events were included at first, so that a mouse twitch would do, and that
+had to be withdrawn: night mode ended twice on evenings when nobody was at the
+desk, both times while the iPad was in use. The likely mechanism is that Screens
+moves the remote cursor with `CGWarpMouseCursorPosition` rather than by posting
+an event, and a warp produces a `mouseMoved` attributed to the HID layer —
+`pid=0, state=1`, indistinguishable from a hand on the desk. Keystrokes carry
+Screens' own process id and are told apart reliably.
 
 ### The four things that had to be learned first, none of them obvious
 
@@ -475,10 +483,11 @@ explicit night mode rather than detection.
   is *dim*, not off. m1ddc has no power-mode command, so standby is out of reach
   without BetterDisplay.
 - **Local input versus Screens**, established with a probe rather than a guess:
-  a hardware key or click reports `pid=0, state=1`; the same keystroke injected
-  by Screens reports the Screens process id and `state=1973594324`. That
-  discriminator is what lets a bare mouse-twitch end night mode without a reply
-  typed from bed ending it too.
+  a hardware keystroke reports `pid=0, state=1`; the same keystroke injected by
+  Screens reports the Screens process id and `state=1973594324`. That
+  discriminator is what lets a key at the desk end night mode without a reply
+  typed from bed ending it too. It holds for keystrokes; it does **not** hold for
+  pointer movement, which is why the wake trigger is keys only.
 - **Nothing on the event-tap path may block.** An `hs.settings` read per event —
   an IPC round-trip to `cfprefsd` — was enough for macOS to disable the tap, and
   a disabled tap is a desk that cannot be woken. Every DDC call is asynchronous
