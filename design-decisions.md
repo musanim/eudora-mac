@@ -413,38 +413,91 @@ Still open, deliberately not built:
 
 ## 8. Reading mail from the iPad — solved outside the app
 
-**Decided 2026-08-11. Working; one overnight test still owed.**
+**Decided 2026-08-12. Working at the desk; the first real night is still owed.**
 
-Stephen reads in bed and wants to read and reply from the iPad. The obstacle was
-never the Mac sleeping — it doesn't — but that turning the external displays off
-reflows their windows onto the built-in display, so a Screens session found a
-rearranged desktop every morning.
+Stephen reads in bed and wants to read and reply from the iPad, over an Edovia
+Screens session to the Mac. Nothing here is Eudora code: it is `scripts/night-mode.lua`,
+a Hammerspoon script, plus `m1ddc`.
 
-**The arrangement that works**, and it needs nothing from Eudora:
+### The answer
 
-- A **BetterDisplay virtual display**, "Virtual 16:12" at 1920x1440. The iPad is
-  a 12.9-inch iPad Pro (5th generation) — 2732x2048 pixels, exactly 4:3 — so a
-  4:3 display fills it without letterboxing. The virtual display exists whether
-  or not the physical ones are awake, which is the whole point.
-- **Screens pinned to that display.** Display Selection lives in the Actions
-  menu of the interactive toolbar during a session, and Screens remembers the
-  last display chosen.
-- **`scripts/eudora-park.lua`**, a Hammerspoon script that moves Eudora's main
-  window onto the virtual display when the DELL U4320Q is powered off and
-  restores it when it returns. Confirmed working in both directions, with a
-  delay of ten seconds or so that doesn't matter.
+**Night mode changes nothing about the display configuration.** All four
+displays stay connected and live. The built-in's backlight goes to 0 — Screens
+captures the framebuffer, not the backlight, so the iPad still sees it perfectly
+— and every external gets an opaque black cover, with DDC luminance and contrast
+taken to 0 underneath where the monitor answers DDC. Eudora's windows are moved
+onto the built-in and it is sized to fill. From the iPad the whole four-display
+desktop is visible, three of the four as black rectangles, and Stephen works in
+the built-in's area of it.
 
-**What was ruled out along the way.** The hoped-for arrangement — Eudora visible
-at the desk *and* independently on the iPad, nothing moving — is not something
-macOS can do. A window lives on exactly one display in exactly one Space, and
-mirroring copies a whole display, not a window. Given that, moving the window on
-a schedule is the honest version of the idea.
+It is turned on by a menu-bar click and turned off by **anything done on an
+office input device** — either keyboard, the keypad, the trackpad, the mouse.
+Touching one of those means wanting the computer normally again.
 
-**Consequences for the iPad client** (a small HTTP server inside the running app,
-web client first): it stays parked, now for a reason rather than by neglect. The
-display route costs no code in Eudora and no second writer to the mail files. It
-is worth revisiting only if the nightly window move proves fragile, or if
+### The four things that had to be learned first, none of them obvious
+
+**1. BetterDisplay broke the displays.** The first design used a BetterDisplay
+virtual display, 4:3 to match the iPad (12.9-inch iPad Pro, 5th generation:
+2732x2048, exactly 4:3), with Eudora parked on it. It worked for one evening.
+BetterDisplay reapplies a display configuration at login, and after a night of it
+the Mac could no longer make the U4320Q its main display — every display went
+black on the attempt, across reboots. The recovery was to quit BetterDisplay,
+remove it from Login Items, set the main display with it not running, and
+restart. It is uninstalled and should stay that way.
+
+**2. A virtual display guarantees a place for windows to hide.** With one, there
+are always at least two displays, and cmd-N put the compose window on whichever
+held the menu bar — not the one the iPad was showing. It could not be found at
+all. This is why night mode targets the built-in: on an ordinary night nothing
+can hide, and `sweepStrays` covers the mixed case.
+
+**3. Screens cannot cope with a display that is connected but not scanning
+out** — it stalls on "Reconnecting…" indefinitely. This is why "just power the
+monitors off" cannot work, and it is longstanding, not new. Unplugging works.
+
+**4. The three Dells do not agree on what powering off means.** Measured, with
+`hs.screen.allScreens()` logged every five seconds across a power cycle:
+
+| Display | On power-off |
+|---|---|
+| DELL U4320Q | disconnects cleanly |
+| DELL 3008WFP | disconnects, then re-announces itself ~5 s later and holds `main` |
+| DELL3007WFPHC | never leaves the display list at all |
+
+So "the displays are off" is not a state the Mac can be asked about. Hence an
+explicit night mode rather than detection.
+
+### Facts worth keeping
+
+- **DDC**: `m1ddc` (Apple Silicon; `/opt/homebrew/bin`, the *native* Homebrew —
+  `/usr/local` is the Intel one). The U4320Q and the 3008WFP answer; the
+  3007WFPHC answers nothing, so it only ever gets a black cover. DDC luminance 0
+  is *dim*, not off. m1ddc has no power-mode command, so standby is out of reach
+  without BetterDisplay.
+- **Local input versus Screens**, established with a probe rather than a guess:
+  a hardware key or click reports `pid=0, state=1`; the same keystroke injected
+  by Screens reports the Screens process id and `state=1973594324`. That
+  discriminator is what lets a bare mouse-twitch end night mode without a reply
+  typed from bed ending it too.
+- **Nothing on the event-tap path may block.** An `hs.settings` read per event —
+  an IPC round-trip to `cfprefsd` — was enough for macOS to disable the tap, and
+  a disabled tap is a desk that cannot be woken. Every DDC call is asynchronous
+  for the same reason.
+- **"Click wallpaper to reveal desktop" sweeps the covers aside**, since they are
+  ordinary windows. Deliberately not defended against: it is the life preserver
+  that got Stephen out of a blacked-out desk twice.
+
+### Consequences for the iPad client
+
+The in-app HTTP server and web client stay parked, now for a reason rather than
+by neglect: this costs no code in Eudora and introduces no second writer to the
+mail files. Worth revisiting only if night mode proves fragile in use, or if
 Stephen wants mail from somewhere the Mac's displays aren't.
+
+**What macOS cannot do**, established along the way and worth not re-deriving: a
+window lives on exactly one display in exactly one Space. Eudora cannot be
+visible at the desk *and* independently on the iPad. Mirroring copies a display,
+not a window.
 
 ---
 

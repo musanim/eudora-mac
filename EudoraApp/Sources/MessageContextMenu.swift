@@ -608,17 +608,15 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             alert.alertStyle = .critical
             alert.messageText = "Add \(address) to your blacklist?"
             // The list has to match what actually happens — a confirmation that
-            // under-reports its own consequences is worse than none. Hence the
-            // last clause: blacklisting reuses the menu's own Delete, so in
-            // Trash it removes rather than moves, and "delete" everywhere else
-            // in this app means "to Trash".
-            let fate = model.selectionIsInTrash
-                ? "and delete the message permanently, since it is already in Trash."
-                : "and move the message to Trash."
+            // under-reports its own consequences is worse than none. Blacklisting
+            // no longer routes through the menu's Delete, so there is no longer a
+            // Trash case to distinguish: the message is destroyed wherever it
+            // was, and no copy of the reply is kept either.
             alert.informativeText =
                 "This can't be undone. It will reply to this message telling the sender "
                 + "they've been blacklisted, add \(address) to your blacklist list "
-                + "(Tools ▸ Blacklist…), " + fate
+                + "(Tools ▸ Blacklist…), and delete the message permanently. "
+                + "No copy of the reply is kept."
             let yes = alert.addButton(withTitle: "Yes, I'm totally sure")
             let cancel = alert.addButton(withTitle: "Cancel")
             yes.keyEquivalent = ""          // Return must not fire the destructive action

@@ -4480,8 +4480,9 @@ final class AppModel: ObservableObject {
 
     /// Blacklist the selected message's sender. The caller has already confirmed
     /// (this is the point of no return): send the notice reply, add the address to
-    /// the blacklist queue, and delete the message. The ISP-side blacklisting
-    /// Stephen does by hand, from Tools ▸ Blacklist….
+    /// the blacklist queue, and destroy the message outright — not to Trash, and
+    /// no copy of the reply kept anywhere. The ISP-side blacklisting Stephen does
+    /// by hand, from Tools ▸ Blacklist….
     func blacklistSelectedSender() {
         guard let part = selectedPart() else { return }
         let origFrom = part.header("From") ?? ""
@@ -4509,12 +4510,17 @@ final class AppModel: ObservableObject {
         //
         // **Unconditional, even if the notice failed to send.** The mail is
         // unwanted either way, the address is on the list either way, and the
-        // error banner still says what went wrong. This is the same
-        // `deleteSelected` the menu's Delete calls, so the message goes to Trash
-        // — and, exactly as with Delete, blacklisting something already *in*
-        // Trash removes it for good. That consistency is the point; a special
-        // case here would be the surprise. The confirmation says so.
-        deleteSelected()
+        // error banner still says what went wrong.
+        //
+        // **Destroyed, not filed in Trash.** This used to call `deleteSelected`,
+        // so a blacklisted message went to Trash like any other delete. But
+        // Trash is a place things are kept, and the whole point of blacklisting
+        // is that this correspondence is over: keeping a copy means it turns up
+        // in searches and in the "most recent" reckoning behind View Response,
+        // and Stephen empties Trash by hand from a 19,000-message backlog. The
+        // confirmation says "delete the message permanently" and now means it,
+        // wherever the message was.
+        removeSelectedPermanently()
 
         addToBlacklistQueue(addr)
     }
@@ -4548,10 +4554,14 @@ final class AppModel: ObservableObject {
 
         Task {
             do {
-                let sent = try await SMTPClient.send(message, account: account, password: password)
-                // File a copy in Trash (not Out — a blacklist notice is disposable
-                // by nature), addressed to whoever it went to.
-                fileBlacklistCopyInTrash(raw: sent.raw, who: origFrom, subject: message.subject)
+                // The sent notice is kept nowhere — not in Out, not in Trash.
+                // It used to be filed in Trash as a disposable record, and that
+                // copy was worse than useless: it carries `In-Reply-To` and a
+                // fresh `Date:`, so View Response would find it and call it the
+                // most recent reply to a message Stephen had actually answered
+                // properly months earlier. Blacklisting is the end of a
+                // correspondence; there is nothing here worth keeping.
+                _ = try await SMTPClient.send(message, account: account, password: password)
                 showBanner("Blacklist notice sent to \(address).")
             } catch {
                 showError("The blacklist notice to \(address) didn't send: " + describe(error)
@@ -4561,45 +4571,18 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// File a copy of the just-sent blacklist notice in Trash, marked sent.
-    private func fileBlacklistCopyInTrash(raw: Data, who: String, subject: String) {
-        guard let trash = base(ofType: .trash) else {
-            showError("Sent the blacklist notice, but this folder has no Trash to file a copy in.")
-            return
-        }
-        do {
-            _ = try Outbox.append(messageData: raw, to: trash,
-                                  status: MailboxMutator.statusSent, who: who, subject: subject)
-            refreshTrashIfShowing()
-        } catch {
-            showError("Sent the blacklist notice, but couldn't file a copy in Trash: " + describe(error))
-        }
-    }
-
-    /// Re-list Trash if it's the mailbox on screen (mirrors `refreshOutIfShowing`).
-    ///
-    /// **Does nothing while a removal veil is up**, and that guard is not
-    /// optional politeness. Blacklisting now deletes the message too, so this
-    /// arrives seconds later, in the middle of the delete's own relist. Without
-    /// the guard, `loadListing` drops the veil and clears the rows — so the list
-    /// goes blank exactly when the veil exists to stop that, the in-flight
-    /// listing task is cancelled, and with it the completion that restores the
-    /// scroll position. On a 22,000-row Trash that is a blank several seconds
-    /// long ending somewhere other than where you were.
-    ///
-    /// Skipping the refresh costs nothing: the veil's own relist is already
-    /// re-reading this mailbox, and the notice copy is a disposable message that
-    /// can wait for the next listing. The unconditional `reloadTree()` is inside
-    /// the guard for the same reason — republishing 6,699 sidebar nodes on the
-    /// main actor while a listing's continuation is queued behind it is the
-    /// contention `afterRemoval` measured at four seconds.
-    private func refreshTrashIfShowing() {
-        guard removalVeil == nil else { return }
-        reloadTree()
-        if let id = selectedMailboxID, itemsByID[id]?.type == .trash {
-            loadListing(force: true)
-        }
-    }
+    // `fileBlacklistCopyInTrash` and `refreshTrashIfShowing` lived here until the
+    // notice stopped being kept at all. One finding from them is worth carrying
+    // forward, because it will apply to the next thing that lands mail while a
+    // list is being rebuilt: **never re-list a mailbox while a removal veil is
+    // up.** `loadListing` drops the veil and clears the rows, so the list goes
+    // blank exactly when the veil exists to prevent that, the in-flight listing
+    // task is cancelled, and with it the completion that restores the scroll
+    // position — on a 22,000-row Trash, several seconds of blank ending
+    // somewhere other than where you were. `reloadTree` belongs behind the same
+    // guard: republishing 6,699 sidebar nodes on the main actor while a
+    // listing's continuation is queued behind it is the contention
+    // `afterRemoval` measured at four seconds.
 
     /// Add the address to the pending blacklist, and say where it went.
     ///
@@ -4977,14 +4960,10 @@ final class AppModel: ObservableObject {
         return (item, Array(selectedMessageIDs))
     }
 
-    /// Whether the selection sits in Trash, where `deleteSelected` removes for
-    /// good rather than moving.
-    ///
-    /// Exists so the blacklist confirmation can name the actual fate of the
-    /// message instead of saying "delete" and meaning two different things. Reads
-    /// the same `currentSelectionSet` the delete itself will read, so the two
-    /// can't disagree about which branch is coming.
-    var selectionIsInTrash: Bool { currentSelectionSet()?.item.type == .trash }
+    // `selectionIsInTrash` was here. It existed for one caller — the blacklist
+    // confirmation, which had to say "moved to Trash" or "deleted permanently"
+    // depending on where the message was. Blacklisting now destroys it either
+    // way, so there is one fate to name and nothing to ask.
 
     /// Whether anywhere exists to move a message to.
     ///
@@ -5197,14 +5176,24 @@ final class AppModel: ObservableObject {
         // matters is how far the eye and the hand have to travel.
         guard PointerAlert.runModal(alert) == .alertFirstButtonReturn else { return }
 
+        // A notice here where an ordinary delete has none: the rows closing is
+        // feedback that *something* happened, and the thing worth confirming is
+        // which of the two deletes it was.
+        removeSelectedPermanently(notice: n == 1 ? "Message deleted permanently."
+                                                 : "\(n) messages deleted permanently.")
+    }
+
+    /// Destroy the selection outright, with no confirmation of its own.
+    ///
+    /// Both callers ask first — `deletePermanentlySelected` with its own alert,
+    /// blacklisting with the one that covers the whole action — so the asking
+    /// stays where the wording can match what will actually happen, and this
+    /// stays the single place that knows how to do it.
+    private func removeSelectedPermanently(notice: String? = nil) {
+        guard let sel = currentSelectionSet() else { return }
         do {
             try MailboxMutator.removeMany(base: sel.item.base, indices: sel.indices)
-            // A notice here where an ordinary delete has none: the rows closing
-            // is feedback that *something* happened, and the thing worth
-            // confirming is which of the two deletes it was.
-            afterRemoval(veil: "Deleting…",
-                         notice: n == 1 ? "Message deleted permanently."
-                                        : "\(n) messages deleted permanently.")
+            afterRemoval(veil: "Deleting…", notice: notice)
         } catch {
             showError("Delete failed: \(error.localizedDescription)")
         }
