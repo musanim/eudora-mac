@@ -33,7 +33,7 @@
 -- is moved to the built-in.
 --
 -- Getting back out is the part that has to be bulletproof, because a failure
--- means a desk that cannot be seen. Four independent ways:
+-- means a desk that cannot be seen. Three independent ways:
 --   1. A keypress on a keyboard in the office — either keyboard, or the numeric
 --      keypad. Only *hardware* keystrokes count: Screens injects keys as though
 --      they were typed here, and those must not end night mode in the middle of
@@ -42,13 +42,18 @@
 --      Pointer events are deliberately not included; see the tap.
 --   2. ctrl-alt-cmd-D, as a backup.
 --   3. The menu-bar item, which is still clickable: the covers carry no mouse
---      callback, and the built-in at brightness 0 is faintly readable.
---   4. Failing all of that, night mode ends by itself at RESTORE_AT.
+--      callback, and the built-in at brightness 0 is faintly readable. Clicking
+--      the wallpaper first sweeps the covers aside and makes it easy to find.
+--
+-- There is deliberately no timed restore. One at 07:00 was tried and removed:
+-- Stephen is usually still asleep then, so it only ever ended night mode hours
+-- early.
 --
 -- Hence GRACE: night mode ignores the office's keyboards for that long first,
 -- which is about how long it takes to leave the room.
+--
 -- Every DDC call is asynchronous, because hs.execute blocks Hammerspoon's main
--- thread and a monitor that doesn't answer would wedge routes 1, 2 and 3 at
+-- thread and a monitor that doesn't answer would wedge all three routes at
 -- once. That is the suspected cause of the night the hotkey did nothing.
 --
 -- Install:
@@ -62,7 +67,7 @@ if _G.nightMode then
   -- chunk's covers would otherwise stay on screen with nothing able to remove
   -- them.
   for _, c in ipairs(_G.nightMode.covers or {}) do pcall(function() c:delete() end) end
-  for _, k in ipairs({ "ticker", "watchdog", "morning", "tap", "hotkey", "menu", "screenWatcher" }) do
+  for _, k in ipairs({ "ticker", "watchdog", "tap", "hotkey", "menu", "screenWatcher" }) do
     local t = _G.nightMode[k]
     -- hs.menubar and hs.hotkey have delete(); timers, taps and watchers have
     -- stop(). An already-deleted hotkey has neither, hence the pcall.
@@ -85,7 +90,6 @@ local DDC_TIMEOUT  = 5      -- seconds before a DDC call is abandoned
 local NIGHT_LEVEL  = 0      -- built-in brightness at night: fully off
 local PANIC_LEVEL  = 0.6    -- built-in brightness when there is nothing to restore
 local PANIC_FRAC   = 0.75   -- fraction of max luminance/contrast, likewise
-local RESTORE_AT   = "07:00"  -- night mode ends by itself, whatever else failed
 local GRACE        = 45     -- seconds of ignoring the office's keyboards after
                             -- night mode starts — time to walk out
 
@@ -578,13 +582,10 @@ M.watchdog = hs.timer.new(10, function()
   end
 end, true):start()
 
--- Whatever else failed, morning happens.
-M.morning = hs.timer.doAt(RESTORE_AT, "1d", function()
-  if active() then
-    log("automatic restore at " .. RESTORE_AT)
-    M.day()
-  end
-end)
+-- There was an automatic restore here, at 07:00, as a last resort if every
+-- other way out failed. Removed at Stephen's request: he is usually still
+-- asleep, so all it did was undo night mode hours before he wanted it undone.
+-- Three ways out remain, and two of them have been used in anger.
 
 M.ticker = hs.timer.new(SWEEP, function()
   local ok, err = pcall(sweep)

@@ -87,11 +87,50 @@ exactly as it applies to Swift, and the probe that finally worked
 
 See Current state. The blacklist change is the only unbuilt thing.
 
-### 2. Night mode has had one real night; two things are still unproven
+### 2. New feature: "Open sender folder" in the message context menu
+
+Asked for at the end of the session and deliberately not started, so that it gets
+a fresh session rather than the tail of a long one. **Most of it already exists.**
+
+What Stephen asked for: a right-click item on a received message that lists the
+mailboxes this *sender's* mail has been filed into, ranked by count, exactly like
+the Move To hints — and picking one opens that mailbox.
+
+The three pieces:
+
+1. **A From-only variant of `filingCounts()`** (`AppModel.swift:4161`). The
+   existing one deliberately merges every address in From/To/Cc across up to
+   twenty selected messages, because any counterparty is a legitimate filing
+   hint. This wants the single address in From, from the clicked message. A
+   parameter is probably cleaner than a second function — but read that
+   function's comments first, especially the `nil` versus `[]` distinction and
+   the reason it must not run while a Find is in flight (`SearchIndex` is
+   `@unchecked Sendable` on the grounds that its one SQLite connection is never
+   used from two threads at once).
+2. **A submenu in `MessageContextMenu.swift`**, built like the Move To hints:
+   readable path plus count, ranked, the current mailbox dropped
+   (`filingSuggestions()` at `AppModel.swift:4137` already drops it, and drops
+   mailboxes that have since vanished).
+3. **The action is `openRecent(_:)`** (`AppModel.swift:5329`) — it already opens a
+   mailbox with its newest message selected, and its doc explains the
+   already-listed versus not-yet-listed split.
+
+Two decisions Stephen was asked for and hasn't answered yet, so **ask before
+building**:
+
+- **Where it appears.** He said "for an email in the In box"; the suggestion made
+  to him was any single received message, wherever it is clicked.
+- **Whether Trash is excluded.** A sender whose mail is usually deleted would
+  otherwise rank Trash first, which is useless. The suggestion was to exclude it.
+
+### 3. Night mode has had one real night; two things are still unproven
 
 It ran overnight on 2026aug12 and behaved: the sweep pulled Eudora back to the
 built-in each time the Mac woke on its own (roughly every 100 minutes — watch for
-`activated loginwindow` in the log), and the 07:00 automatic restore fired.
+`activated loginwindow` in the log), and the 07:00 automatic restore fired. That
+automatic restore has since been **removed** at Stephen's request — he is usually
+still asleep at seven, so it only ended night mode early. Three ways out remain:
+a keypress at the desk, ctrl-alt-cmd-D, and the menu-bar item.
 
 **One thing was found and fixed in the morning.** The wake trigger used to
 include pointer events, and night mode ended twice with nobody at the desk, both
@@ -107,11 +146,12 @@ Still unproven:
   built-in within five seconds. This is the failure that made the very first
   night unusable, and it has not been exercised end to end.
 - **Whether the morning restore returns Eudora to where it was**, since the last
-  two mornings ended with the automatic 07:00 restore rather than a keypress.
+  two mornings ended with the automatic restore rather than a keypress — and that
+  automatic path no longer exists.
 
 `nightMode.status()` in the Hammerspoon console reports everything relevant.
 
-### 3. The filing-triggered reindex is still untested
+### 4. The filing-triggered reindex is still untested
 
 Written two sessions ago, built, never exercised. Filing to a mailbox the
 correspondent has never gone to should start a rebuild — **"Indexing…" should
@@ -130,7 +170,7 @@ Two known costs, both deliberate, both to reconsider only if Stephen feels them:
   menu-driven route that work is done twice. Caching `filingCounts()` against the
   selection would make the second free.
 
-### 4. Dead message list after a move — still instrumented, still waiting
+### 5. Dead message list after a move — still instrumented, still waiting
 
 Unchanged for four handoffs and **not reproduced**. Both diagnostics still on.
 Read `RemovalVeilDiagnostics`' doc comment (`AppModel.swift`, above `PerfLog`)
@@ -143,7 +183,7 @@ scroll-restore chain set `pendingScrollTopRow` to nil, and `clearPendingScroll`
 lifts the veil *only* when it finds one pending. What doesn't fit is that
 Stephen's lasted minutes, not fifteen seconds.
 
-### 5. One behaviour change he may want reversed
+### 6. One behaviour change he may want reversed
 
 `menu(for:)`/`willOpenMenu` bail unless the view is editable, so **"Correct
 'word' to…" no longer appears when right-clicking a word in a message you are
@@ -151,14 +191,14 @@ reading.** It was dead there anyway (no controller to save through), but it was
 visible. Say the word and it comes back for the reader without the case guesses,
 which are the part that would have rewritten displayed mail.
 
-### 6. Remaining View Response loose end
+### 7. Remaining View Response loose end
 
 The first of the two is now fixed — the blacklist notice no longer exists to be
 found. Still open: **the jump reads the destination mailbox in full on the main
 thread.** `MailStore.indexOfRecord` is a non-mapped `Data(contentsOf:)` plus a
 whole-file record scan, unbounded.
 
-### 7. Older loose ends, still open
+### 8. Older loose ends, still open
 
 - `SidebarExpansion`'s doc comment claims a rename changes a `MailboxItem.ID`.
   Wrong, and now load-bearing for Recents.
@@ -175,7 +215,7 @@ whole-file record scan, unbounded.
   delete's completion message. No delete path passes a notice; the only "Moved
   to…" comes from `moveSelected`. Cosmetic, but wrong.
 
-### 8. Test list, unchanged
+### 9. Test list, unchanged
 
 - **A plain unstyled message must still be a single `text/plain` part** — the
   regression guard for the whole image change.
@@ -220,6 +260,13 @@ over `git commit -F`. Recovery: `rm -f .git/index.lock`. Claude *can* read
 Nothing was added to either today.
 
 **Releasing** is a double-click on `Build Release to Share.command`.
+
+**Claude's Linux workspace was failing to start** at the end of this session
+(`VZErrorDomain Code=1`, "The virtual machine failed to start"). It matters less
+than it looks: `Read`, `Write`, `Edit`, `Grep` and `Glob` run on the host and
+work regardless — only `bash` needs the VM, and everything it was used for here
+(searching the tree, checking dates) has a host-side equivalent. If it is still
+failing, don't spend the session on it; work without shell and say so.
 
 **SMTP/POP are implicit TLS only** — no STARTTLS, no OAuth2. Known gap.
 
