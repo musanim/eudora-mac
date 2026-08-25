@@ -164,6 +164,10 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
     /// time its submenu opened, and the submenu would come up empty.
     private var moveBuilders: [MailboxMenuBuilder] = []
 
+    /// Retained for the same reason as `moveBuilders` — a weak `NSMenu.delegate`
+    /// with nothing else holding it fills nothing.
+    private var senderBuilder: SenderMailboxesBuilder?
+
     /// Prints where the menu was asked to appear, for when it doesn't.
     ///
     /// Off, intact, in the manner of the other diagnostics here. It exists
@@ -354,6 +358,7 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         moveBuilders.removeAll()
+        senderBuilder = nil
 
         if let clicked = resolveClickedID() {
             // Inside the current multi-selection → the menu acts on all of it;
@@ -432,6 +437,55 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         move.submenu = submenu
         move.isEnabled = model.hasMoveTargets
         menu.addItem(move)
+
+        // Directly under Move to, because it is the same knowledge read the
+        // other way round. Move to ▸ asks "where should this go" and answers
+        // from the archive; this asks "where does this person's mail already
+        // live" and answers from the same index — so the two belong together,
+        // and Move to keeps first place under the pointer.
+        //
+        // **A single received message only.** On a message Stephen wrote, the
+        // From address is his own, and an address of his that the identity set
+        // hasn't caught up with matches a large fraction of the archive — the
+        // stale-"me" case `filingCounts` caps its query against. The ranking
+        // would come back as "every mailbox, biggest first", which is worse
+        // than absent. On a multi-selection the question has no single subject.
+        //
+        // `isOutgoingMessage`, **not** `isSentMessage` — see its doc. The
+        // narrow one means "successfully sent", so gating on it would leave the
+        // item offered on every draft and queued message sitting in Out, which
+        // is exactly the case the paragraph above says it exists to exclude.
+        //
+        // Lazy, like Move to, and for the stronger version of the same reason:
+        // filling this costs a bounded read of the message plus an index query,
+        // and hovering past an item must not pay for it.
+        if n == 1, let id = clickedPrimary, !model.isOutgoingMessage(id) {
+            let open = NSMenuItem(title: "Open sender's mailbox", action: nil,
+                                  keyEquivalent: "")
+            let senders = NSMenu(title: "Open sender's mailbox")
+            senders.autoenablesItems = false
+            let builder = SenderMailboxesBuilder(
+                // A pure read, like the Move to suggestions closure, and it must
+                // stay that way: AppKit may call `menuNeedsUpdate:` more than
+                // once, and merely hovering this item then pressing Escape must
+                // leave nothing behind.
+                //
+                // It reads the *clicked* row by id rather than the selection, so
+                // it doesn't depend on the selection install above having stuck.
+                suggestions: { [weak self] in self?.model.senderFilings(for: id) ?? [] },
+                // Not through `actOnClickedRows`: that installs the clicked rows
+                // as the selection so a model operation can act on it, and this
+                // is about to move the selection to another mailbox entirely.
+                // Same reasoning as `viewResponse`.
+                onPick: { [weak self] destination in
+                    self?.model.openRecent(destination)
+                })
+            senders.delegate = builder
+            senderBuilder = builder
+            open.submenu = senders
+            open.isEnabled = true
+            menu.addItem(open)
+        }
 
         menu.addItem(.separator())
         // Reply and Forward only make sense on one message (the design
@@ -626,6 +680,70 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             guard PointerAlert.runModal(alert) == .alertFirstButtonReturn else { return }
             model.blacklistSelectedSender()
         }
+    }
+}
+
+/// Fills "Open sender's mailbox" when it opens: the mailboxes this sender's mail
+/// has been filed into, most used first, each opening that mailbox.
+///
+/// Deliberately *not* `MailboxMenuBuilder` with a different `onPick`. That one
+/// is a tree walker whose suggestions are a shortcut at the top of a hierarchy
+/// that still has to be there — "Other ▸", "New…", folders one level at a time.
+/// This menu is the short list and nothing else: there is no tree to fall back
+/// to, because "every mailbox in the archive" is not an answer to "where does
+/// this person's mail live". Sharing the class would mean carrying that whole
+/// apparatus behind a flag that turns all of it off.
+///
+/// One level, so no child builders to retain — but the *owner* still has to
+/// retain this one, since `NSMenu.delegate` is weak.
+@MainActor
+final class SenderMailboxesBuilder: NSObject, NSMenuDelegate {
+    private let suggestions: () -> [AppModel.FilingSuggestion]
+    private let onPick: (MailboxItem.ID) -> Void
+
+    init(suggestions: @escaping () -> [AppModel.FilingSuggestion],
+         onPick: @escaping (MailboxItem.ID) -> Void) {
+        self.suggestions = suggestions
+        self.onPick = onPick
+        super.init()
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        // Rebuilt each time, like every other menu here: the tree can change
+        // under us, and AppKit is free to ask more than once.
+        menu.removeAllItems()
+
+        let found = suggestions()
+        guard !found.isEmpty else {
+            // Never leave it empty — an `NSMenu` with no items doesn't appear at
+            // all, so the submenu would look broken rather than answered.
+            //
+            // "None found" rather than "never filed", because this is also what
+            // shows when the question couldn't be *asked*: no index yet, or a
+            // Find in flight, both of which `filingCounts` reports as nil and
+            // `senderFilings` flattens to an empty list. Naming the stronger
+            // claim would make the menu lie in those two cases.
+            let none = NSMenuItem(title: "None found", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            menu.addItem(none)
+            return
+        }
+
+        // Same label shape as the Move to hints — readable path, then the count
+        // in parentheses — so the two menus read as the one fact they are.
+        for suggestion in found {
+            let entry = NSMenuItem(title: "\(suggestion.path)  (\(suggestion.count))",
+                                   action: #selector(pick(_:)), keyEquivalent: "")
+            entry.target = self
+            entry.isEnabled = true
+            entry.representedObject = suggestion.id
+            menu.addItem(entry)
+        }
+    }
+
+    @objc private func pick(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? MailboxItem.ID else { return }
+        onPick(id)
     }
 }
 

@@ -3690,6 +3690,22 @@ final class AppModel: ObservableObject {
         return rows[pos].isSent
     }
 
+    /// Whether a listed message is Stephen's own — sent, queued, or still an
+    /// unsent draft.
+    ///
+    /// **Broader than `isSentMessage`, deliberately.** That one is the "Send
+    /// Again" gate and means *successfully* sent (status 8 alone); everything
+    /// else in Out — a draft, a queued message, one whose send failed — is just
+    /// as much a message *from* Stephen, and asking "where is this sender's mail
+    /// filed" about himself is the stale-"me" case `filingCounts` caps its query
+    /// against: an address of his the identity set hasn't caught up with matches
+    /// a large fraction of the archive. So "Open sender's mailbox" gates on this
+    /// rather than on `isSentMessage`.
+    func isOutgoingMessage(_ id: MessageRow.ID) -> Bool {
+        guard let pos = rowPositionByID[id], pos < rows.count else { return false }
+        return MailboxMutator.outgoingStatuses.contains(rows[pos].status)
+    }
+
     /// Whether a row carries the R mark — a message a reply has been sent to.
     ///
     /// Gates "View Response" in the context menu. The status byte only, not a
@@ -4149,6 +4165,34 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Where the *sender* of one message has had their mail filed, most used
+    /// first — the ranking behind the context menu's "Open sender's mailbox".
+    ///
+    /// A different question from `filingSuggestions`, which is about where a
+    /// message should *go*: this one is about where a person's mail already
+    /// *is*, so picking an entry opens that mailbox rather than moving anything.
+    /// Hence From only and one message only — see `filingCounts(fromOnly:)`.
+    ///
+    /// **Trash and Junk are dropped.** A sender whose mail is usually binned
+    /// would otherwise rank Trash first by a wide margin, which answers the
+    /// question truthfully and uselessly. Junk is excluded on the same argument
+    /// and not a separate decision; if either should come back, this is the one
+    /// line to change.
+    func senderFilings(for clicked: MessageRow.ID) -> [FilingSuggestion] {
+        guard let counts = filingCounts(fromOnly: clicked) else { return [] }
+        return counts.compactMap { hit in
+            // Same two drops as `filingSuggestions`: a mailbox the index still
+            // names but the tree no longer has, and the one we are already
+            // looking at — "open the mailbox you are in" is not an offer.
+            guard hit.mailbox != selectedMailboxID,
+                  let item = itemsByID[hit.mailbox], !item.isFolder,
+                  item.type != .trash, item.type != .junk else { return nil }
+            return FilingSuggestion(id: hit.mailbox,
+                                    path: readablePath(of: hit.mailbox),
+                                    count: hit.count)
+        }
+    }
+
     /// The unfiltered ranking behind `filingSuggestions` — which mailboxes the
     /// index has seen this correspondence filed into, and how often.
     ///
@@ -4158,7 +4202,18 @@ final class AppModel: ObservableObject {
     /// with these addresses anywhere. `filingSuggestions` treats both as "show
     /// nothing", but `filingIsUnfamiliar` must not, since `[]` is precisely the
     /// new-correspondent case it exists to catch.
-    private func filingCounts() -> [SearchIndex.FilingCount]? {
+    ///
+    /// **`fromOnly` narrows it to one message's sender**, for `senderFilings`.
+    /// It changes three things, all of them because the question is "where does
+    /// *this person's* mail live" rather than "where might this message belong":
+    /// one message instead of a sample of the selection, `From` instead of
+    /// From/To/Cc, and no body fallback. The last is the one worth stating —
+    /// the fallback answers from addresses quoted in the body, which are people
+    /// the message *mentions*, not the person who sent it. Answering "the
+    /// sender's mail is filed here" from a name in a quoted footer would be
+    /// wrong rather than merely noisy.
+    private func filingCounts(fromOnly clicked: MessageRow.ID? = nil)
+        -> [SearchIndex.FilingCount]? {
         // Not while a Find is running. `SearchIndex` is `@unchecked Sendable` on
         // the stated grounds that its one SQLite connection is never used from
         // two threads at once, and `runSearch` moved the search to a detached
@@ -4171,7 +4226,19 @@ final class AppModel: ObservableObject {
         // opening, and every extra message costs a file read plus a parse; a
         // 500-message selection would hold the menu shut for a visible moment to
         // refine a ranking that the first twenty already settle.
-        let chosen = rows.filter { selectedMessageIDs.contains($0.id) }.prefix(20)
+        //
+        // `fromOnly` takes exactly the one row it names. Not `rows[pos]` blind:
+        // a row id is a mailbox index and `rowPositionByID` is what translates
+        // it, the same way `isSentMessage` does — they differ whenever a mailbox
+        // has ghosts, and reading the wrong record would rank the wrong person's
+        // mailboxes with no visible sign anything went wrong.
+        let chosen: ArraySlice<MessageRow>
+        if let clicked {
+            guard let pos = rowPositionByID[clicked], pos < rows.count else { return nil }
+            chosen = rows[pos...pos]
+        } else {
+            chosen = rows.filter { selectedMessageIDs.contains($0.id) }.prefix(20)
+        }
         guard !chosen.isEmpty, let store else { return nil }
 
         // Every address in From/To/Cc that isn't me. Not `CorrespondentResolver`,
@@ -4195,8 +4262,14 @@ final class AppModel: ObservableObject {
             // Latin-1, which cannot fail: this is only ever scanned for
             // addresses, which are ASCII, and a message whose encoding we
             // guessed wrong should still give up the addresses inside it.
-            bodies.append(String(raw.map { Character(UnicodeScalar($0)) }))
-            for field in ["From", "To", "Cc"] {
+            //
+            // Skipped entirely in `fromOnly` mode, which has no body fallback to
+            // feed: this maps 32 KB into a `String` one `Character` at a time,
+            // and it would be built only to be thrown away.
+            if clicked == nil {
+                bodies.append(String(raw.map { Character(UnicodeScalar($0)) }))
+            }
+            for field in clicked == nil ? ["From", "To", "Cc"] : ["From"] {
                 // `addresses(in:)` already returns bare addresses — it is
                 // `splitList` followed by `bareAddress` — so no second pass.
                 for address in EmailAddress.addresses(in: part.header(field) ?? "") {
@@ -4240,8 +4313,10 @@ final class AppModel: ObservableObject {
         // from one is not.
         //
         // Only when the header attempt produced nothing, so a case that works
-        // today cannot be made worse by it.
-        if counts.isEmpty {
+        // today cannot be made worse by it. And never in `fromOnly` mode — see
+        // the note on this function about why a body address cannot answer
+        // "who sent this".
+        if counts.isEmpty, clicked == nil {
             var fromBody = Set<String>()
             for body in bodies {
                 for address in EmailAddress.scan(inText: body) {
