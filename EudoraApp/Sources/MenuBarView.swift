@@ -235,10 +235,14 @@ struct MenuBarView: View {
             Divider()
             // The count is in the title because the list is otherwise invisible:
             // blacklisting a sender no longer opens anything, so this is the only
-            // standing reminder that addresses are waiting to go to the ISP.
-            Button(model.blacklistQueue.isEmpty
+            // standing reminder that addresses are waiting to go to a blocklist.
+            //
+            // Both lists summed, since the item opens the one window holding
+            // both — a count that named only the ISP list would leave Gmail
+            // entries with no standing sign at all.
+            Button(model.blacklistWaitingCount == 0
                    ? "Blacklist…"
-                   : "Blacklist… (\(model.blacklistQueue.count))") {
+                   : "Blacklist… (\(model.blacklistWaitingCount))") {
                 openWindow(id: "blacklist")
             }
         }.menuBarItem()

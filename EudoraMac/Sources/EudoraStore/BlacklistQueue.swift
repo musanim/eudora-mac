@@ -1,6 +1,11 @@
 import Foundation
 
-/// Addresses waiting to be pasted into Stephen's ISP-side blocklist.
+/// Addresses waiting to be pasted into a blocklist Stephen maintains by hand.
+///
+/// One of these per destination — see `BlacklistBucket`. TigerTech's blocklist
+/// covers musanim.com and a Gmail filter covers gmail.com, and neither can see
+/// the other's list, so the addresses have to be kept apart from the moment they
+/// are collected. The type itself doesn't know or care which it is.
 ///
 /// **Why this is a value in the app and not a file on disk.** It used to be
 /// `~/email_blacklist.txt`: blacklisting a sender appended a line and opened the

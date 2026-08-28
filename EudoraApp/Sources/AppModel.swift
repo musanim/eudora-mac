@@ -587,8 +587,31 @@ final class AppModel: ObservableObject {
     /// open. That is a few hundred bytes into `UserDefaults` and not worth
     /// debouncing — where losing the list to a crash mid-edit would be, since the
     /// window is the only copy until it is drained.
-    @Published var blacklistQueue = BlacklistStore.load() {
-        didSet { BlacklistStore.save(blacklistQueue) }
+    @Published var blacklistQueue = BlacklistStore.load(.isp) {
+        didSet { BlacklistStore.save(blacklistQueue, .isp) }
+    }
+
+    /// The same, for mail that arrives via Gmail rather than musanim.com.
+    ///
+    /// **Two lists because there are two blocklists and neither can see the
+    /// other.** TigerTech filters musanim.com; a Gmail filter's From field
+    /// filters gmail.com. Blacklisting stays one gesture — `BlacklistRouting`
+    /// decides which list the address lands on from the message's own delivery
+    /// headers — and only the draining is separate, because the two destinations
+    /// are separate.
+    ///
+    /// A separate `@Published` rather than a dictionary keyed by bucket: the
+    /// Blacklist window binds a `TextEditor` straight to `.text`, and a binding
+    /// through a dictionary subscript is the kind of thing that works until the
+    /// key is missing.
+    @Published var gmailBlacklistQueue = BlacklistStore.load(.gmail) {
+        didSet { BlacklistStore.save(gmailBlacklistQueue, .gmail) }
+    }
+
+    /// How many addresses are waiting across both lists — what the Tools menu
+    /// shows, since the menu item opens one window holding both.
+    var blacklistWaitingCount: Int {
+        blacklistQueue.count + gmailBlacklistQueue.count
     }
 
     /// The selected messages. Usually one; ⌘-click and ⇧-click grow it.
@@ -4578,10 +4601,11 @@ final class AppModel: ObservableObject {
         // that no longer sits where the selection says it does.
         //
         // **Before queuing the address**, which is the other half of the
-        // ordering. `addToBlacklistQueue` takes only a `String` and never
-        // touches the message, so it is free to come last — and last is where it
-        // belongs, because it raises a banner and the delete's own feedback
-        // should not be talked over.
+        // ordering. `addToBlacklistQueue` takes a `String` and a set of already-
+        // decided destinations, and touches no message, so it is free to come
+        // last — and last is where it belongs, because it raises a banner and
+        // the delete's own feedback should not be talked over. Deciding *which*
+        // lists is the part that reads the message, and it is hoisted below.
         //
         // **Unconditional, even if the notice failed to send.** The mail is
         // unwanted either way, the address is on the list either way, and the
@@ -4595,9 +4619,65 @@ final class AppModel: ObservableObject {
         // and Stephen empties Trash by hand from a 19,000-message backlog. The
         // confirmation says "delete the message permanently" and now means it,
         // wherever the message was.
+
+        // **Decided before the message is destroyed**, and that ordering is as
+        // load-bearing as the notice's. The routing reads the message's own
+        // delivery headers, and after `removeSelectedPermanently` there is no
+        // message left to read them from.
+        let buckets = blacklistBuckets(for: part)
+
         removeSelectedPermanently()
 
-        addToBlacklistQueue(addr)
+        addToBlacklistQueue(addr, buckets: buckets)
+    }
+
+    /// The two addresses of Stephen's whose mail arrives by different routes, and
+    /// so has to be blocked in different places.
+    ///
+    /// Constants rather than settings, because they are facts about his two
+    /// mailboxes and not preferences — and because a wrong value here is silent
+    /// (an address goes on both lists rather than one, which the "both" fallback
+    /// already covers). If a third route ever appears, this and
+    /// `BlacklistBucket` are the two places to change.
+    ///
+    /// Not derived from `me`, which deliberately doesn't distinguish *which* of
+    /// his addresses is which — its whole job is to answer "is this me" with one
+    /// set lookup.
+    static let ispBlacklistDomains: Set<String> = ["musanim.com"]
+    static let gmailBlacklistDomains: Set<String> = ["gmail.com"]
+
+    /// Which pending list(s) a blacklisted sender belongs on. See
+    /// `BlacklistRouting` for why delivery headers are asked before `To`.
+    private func blacklistBuckets(for part: MIMEPart) -> Set<BlacklistBucket> {
+        BlacklistRouting.buckets(
+            deliveredTo: Self.allHeaders(BlacklistRouting.deliveryHeaders, in: part),
+            recipients: Self.allHeaders(BlacklistRouting.recipientHeaders, in: part),
+            ispDomains: Self.ispBlacklistDomains,
+            gmailDomains: Self.gmailBlacklistDomains)
+    }
+
+    /// **Every** value of the named headers, not just the first.
+    ///
+    /// `MIMEPart.header(_:)` returns the first match, which is the last hop —
+    /// MTAs prepend — and a message that reached Stephen by more than one hop
+    /// wants every destination in the chain, not the final one. Blocking such a
+    /// message at the last hop alone leaves the earlier one still letting it
+    /// through.
+    ///
+    /// **No current mail path produces that**: musanim.com and gmail.com are two
+    /// independent mailboxes, collected separately, and neither forwards to the
+    /// other (confirmed 2026aug28). So this is a guard against a shape the
+    /// archive doesn't hold today rather than a fix for one it does — kept
+    /// because reading the whole chain costs nothing and because the alternative
+    /// gets the right answer only by accident of which headers happen to be
+    /// present. If a forward is ever set up, this is already correct.
+    ///
+    /// Case-insensitively, matching `header(_:)`'s own behaviour — these names
+    /// arrive in whatever case the sending MTA felt like.
+    private static func allHeaders(_ names: [String], in part: MIMEPart) -> [String?] {
+        part.headers
+            .filter { h in names.contains { $0.caseInsensitiveCompare(h.name) == .orderedSame } }
+            .map { Optional($0.value) }
     }
 
     /// Auto-send the "you've been blacklisted" reply to the sender.
@@ -4670,12 +4750,44 @@ final class AppModel: ObservableObject {
     ///
     /// The banner carries the count because nothing opens any more: it is the
     /// only standing sign that addresses are waiting.
-    private func addToBlacklistQueue(_ address: String) {
-        if blacklistQueue.add(address) {
-            showBanner("\(address) added to your blacklist — "
-                       + "\(blacklistQueue.count) waiting (Tools ▸ Blacklist…).")
-        } else {
+    /// **The banner names the destination**, because with two lists "added to
+    /// your blacklist" no longer says what will happen next. The two are drained
+    /// into different places by hand, so which one an address landed on is the
+    /// one fact worth carrying.
+    private func addToBlacklistQueue(_ address: String, buckets: Set<BlacklistBucket>) {
+        var added: [String] = []
+        var already = false
+        // Ordered, not `for bucket in buckets` — a `Set` has no order, and the
+        // banner would otherwise name the two lists in whichever order the hash
+        // happened to fall.
+        for bucket in BlacklistBucket.allCases where buckets.contains(bucket) {
+            let didAdd: Bool
+            switch bucket {
+            case .isp:   didAdd = blacklistQueue.add(address)
+            case .gmail: didAdd = gmailBlacklistQueue.add(address)
+            }
+            if didAdd { added.append(Self.blacklistDestinationName(bucket)) } else { already = true }
+        }
+
+        guard !added.isEmpty else {
             showBanner("\(address) was already on your blacklist.")
+            return
+        }
+        // "Gmail and TigerTech" rather than a comma list, since there are only
+        // ever two.
+        let destination = added.joined(separator: " and ")
+        let alreadyNote = already ? " It was already on the other list." : ""
+        showBanner("\(address) added to your \(destination) blacklist — "
+                   + "\(blacklistWaitingCount) waiting (Tools ▸ Blacklist…)."
+                   + alreadyNote)
+    }
+
+    /// What to call a bucket in a banner — the place the list is drained into,
+    /// which is what Stephen thinks of it as, rather than the enum's name.
+    static func blacklistDestinationName(_ bucket: BlacklistBucket) -> String {
+        switch bucket {
+        case .isp:   return "TigerTech"
+        case .gmail: return "Gmail"
         }
     }
 
