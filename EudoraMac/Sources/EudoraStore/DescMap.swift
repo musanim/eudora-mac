@@ -38,6 +38,16 @@ public struct DescMapEntry: Sendable {
     public let type: MailboxType
     public let unread: String
 
+    /// Eudora 7's unread flag, as the file records it.
+    ///
+    /// **Not live state, and nothing in the app may treat it as such.** Eudora 8
+    /// reads this field and never writes it — `MailboxTreeMutator` deliberately
+    /// carries it across byte-for-byte through every rename, move, reorder and
+    /// create — so it says what Eudora 7 believed at the cutover and nothing
+    /// since. It once bolded the sidebar row name, which is how that was found:
+    /// an emptied Trash whose line still read `Trash,Trash.mbx,S,Y` stayed bold
+    /// permanently. Kept because the format has the field and `eudora-spike`
+    /// dumps it.
     public var hasUnread: Bool { unread.uppercased().hasPrefix("Y") }
 }
 

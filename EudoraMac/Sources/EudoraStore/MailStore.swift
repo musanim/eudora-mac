@@ -148,8 +148,12 @@ public struct MailStore: Sendable {
     ///
     /// The In sidebar badge's whole definition: if the most recent arrival is
     /// still unread then the user's pass through In is unfinished, whatever else
-    /// the mailbox contains. Distinct from `DescMapEntry.hasUnread`, which is true
-    /// while *any* message is unread and drives the bold row name.
+    /// the mailbox contains — and, since the sidebar's bold was derived, what
+    /// draws both the glyph and the bold name on In.
+    ///
+    /// Distinct from `DescMapEntry.hasUnread`, which claims to be true while
+    /// *any* message is unread. That one used to drive the bold row name and no
+    /// longer drives anything; see the note on it for why it cannot be trusted.
     public func newestIsUnread(base: URL) -> Bool {
         newestStatus(base: base) == MailboxMutator.statusUnread
     }

@@ -879,6 +879,15 @@ struct MailboxRow: View {
     /// caller gates it on `item.type == .inbox` (see `AppModel.inboxHasNewMail`).
     let newMail: Bool
 
+    /// Whether this row's name is drawn bold: In with an unread newest message,
+    /// or Out with mail waiting to go.
+    ///
+    /// Both terms are already gated to a single row by the values they come
+    /// from — `newMail` by the caller, `hasUnsent` by the tree walk — so this
+    /// needs no test on `item.type`, and would keep working if a second mailbox
+    /// ever legitimately earned either flag.
+    private var wantsAttention: Bool { newMail || item.hasUnsent }
+
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: item.systemImage)
@@ -886,7 +895,17 @@ struct MailboxRow: View {
                 .frame(width: 18)
             Text(item.display)
                 .font(EudoraFont.list)
-                .fontWeight(item.hasUnread ? .semibold : .regular)
+                // **Bold means "this mailbox wants your attention"**, and it is
+                // derived from the same two facts that draw the two glyphs
+                // below — nothing else in the sidebar is ever bold.
+                //
+                // It used to be `item.hasUnread`, read from `descmap.pce`'s
+                // fourth field, which no part of Eudora 8 writes: the flags were
+                // frozen at the cutover, and an emptied Trash stayed bold
+                // forever. Deriving it is the same fix `inboxNewestIsUnread`
+                // already made for the In badge. See the note where `hasUnread`
+                // was removed from `MailboxItem`.
+                .fontWeight(wantsAttention ? .semibold : .regular)
             // Eudora's green "unsent" glyph, just right of the label, when Out
             // holds mail waiting to go. Native art, drawn crisp (no smoothing),
             // at its own size. Only ever set for the Out row — see

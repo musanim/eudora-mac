@@ -25,7 +25,20 @@ struct MailboxItem: Identifiable, Hashable {
     let base: URL           // mailbox base URL (…/In), passed straight to MailStore
     let isFolder: Bool
     let messageCount: Int
-    let hasUnread: Bool
+    // `hasUnread` was here, and it bolded the sidebar row name. It was the
+    // fourth field of the mailbox's `descmap.pce` line — Eudora 7's unread flag
+    // — and **Eudora 8 never writes it**: every mutator in `MailboxTreeMutator`
+    // carries that field across byte-for-byte on purpose. So it recorded what
+    // Eudora 7 believed on the day of the cutover and nothing since. Emptying
+    // Trash left `Trash,Trash.mbx,S,Y` on disk and the row permanently bold,
+    // which is how it was found.
+    //
+    // The same lesson as the In new-mail flag, from the other direction: that
+    // one was remembered state with an unreliable clearer, this was remembered
+    // state with no writer at all. Bold is now derived — see `MailboxRow`, which
+    // takes it from `newMail` and `hasUnsent`, both computed during the tree
+    // walk. `DescMapEntry.hasUnread` still exists because the file format has
+    // that field and `eudora-spike` dumps it; nothing in the app may trust it.
     /// Whether this mailbox holds at least one unsent (status-9) message. Only
     /// ever true for Out — it's the flag behind the green Unsent badge on the Out
     /// row in the sidebar. Computed off-main during the tree build, so it rides
@@ -1012,10 +1025,12 @@ final class AppModel: ObservableObject {
     /// that produced it. Nothing else may set this — if the badge is ever wrong,
     /// the question is which tree walk was missing, not which clear misfired.
     ///
-    /// Not the same signal as the bold row name, which is `MailboxItem.hasUnread`
-    /// and means "In holds unread mail anywhere". This one narrows that to the most
-    /// recent arrival, so working back through a backlog turns the badge off as
-    /// soon as the newest is read, while leaving the bold name alone.
+    /// **Now also what bolds the In row.** It used to be a separate signal —
+    /// `MailboxItem.hasUnread`, "In holds unread mail anywhere" — but that came
+    /// from a `descmap.pce` field nothing in this app writes, so it was frozen
+    /// at the cutover rather than narrower. The distinction it drew was real and
+    /// worth having; the data behind it was not. See the note where
+    /// `hasUnread` was removed.
     @Published private(set) var inboxHasNewMail = false
 
     /// The message list's Who and Date column widths, adjustable by dragging the
@@ -1806,9 +1821,6 @@ final class AppModel: ObservableObject {
     /// Where sent and unsent mail lives, from the in-memory tree.
     var outboxBase: URL? { base(ofType: .outbox) }
 
-    /// A hash of everything the Move menus draw: ids, labels, folder-ness and
-    /// nesting. Deliberately excludes `messageCount` and `hasUnread`, which are
-    /// the only things our own mutations change.
     /// A hash of the tree's *parentage* graph: which items exist, what kind they
     /// are, and what each one's parent is. Keys the sidebar's `.id()`.
     ///
@@ -1816,7 +1828,7 @@ final class AppModel: ObservableObject {
     ///
     /// - **Display names**, because a rename leaves every row identity intact
     ///   (see `treeIdentityVersion`).
-    /// - **Message counts and unread flags**, because mail arriving must not
+    /// - **Message counts and the unsent flag**, because mail arriving must not
     ///   rebuild the sidebar.
     /// - **Sibling order** — which is why the per-item hashes are XOR-ed rather
     ///   than fed to a `Hasher` in sequence. `Hasher` is order-sensitive, so
@@ -1852,6 +1864,13 @@ final class AppModel: ObservableObject {
         return combined
     }
 
+    /// A hash of everything the Move menus draw: ids, labels, folder-ness and
+    /// nesting. Deliberately excludes `messageCount` and `hasUnsent`, which are
+    /// the only things our own mutations change.
+    ///
+    /// This paragraph sat orphaned above `identitySignature` — two doc comments
+    /// stacked, the first describing this function — and named `hasUnread`,
+    /// which no longer exists. Moved to what it describes, and corrected.
     private static func shapeSignature(_ items: [MailboxItem]) -> Int {
         var hasher = Hasher()
         func walk(_ items: [MailboxItem]) {
@@ -1885,7 +1904,6 @@ final class AppModel: ObservableObject {
                                base: n.base,
                                isFolder: n.isFolder,
                                messageCount: n.messageCount,
-                               hasUnread: n.entry.hasUnread,
                                hasUnsent: n.entry.type == .outbox && outboxUnsent,
                                children: kids)
         }
@@ -2228,9 +2246,15 @@ final class AppModel: ObservableObject {
             // KNOWN GAP: `rebuildRows` returns without calling its completion if
             // its listing task is cancelled (a sidebar switch during the settle
             // delay), so a delivery in that window never reaches this line and
-            // In's bold-unread name stays stale until the next tree reload. The
-            // new-mail glyph is set unconditionally in `receiveMail`, so the
-            // arrival is still announced.
+            // In's badge stays stale until the next tree reload.
+            //
+            // **This gap got wider when bold was derived.** It used to be
+            // consoled by "the new-mail glyph is set unconditionally in
+            // `receiveMail`, so the arrival is still announced" — but the glyph
+            // and the bold name are now the same derived value, and nothing
+            // sets it explicitly any more. Miss this line and the arrival goes
+            // unannounced by both until the next tree walk. The gap itself is
+            // unchanged; only the fallback is gone.
             self.reloadTree()
         }
     }
@@ -6052,7 +6076,6 @@ final class AppModel: ObservableObject {
                                base: base,
                                isFolder: asFolder,
                                messageCount: 0,
-                               hasUnread: false,
                                // A freshly made mailbox/folder is never Out and
                                // never unsent; the tree walk will confirm it.
                                hasUnsent: false,
@@ -6271,9 +6294,11 @@ final class AppModel: ObservableObject {
             // value is already true; saying so twice is how the two copies got a
             // chance to disagree.
             //
-            // Still deliberately *not* the same signal as the bold unread name:
-            // bold means "In holds unread mail anywhere" and this means "In's most
-            // recent message is unread".
+            // This is now also what bolds the In row. It used to be deliberately
+            // distinct from the bold name, which meant "In holds unread mail
+            // anywhere" — but that came from a `descmap.pce` field nothing in
+            // this app writes, so it was frozen rather than broader. One derived
+            // value now drives both the glyph and the weight.
         }
 
         report(received: received, duplicates: duplicates, failures: failures,
