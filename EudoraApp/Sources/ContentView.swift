@@ -464,6 +464,11 @@ struct MailboxTree: View, Equatable {
     /// makes the first paint already correct.
     @State private var liveExpansion: Set<String>?
 
+    /// The measured layout of the pinned set, or nil until it has been measured.
+    /// Written by `PinnedSetHeightReader`; see the frame and the set rule in
+    /// `pinnedSet`.
+    @State private var pinnedGeometry: PinnedSetHeightReader.Geometry?
+
     private var expandedIDs: Set<String> { liveExpansion ?? savedExpansion() }
 
     /// `expandedIDs`, reported once per actual change on the way past.
@@ -518,6 +523,30 @@ struct MailboxTree: View, Equatable {
     }
 
     var body: some View {
+        treeList
+            // **The pinned set, as a safe-area inset — not a row of a `VStack`.**
+            //
+            // Stephen leaves only the top-left corner of the window uncovered so
+            // he can see In's green new-mail ball, and scrolling the sidebar took
+            // it away. In/Out/Trash and Recents therefore live in their own
+            // container that never scrolls, above the outline.
+            //
+            // `safeAreaInset` rather than a stack for the same reason the
+            // indexing bar uses it (see the comment in `ContentView.body`): an
+            // inset lives *inside* the view it is applied to, so the height
+            // offered to the outline doesn't change out from under it. Here the
+            // stack version would also have been wrong for a second reason — the
+            // inset keeps the outline's scroller running the full height of the
+            // sidebar instead of starting below the pinned block.
+            //
+            // Applied after `.id(treeIdentityVersion)`, deliberately: the pinned
+            // rows never reparent, so they have no business being thrown away
+            // when the outline's identity changes.
+            .safeAreaInset(edge: .top, spacing: 0) { pinnedSet }
+    }
+
+    /// The scrolling part: the user's own mailboxes and folders.
+    private var treeList: some View {
         List(selection: selection) {
             // The row height, and note where this sits: **inside** the `List`,
             // wrapped around its content, not on the `List` itself.
@@ -537,25 +566,6 @@ struct MailboxTree: View, Equatable {
             // content rather than derived from it, which is why `.listRowInsets`
             // could never have worked either. See `SidebarRowMetrics`.
             Group {
-                // System mailboxes (In/Out/Junk/Trash) are pinned at the top and
-                // have no children, so they're a flat ForEach; a divider then sets
-                // them off from the user's own mailboxes and folders below.
-                ForEach(systemMailboxes) { item in row(for: item) }
-                // Recents is its own set, between the system mailboxes and the
-                // user's own: a divider above it as well as below. Stephen's
-                // reason, and the one to keep in mind before moving it — unlike
-                // everything else in the sidebar, it is not a mailbox. Sharing a
-                // set with rows that are would say it was.
-                //
-                // Placed after the whole system block rather than after the Trash
-                // row, because descmap order isn't guaranteed to put Trash last
-                // (see `MailboxTreeMutator.moveEntry`) — the block is hoisted here
-                // whatever order the file is in, so this is the only stable way to
-                // say "below Trash". Inside the `Group`, so it inherits the 21 pt
-                // row height along with everything else.
-                RecentsRow(entries: recentFilings, onPick: onPickRecent,
-                           ruleAbove: !systemMailboxes.isEmpty,
-                           ruleBelow: !otherMailboxes.isEmpty)
                 // `DisclosureGroup`s bound to `expandedIDs`, not an
                 // `OutlineGroup`. The swap buys exactly one thing: expansion this
                 // app can read and write. `OutlineGroup` keeps it inside
@@ -659,6 +669,140 @@ struct MailboxTree: View, Equatable {
         // changes; `attach` handles that itself by re-finding the table when the
         // one it holds has left the window.
         .background(SidebarRowHeightPin())
+    }
+
+    /// In/Out/Trash and Recents, in a container of their own that never scrolls.
+    ///
+    /// **A second `List`, not hand-built rows, and that is the whole reason this
+    /// was affordable.** Row height, the row insets, the separator hairlines and
+    /// the `.plain` selection fill are all things the sidebar spent five builds
+    /// getting right (see `SidebarRowMetrics`), and none of them is reachable
+    /// from outside a `List`. Reproducing them by hand for four rows would have
+    /// been four more chances to be a point out. So this repeats the two
+    /// modifiers that own the geometry — `.listStyle(.plain)` and
+    /// `defaultMinListRowHeight` *inside* the list — and gets identical rows for
+    /// free.
+    ///
+    /// What it costs, chosen knowingly: arrow keys no longer walk between these
+    /// rows and the outline, because they are now separate `NSOutlineView`s.
+    /// Stephen uses the arrow keys inside the tree, going through long lists of
+    /// sub-groups, and not on these four.
+    ///
+    /// Selection needs no special handling: it lives in `AppModel`, both lists
+    /// bind the same `selection`, and a `List` whose selected id is not in its
+    /// own content writes `nil` — which `AppModel.mailboxSelection`'s setter
+    /// already refuses whenever the current id still exists, a guard that was put
+    /// there for the `.id()` rebuild and covers this unchanged.
+    ///
+    /// **`SidebarOutlineFinder` is now ambiguous** — it looks for *the*
+    /// single-column headerless `NSTableView` and there are two. Only the
+    /// switched-off probes use it, so this is a note rather than a bug; a probe
+    /// that needs the outline again should pick the taller of the two.
+    private var pinnedSet: some View {
+        List(selection: selection) {
+            Group {
+                // System mailboxes (In/Out/Junk/Trash) have no children, so
+                // they're a flat ForEach.
+                ForEach(systemMailboxes) { item in row(for: item) }
+                // Recents is its own set, between the system mailboxes and the
+                // user's own. Stephen's reason, and the one to keep in mind
+                // before moving it — unlike everything else in the sidebar, it is
+                // not a mailbox. Sharing a set with rows that are would say it was.
+                //
+                // Placed after the whole system block rather than after the Trash
+                // row, because descmap order isn't guaranteed to put Trash last
+                // (see `MailboxTreeMutator.moveEntry`) — the block is hoisted here
+                // whatever order the file is in, so this is the only stable way to
+                // say "below Trash". Inside the `Group`, so it inherits the 21 pt
+                // row height along with everything else.
+                //
+                // `ruleBelow` is off because that rule is no longer between two
+                // rows: it parts this container from the outline, and is drawn on
+                // the container's edge below.
+                RecentsRow(entries: recentFilings, onPick: onPickRecent,
+                           ruleAbove: !systemMailboxes.isEmpty,
+                           ruleBelow: false)
+            }
+            .environment(\.defaultMinListRowHeight, SidebarRowMetrics.rowHeight)
+        }
+        .listStyle(.plain)
+        // A `List` takes every point it is offered, and inside a `safeAreaInset`
+        // that would be the whole sidebar — so something has to name the height.
+        //
+        // **Measured, after arithmetic got it wrong.** The first version computed
+        // it from `rowHeight` and `recentsRowPadding` and cut the Recents row in
+        // half, because the row is not the sum of the constants that describe it:
+        // the list's own content insets are in there too, and nothing in this file
+        // knows their value. That is the same lesson `rowHeight` itself cost five
+        // builds to learn — AppKit's row geometry here is measured, never derived.
+        //
+        // So the geometry is read back from the table that was actually built,
+        // and the arithmetic survives only as the value used for the first frame,
+        // before a measurement exists.
+        .frame(height: pinnedGeometry?.height
+                    ?? SidebarRowMetrics.pinnedSetEstimate(systemRows: systemMailboxes.count))
+        // With scrolling on, a block a few points short would bounce under the
+        // trackpad and hide a row at rest. Off, the same shortfall clips — wrong,
+        // but wrong in a way that stays put and can be reported.
+        .scrollDisabled(true)
+        // The outline scrolls *underneath* an inset, so this has to be opaque or
+        // 2,650 mailbox rows will slide visibly through In/Out/Trash — the exact
+        // opposite of what the pinning is for. `.plain` should already paint an
+        // opaque list background; this says so rather than depending on it, which
+        // costs nothing and removes the one failure mode that would make the
+        // feature worse than not having it.
+        .background(Color(nsColor: .controlBackgroundColor))
+        // Reads the height the pinned table actually needs and writes it back
+        // into the frame above. See `PinnedSetHeightReader` for why this cannot
+        // be a `GeometryReader`: what SwiftUI would report is the height this
+        // view was *given*, which is the number in question.
+        .background(PinnedSetHeightReader(rowCount: systemMailboxes.count + 1) { measured in
+            // Only on a real change, or the write re-renders the view that
+            // produced it. The measured value doesn't depend on the frame — it is
+            // the sum of the rows' own heights — so one write settles it.
+            if pinnedGeometry != measured { pinnedGeometry = measured }
+        })
+        // Showing or hiding Junk changes the row count, and the geometry measured
+        // for the old count is now a row out. Drop back to the estimate — which
+        // is deliberately generous — for the second it takes to re-measure,
+        // rather than holding a number that is known to be wrong.
+        .onChange(of: systemMailboxes.count) { _ in pinnedGeometry = nil }
+        // The set rule that used to hang under the Recents row. It now parts two
+        // containers rather than two rows, so it hangs on this one's bottom edge
+        // — same line, same outward nudge, drawn over the outline's first row
+        // because inset content is composited above the content it insets.
+        //
+        // **Zero overhang here**, unlike the rule above Recents. That one is an
+        // overlay on a `List` row, which clips the excess; this one is on the
+        // container, which doesn't, and 40 pt of it would run out across the
+        // message list. The container is already the full width of the sidebar,
+        // so there is nothing for an overhang to reach.
+        //
+        // **Not `setRuleOffset`, and this is the one place that constant does not
+        // apply.** It is 3, tuned to centre a rule hanging between two rows *of
+        // the same list*. Used here it put the line 3 pt below the boundary,
+        // which read as a wide space under Recents and almost none over
+        // PROJECTS. Measured (2026aug31): the pinned rows are 25, 25, 25, 27 —
+        // the last one taller by the Recents padding — with zero content insets,
+        // so the container ends exactly on the Recents row's bottom edge.
+        //
+        // That 2 pt is the whole asymmetry. It sits half above the label and half
+        // below, so the space under "Recents" exceeds the space over the first
+        // mailbox by half of it, and centring means dropping the rule by half
+        // again: `lastRowExtra / 4`, which is 0.5 pt here. Derived from the
+        // measurement rather than written as a number, so it follows
+        // `recentsRowPadding` if that is ever changed.
+        //
+        // **If it still isn't centred, this expression is the knob** — larger
+        // moves the line toward PROJECTS, smaller toward Recents, and a whole
+        // point is a visible step. Only the line moves; the height is measured
+        // separately and cannot bring back the clipping.
+        .overlay(alignment: .bottom) {
+            if !otherMailboxes.isEmpty {
+                SidebarSetRule(overhang: 0)
+                    .offset(y: (pinnedGeometry?.lastRowExtra ?? 0) / 4)
+            }
+        }
     }
 
     /// The pinned system boxes and everything else, split off `tree` (already
@@ -1531,6 +1675,19 @@ enum SidebarOutlineFinder {
 /// 32 → 24 halved the space around ~16 pt of content; 21 takes most of what is
 /// left.
 enum SidebarRowMetrics {
+    /// **A floor, and nothing in this sidebar is actually sitting on it.**
+    ///
+    /// Measured 2026aug31, from the pinned set's own `NSTableView`: the rows come
+    /// out 25 pt, and the Recents row 27. So 21 is doing its documented job —
+    /// keeping a row from being shorter than the 20 pt new-mail badge — and is
+    /// not the height of anything. Where the other 4 pt comes from is not exposed
+    /// anywhere SwiftUI or AppKit will admit to; `rect(ofRow:)` is the only thing
+    /// that knows.
+    ///
+    /// Recorded here because two attempts to compute the pinned set's height from
+    /// this constant were both wrong, in opposite directions, and both looked
+    /// like arithmetic slips rather than a false premise. **Anything that needs a
+    /// real row height must measure one** — see `PinnedSetHeightReader`.
     static let rowHeight: CGFloat = 21
 
     /// The rule between sets of sidebar rows.
@@ -1572,6 +1729,269 @@ enum SidebarRowMetrics {
     /// is the one for "the rules aren't centred in the gap". They are easy to
     /// confuse and they move different things.
     static let recentsRowPadding: CGFloat = 2
+
+    /// The height of the pinned set at the top of the sidebar — the system
+    /// mailboxes plus the Recents row.
+    ///
+    /// Computed rather than measured because a `List` has no content-sized
+    /// height: it takes whatever it is offered, so inside a `safeAreaInset` it
+    /// would take the whole sidebar. Something has to name the number.
+    ///
+    /// A system row is exactly `rowHeight` — that is what `defaultMinListRowHeight`
+    /// pins it to, and these rows have no content taller than the 20 pt new-mail
+    /// badge the height was chosen for. The Recents row is that plus its own
+    /// padding top and bottom, which is the same "it does lengthen the sidebar by
+    /// twice this" recorded on `recentsRowPadding`.
+    ///
+    /// A first guess at the pinned set's height, for the frame or two before
+    /// `PinnedSetHeightReader` reports the real one.
+    ///
+    /// Built from the *measured* row heights (25, and 27 for Recents — see
+    /// `rowHeight`), not from `rowHeight` itself, which is a floor nothing rests
+    /// on. Computing this from the constants cut the Recents row in half on the
+    /// first build.
+    ///
+    /// Rounded up by a row so that if the measurement never arrives the failure
+    /// is a strip of empty list rather than a clipped one. The cost is a possible
+    /// one-frame settle at launch, which is the right way round to be wrong.
+    ///
+    /// Don't tune this. If the pinned block is wrong, the measurement is what to
+    /// look at — these numbers are only ever on screen for a frame.
+    static func pinnedSetEstimate(systemRows: Int) -> CGFloat {
+        CGFloat(systemRows + 1) * measuredRowHeight + measuredRecentsRowHeight
+    }
+
+    /// What a sidebar row actually measures, as opposed to the `rowHeight` floor.
+    /// Only for the first-frame estimate above; everything else measures.
+    private static let measuredRowHeight: CGFloat = 25
+    private static let measuredRecentsRowHeight: CGFloat = 27
+}
+
+/// Measures the height the pinned sidebar set actually needs, and hands it back.
+///
+/// **Why AppKit and not a `GeometryReader`.** What SwiftUI can report about this
+/// container is the height it was *given* — which is the number being asked
+/// about, so a `GeometryReader` would only ever confirm its own input. The height
+/// wanted is a property of the `NSTableView` SwiftUI built: the sum of its rows'
+/// own heights plus whatever its scroll view is insetting them by. Only AppKit
+/// can be asked.
+///
+/// **How it tells the two sidebar tables apart.** Since the system rows were
+/// pinned there are two single-column headerless tables in this window, which is
+/// why `SidebarOutlineFinder` is no longer usable — it was written when there was
+/// one. Two discriminators, because neither is sufficient alone:
+///
+/// - `numberOfRows == rowCount`, which is 4 here against the outline's hundreds.
+///   Not enough on its own: a tree with exactly four top-level items is ordinary,
+///   and the two would then *not* be the same height — the pinned set is three
+///   mailbox rows plus a Recents row carrying padding no mailbox row has, which
+///   is precisely the difference the arithmetic version got wrong.
+/// - Among the matches, **the shortest enclosing scroll view wins.** The outline
+///   fills the sidebar whatever it contains; the pinned set is around a hundred
+///   points. That separates them unconditionally, so it is the one doing the real
+///   work — and it is why every match is collected rather than the first returned.
+///   Which comes first depends on SwiftUI's subview order, which is not ours.
+///
+/// **It keeps measuring for a second and takes the largest answer**, rather than
+/// latching the first. `NSScrollView.contentInsets` can be derived from layout,
+/// so reading it on the turn the table first exists can return 0 where the
+/// settled value is not — and a latched wrong height would last the session. This
+/// is the density probe's first-outing mistake, recorded a few types down, and
+/// the same beat is the same cure.
+struct PinnedSetHeightReader: NSViewRepresentable {
+    /// What the pinned container needs to lay itself out.
+    struct Geometry: Equatable {
+        /// The height at which no row is clipped.
+        let height: CGFloat
+        /// How much taller the last row (Recents) is than the mailbox rows above
+        /// it — its own vertical padding, which no mailbox row has.
+        ///
+        /// This is what positions the set rule below the container. The padding
+        /// sits half above the label and half below, so the space under
+        /// "Recents" exceeds the space over the first mailbox by half of this,
+        /// and the rule is centred by dropping it half of that again. See the
+        /// offset at the call site.
+        let lastRowExtra: CGFloat
+    }
+
+    let rowCount: Int
+    let onGeometry: (Geometry) -> Void
+
+    /// Prints the pinned table's real geometry, once per measurement.
+    ///
+    /// Off. It ran on 2026aug31 and settled the thing three rounds of reasoning
+    /// had not:
+    ///
+    ///     [pinned] rows 4 heights [25.0, 25.0, 25.0, 27.0] sum 102.0
+    ///     [pinned]   contentInsets t0.0 b0.0  safeArea t0.0 b0.0  autoAdjusts true
+    ///     [pinned]   -> height 102.0
+    ///
+    /// Two false premises fell out of that at once. The rows are **25 pt, not the
+    /// 21 of `defaultMinListRowHeight`** — that value is a floor nothing was
+    /// resting on, so every estimate built from it was arithmetic over a wrong
+    /// number. And the content insets are **zero**, so the container ends exactly
+    /// on the last row's bottom edge and the missing-bottom-inset theory that
+    /// preceded this was wrong too. What is left is the Recents row's own 2 pt of
+    /// padding, which is the whole of the asymmetry the set rule has to answer to.
+    ///
+    /// Left switched off rather than deleted, per CLAUDE.md. Turn it on if the
+    /// pinned set's geometry is ever in doubt again — it costs one build and
+    /// answers in one run, which is cheaper than any of the three rounds of
+    /// inference it replaced.
+    static var diagnose = false
+
+    final class Coordinator {
+        /// The count settled on, so a change in the number of system mailboxes
+        /// (showing or hiding Junk) measures again instead of keeping a height
+        /// that is now a row out.
+        var measuredFor: Int?
+        /// The largest height seen this pass. Largest, not last: every source of
+        /// error here — a table not yet laid out, insets not yet derived — makes
+        /// the measurement too *small*. Note that "too small clips a row, too
+        /// large is invisible" is **not** the reasoning; it was, and it was wrong.
+        /// Too large moves the set rule off the bottom of the Recents row. Both
+        /// directions are visible, which is why `height(of:)` carries no margin
+        /// and this takes the settled maximum rather than a padded first answer.
+        var best: CGFloat = 0
+        /// Whether a chain is already running, so the re-render caused by
+        /// reporting a height doesn't start another one alongside it.
+        var running = false
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        let coordinator = context.coordinator
+        guard coordinator.measuredFor != rowCount else { return }
+        // A row was added or removed: whatever was measured describes a different
+        // set of rows, so start over rather than improving on a stale maximum.
+        coordinator.best = 0
+        guard !coordinator.running else { return }
+        coordinator.running = true
+        DispatchQueue.main.async {
+            measure(near: nsView, coordinator: coordinator, attemptsLeft: 5)
+        }
+    }
+
+    @MainActor
+    private func measure(near view: NSView, coordinator: Coordinator, attemptsLeft: Int) {
+        if let table = table(near: view) {
+            let measured = geometry(of: table)
+            if measured.height > coordinator.best {
+                coordinator.best = measured.height
+                onGeometry(measured)
+            }
+        }
+        guard attemptsLeft > 0 else {
+            coordinator.running = false
+            // Latch only if something was actually measured. Leaving it unlatched
+            // is what makes a failed launch self-healing: the next re-render —
+            // any selection change or disclosure click — starts a fresh chain.
+            if coordinator.best > 0 { coordinator.measuredFor = rowCount }
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            measure(near: view, coordinator: coordinator, attemptsLeft: attemptsLeft - 1)
+        }
+    }
+
+    /// The height the list needs for none of its rows to be clipped.
+    ///
+    /// Summed from the rows themselves rather than taken from `table.frame`,
+    /// which would be circular: an `NSTableView` grows to fill its clip view when
+    /// its content is shorter, so its frame reports the height it was *given* —
+    /// the number being asked about. `rect(ofRow:)` reports what SwiftUI's outline
+    /// coordinator actually answered for `heightOfRowByItem`, which is exactly
+    /// what the constants could not predict.
+    ///
+    /// **Exact, with no slack, and that is a requirement rather than a
+    /// preference.** The set rule that parts this block from the outline hangs on
+    /// the container's bottom edge, so every point by which the container exceeds
+    /// its rows is background inserted between the Recents row and the line —
+    /// visible, and the fault this measurement is on its second attempt at.
+    ///
+    /// It cost the obvious two safety margins to learn:
+    ///
+    /// - A point of slack, added against clipping. It moves the rule a point.
+    /// - `safeAreaInsets` added alongside `contentInsets`. Those are not
+    ///   independent on an `NSScrollView`: with `automaticallyAdjustsContentInsets`
+    ///   on, `contentInsets` is *derived from* the safe area, so adding both
+    ///   counts the same points twice.
+    ///
+    /// So: the rows, the spacing between them, and `contentInsets` alone. If a
+    /// row ever does come out clipped, the answer is a better measurement, not a
+    /// margin — a margin here is a visible defect somewhere else.
+    @MainActor
+    private func geometry(of table: NSTableView) -> Geometry {
+        guard table.numberOfRows > 0 else { return Geometry(height: 0, lastRowExtra: 0) }
+        var rows: CGFloat = 0
+        for row in 0..<table.numberOfRows { rows += table.rect(ofRow: row).height }
+        // Zero on this view, but excluded from `rect(ofRow:)`, so adding it costs
+        // nothing and stops the measurement being silently wrong if it changes.
+        rows += table.intercellSpacing.height * CGFloat(table.numberOfRows - 1)
+
+        let scroll = table.enclosingScrollView
+        let insets = scroll?.contentInsets ?? NSEdgeInsets()
+        let height = rows + insets.top + insets.bottom
+
+        // How much taller the Recents row is than the mailbox rows above it. The
+        // tallest of the others rather than the mean, so one odd row can only
+        // make this smaller — and a smaller value leaves the rule nearer the
+        // boundary, which is the safer place for it to be wrong.
+        let heights = (0..<table.numberOfRows).map { table.rect(ofRow: $0).height }
+        let extra = max(0, (heights.last ?? 0) - (heights.dropLast().max() ?? heights.last ?? 0))
+
+        if Self.diagnose {
+            print("[pinned] rows \(table.numberOfRows) heights \(heights) sum \(rows)")
+            print("[pinned]   contentInsets t\(insets.top) b\(insets.bottom)"
+                  + "  safeArea t\(scroll?.safeAreaInsets.top ?? 0) b\(scroll?.safeAreaInsets.bottom ?? 0)"
+                  + "  autoAdjusts \(scroll?.automaticallyAdjustsContentInsets ?? false)")
+            print("[pinned]   table.frame \(table.frame)  scroll.frame \(scroll?.frame ?? .zero)"
+                  + "  clip.bounds \(scroll?.contentView.bounds ?? .zero)")
+            print("[pinned]   -> height \(height)  lastRowExtra \(extra)")
+        }
+        return Geometry(height: height, lastRowExtra: extra)
+    }
+
+    /// The pinned set's table.
+    ///
+    /// Walks *up* from the backing view and searches down from each ancestor: the
+    /// background view is a sibling of the list rather than inside it, so its own
+    /// superviews never include the table.
+    @MainActor
+    private func table(near view: NSView) -> NSTableView? {
+        var ancestor: NSView? = view.superview
+        while let current = ancestor {
+            var found: [NSTableView] = []
+            collect(current, into: &found)
+            // The shortest scroll view is the pinned one — see the type comment.
+            if let best = found.min(by: {
+                ($0.enclosingScrollView?.frame.height ?? .greatestFiniteMagnitude)
+                    < ($1.enclosingScrollView?.frame.height ?? .greatestFiniteMagnitude)
+            }) {
+                return best
+            }
+            ancestor = current.superview
+        }
+        return nil
+    }
+
+    @MainActor
+    private func collect(_ view: NSView, into found: inout [NSTableView]) {
+        if let table = view as? NSTableView {
+            // A table's subviews are its visible row views, and no table ever
+            // contains another, so this stops here rather than recursing — which
+            // keeps the search off the outline's rows and the message table's.
+            if table.tableColumns.count == 1, table.headerView == nil,
+               table.numberOfRows == rowCount {
+                found.append(table)
+            }
+            return
+        }
+        for sub in view.subviews { collect(sub, into: &found) }
+    }
 }
 
 /// The rule between sets in the sidebar: system mailboxes, Recents, and the
@@ -1612,11 +2032,21 @@ enum SidebarRowMetrics {
 /// The within-set separators are untouched and should stay: they part rows that
 /// belong together, which is the one place a hairline reads correctly.
 struct SidebarSetRule: View {
+    /// How far to reach past the host view on each side.
+    ///
+    /// The default is the generous overhang above, which is safe **only because a
+    /// `List` row clips it**: the excess is invisible where it isn't needed and
+    /// the rule still meets the window edges where it is. Drawn on something that
+    /// doesn't clip — the pinned set's container, whose bottom edge is already
+    /// the full width of the sidebar — the same overhang would run 40 pt out into
+    /// the message list as a visible grey bar. So that call site passes 0.
+    var overhang: CGFloat = SidebarRowMetrics.setRuleOverhang
+
     var body: some View {
         Rectangle()
             .fill(SidebarRowMetrics.setDividerColor)
             .frame(height: SidebarRowMetrics.setDividerThickness)
-            .padding(.horizontal, -SidebarRowMetrics.setRuleOverhang)
+            .padding(.horizontal, -overhang)
     }
 }
 
@@ -1844,6 +2274,13 @@ enum SidebarRowSizeStyleTrial {
     /// coordinator does not derive its height from `rowSizeStyle`. Left switched
     /// off rather than deleted, per CLAUDE.md, and it must stay off: it mutates
     /// the table mid-run, which would confound any later density measurement.
+    ///
+    /// **And there is now a second reason.** The sidebar holds two single-column
+    /// headerless tables since the system rows were pinned, so
+    /// `SidebarOutlineFinder` no longer identifies which one this would be
+    /// mutating. The read-only probes would merely report the wrong table; this
+    /// one would change it. Disambiguate before ever setting `enabled` — the
+    /// outline is the taller of the two.
     static let enabled = false
     private static var tried = false
 
@@ -4467,8 +4904,9 @@ struct PreviewView: View {
                 } else if p.content.isEmpty {
                     // An attachment-only message genuinely has no text, so say
                     // that rather than implying something failed.
-                    Text(p.detached.isEmpty ? "(no text body)"
-                                            : "(no message text — attachment only)")
+                    Text(p.detached.isEmpty && p.recorded.isEmpty
+                            ? "(no text body)"
+                            : "(no message text — attachment only)")
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
@@ -4545,9 +4983,122 @@ struct PreviewView: View {
                     }
                 }
             }
+            if !p.recorded.isEmpty {
+                recordedAttachments(p.recorded)
+            }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The files Eudora recorded as attached when *I* sent this message.
+    ///
+    /// Here, with From/To/Date, rather than in the bar after the body where the
+    /// detached ones go — the two look alike and are not alike. A detached
+    /// attachment is an object with actions attached to it, so it belongs beside
+    /// its actions. A recorded one is a fact about the message and nothing more:
+    /// the bytes were never kept (see `RecordedAttachment`), so there is nothing
+    /// to click, and putting it after the body meant scrolling past a long letter
+    /// to learn whether the attachment even had a name.
+    ///
+    /// No label column: this joins the attachment chips below the summary, and
+    /// "Attached" does not fit the 40-point label width the three summary lines
+    /// share. The paperclip carries the meaning instead.
+    ///
+    /// **The path is not always a location**, and the wording turns on that. When
+    /// the file was dragged in from the Mac, what Eudora recorded is the
+    /// throwaway copy Parallels handed it, not where the file lives — see
+    /// `RecordedAttachment.pathRecordsOrigin`. Showing "was at …" for one of
+    /// those would send the reader after a directory that never held their file,
+    /// and away from the Desktop where it may still be sitting. So a staging path
+    /// is named as one, and the emphasis falls back on the filename, which is
+    /// accurate in every case and is what a search will actually match.
+    ///
+    /// **Three states, not two — and the third says nothing at all.**
+    /// `eudora-relink` wrote verified locations into the messages whose recorded
+    /// path was a purged staging folder, so a recorded path can now name a file
+    /// that is genuinely there. Past tense for that would be false — "'was at'
+    /// sounds like it's no longer at that location, although it is" — but the
+    /// present tense earns no more room than the past did. If the file is there,
+    /// "no copy kept" is beside the point and the path is a right-click away, so
+    /// the row is just the paperclip and the name, which is what an attachment
+    /// that exists has always looked like. The caveat appears only when there is
+    /// nowhere to go, which is when it is worth reading.
+    ///
+    /// **The row has one menu, and the text is deliberately not selectable.**
+    /// `.textSelection(.enabled)` gives a `Text` its own editing menu — spelling
+    /// suggestions and the rest — and that menu wins over the row's, so
+    /// right-clicking the path offered a text editor's options while only the
+    /// paperclip offered the attachment's. Copy Path and Copy Name replace what
+    /// selection was there for, and every row carries the menu: copying is worth
+    /// doing even when the file is gone, and for a staging path the *name* is
+    /// the only handle there is.
+    ///
+    /// The path truncates in the *middle* so the volume and the filename both
+    /// stay on screen. The tooltip has the recorded text whole, in every case.
+    @ViewBuilder
+    private func recordedAttachments(_ items: [LocatedAttachment]) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            // Keyed by position: a message can record the same file twice.
+            ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                let real = RecordedAttachment.pathRecordsOrigin(item.recordedPath)
+                let onDisk = item.url != nil
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Image(systemName: "paperclip")
+                        .foregroundStyle(.secondary)
+                    Text(item.filename)
+                    if !onDisk {
+                        Text(real ? "— no copy kept; was at \(item.recordedPath)"
+                                  : "— no copy kept, and its location wasn't recorded")
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                .font(.caption)
+                .help(help(for: item, pathRecordsOrigin: real))
+                .contextMenu { menu(for: item, onDisk: onDisk) }
+            }
+        }
+    }
+
+    /// The row's menu. Reveal only where there is a file to reveal; copying
+    /// always, since the name and the recorded text are useful precisely when
+    /// the file can't be found.
+    @ViewBuilder
+    private func menu(for item: LocatedAttachment, onDisk: Bool) -> some View {
+        if onDisk {
+            Button("Reveal in Finder") { DetachedAttachmentActions.reveal(item) }
+        }
+        Button("Copy Path") { copyToPasteboard(item.recordedPath) }
+        Button("Copy Name") { copyToPasteboard(item.filename) }
+    }
+
+    private func copyToPasteboard(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// The long form, for the tooltip. The staging case has to explain itself:
+    /// "the location wasn't recorded" invites the reply "but there's a path right
+    /// there", so the path is shown *and* said to be a copy.
+    ///
+    /// The found case carries more weight than the others now, because the row
+    /// itself shows only the name: this is where the path appears without a
+    /// right-click.
+    private func help(for item: LocatedAttachment, pathRecordsOrigin real: Bool) -> String {
+        if item.url != nil {
+            return "Attached when this message was sent. Eudora kept no copy with the "
+                 + "mail, but the file is still at: " + item.recordedPath
+        }
+        if real {
+            return "Attached when this message was sent. Eudora kept no copy with the "
+                 + "mail; it recorded the file as: " + item.recordedPath
+        }
+        return "Attached when this message was sent. Eudora kept no copy with the mail, "
+             + "and the path it recorded is a temporary copy made to hand the file over — "
+             + "not where the file came from, so the original may still be where you left "
+             + "it. Search by name. Recorded as: " + item.recordedPath
     }
 
     /// The raw block, in place of the From/To/Date summary.
@@ -4639,6 +5190,17 @@ struct AttachmentChip: View {
 /// unclickable, with the recorded Windows path as its tooltip — that path is the
 /// only remaining clue to where it went, and silently dropping the row would
 /// misrepresent the message as having had no attachment.
+///
+/// Eudora's *other* by-path record — `X-Attachments`, the files I attached to a
+/// message I sent — is deliberately not shown here. It goes in the header block
+/// (`recordedAttachments`). The original reason was that it could never be found
+/// and so had no actions; that is now only mostly true — `eudora-relink` gave
+/// 320 of them verified locations, and those rows do offer Reveal in Finder. The
+/// separation stands on the other half of the argument, which hasn't moved:
+/// saying "not found in the Attachments folder" about one of these would send
+/// the reader to the one place it was never going to be. `missingHelp` still
+/// distinguishes the two, so a `.recordedOnSend` row routed here by some later
+/// caller says something true rather than something misleading.
 struct DetachedAttachmentBar: View {
     let items: [LocatedAttachment]
 
@@ -4663,13 +5225,28 @@ struct DetachedAttachmentBar: View {
                     .help(item.url?.path ?? item.filename)
                 } else {
                     row(item, enabled: false)
-                        .help("Not found in the Attachments folder. Eudora recorded it as: "
-                                + item.recordedPath)
+                        .help(missingHelp(item))
                 }
             }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// What to say about a file that isn't here. The two origins send the reader
+    /// looking in different places, so they get different sentences rather than
+    /// one hedged one: a detached attachment *should* be in the Attachments
+    /// folder and its absence is a fact about that folder, while a recorded one
+    /// never was there and the recorded path is where the search starts.
+    private func missingHelp(_ item: LocatedAttachment) -> String {
+        switch item.origin {
+        case .detachedOnReceipt:
+            return "Not found in the Attachments folder. Eudora recorded it as: "
+                 + item.recordedPath
+        case .recordedOnSend:
+            return "Attached when this message was sent. No copy was kept with the mail; "
+                 + "Eudora recorded the file as: " + item.recordedPath
+        }
     }
 
     private func row(_ item: LocatedAttachment, enabled: Bool) -> some View {

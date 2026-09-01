@@ -72,29 +72,49 @@ public enum RecordedAttachment {
     /// The recorded attachments as display rows, sharing `LocatedAttachment` with
     /// the detached ones so the preview has a single list to draw.
     ///
-    /// `url` is always nil, and that is a decision rather than a limitation:
+    /// `url` is set only when the recorded path is already a POSIX path and a
+    /// file is sitting at exactly it. Both halves of that are load-bearing, and
+    /// the two things this still refuses to do are the reasons why:
     ///
-    /// - **The `Attachments` folder is not searched.** It holds what Eudora
-    ///   detached from *received* mail. A name match there would be a coincidence
-    ///   between someone else's attachment and mine, which is exactly the
-    ///   wrong-file failure `AttachmentLocator`'s exact-match rule exists to
-    ///   prevent — and worse here, because the row would look authoritative.
-    /// - **The recorded path is not translated to a Mac path.** It reaches us
+    /// - **The `Attachments` folder is not searched, and neither is anywhere
+    ///   else.** That folder holds what Eudora detached from *received* mail. A
+    ///   name match there would be a coincidence between someone else's
+    ///   attachment and mine — exactly the wrong-file failure
+    ///   `AttachmentLocator`'s exact-match rule exists to prevent, and worse
+    ///   here, because the row would look authoritative.
+    /// - **A Windows path is not translated to a Mac path.** It reaches us
     ///   through whichever share mapping was in use at the time, and `phaseX`
     ///   holds at least four: `\\Mac\Home`, `\\Mac\AllFiles`, `\\psf\Host`, and
     ///   plain drive letters (`C:`, `Y:`) from the pre-Parallels years. Inferring
     ///   the mapping from the prefix would be a guess that sometimes lands on a
-    ///   real, different file.
+    ///   real, different file. So a path that isn't already POSIX is never
+    ///   resolved — `hasPrefix("/")` is the whole test, and it also means a
+    ///   Windows path never costs a filesystem call.
     ///
-    /// So the row is always the greyed not-found one, which is the honest answer:
-    /// here is the name, here is where it was, go and look.
+    /// What changed is that some of these paths are now POSIX. `eudora-relink`
+    /// wrote verified locations into 320 messages whose recorded path had been a
+    /// purged Parallels staging folder (see `RecordedAttachmentRelink`), so for
+    /// those the file genuinely is where the header says. Resolving one is a
+    /// statement of fact about an exact path, not a search — which is why it does
+    /// not reopen either refusal above.
     public static func located(in message: MIMEPart) -> [LocatedAttachment] {
         recordedPaths(in: message).map {
             LocatedAttachment(filename: displayName(fromRecordedPath: $0),
                               recordedPath: $0,
-                              url: nil,
+                              url: fileIfPresent(at: $0),
                               origin: .recordedOnSend)
         }
+    }
+
+    /// The file at exactly this recorded path, or nil.
+    ///
+    /// No inference of any kind: a path that doesn't begin `/` is not a Mac path
+    /// and is refused without touching the disk, and a POSIX path is checked
+    /// where it points and nowhere else.
+    public static func fileIfPresent(at path: String) -> URL? {
+        guard path.hasPrefix("/"),
+              FileManager.default.fileExists(atPath: path) else { return nil }
+        return URL(fileURLWithPath: path)
     }
 
     /// Whether the recorded path says anything about where the file came from.

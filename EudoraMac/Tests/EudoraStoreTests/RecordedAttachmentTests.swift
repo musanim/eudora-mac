@@ -210,4 +210,49 @@ final class RecordedAttachmentTests: XCTestCase {
         let p = part("From: me@x\r\n\r\n" + #"X-Attachments: \\Mac\Home\a.jpg;"# + "\r\nnot a header")
         XCTAssertTrue(RecordedAttachment.located(in: p).isEmpty)
     }
+
+    // MARK: resolving a relinked path
+
+    /// A Windows path is never resolved, however plausible it looks — the share
+    /// mapping behind it is unknowable, and guessing lands on a real, different
+    /// file. It must not even reach the filesystem.
+    func testWindowsPathIsNeverResolved() {
+        XCTAssertNil(RecordedAttachment.fileIfPresent(at: #"C:\DEV\TUNING.ZIP"#))
+        XCTAssertNil(RecordedAttachment.fileIfPresent(at: #"\\Mac\Home\Documents\photo.jpg"#))
+    }
+
+    /// A POSIX path is checked where it points and nowhere else: present means
+    /// present, and absent stays absent rather than starting a search.
+    func testPOSIXPathResolvesOnlyWhenTheFileIsThere() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("recorded-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let file = dir.appendingPathComponent("photo.jpg")
+        XCTAssertNil(RecordedAttachment.fileIfPresent(at: file.path))
+        try Data("x".utf8).write(to: file)
+        // Compared by path: two URLs for the same file can differ in their
+        // directory hint and percent-encoding without differing on disk.
+        XCTAssertEqual(RecordedAttachment.fileIfPresent(at: file.path)?.path, file.path)
+    }
+
+    /// The whole point of the relink, read back through the display path: a
+    /// message whose header names a file that is there gets a `url`, and one
+    /// whose header names a Windows path does not.
+    func testLocatedCarriesTheURLOnlyForAFileThatIsThere() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("recorded-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("score.pdf")
+        try Data("x".utf8).write(to: file)
+
+        let p = part("From: me@x\r\nX-Attachments: \(file.path); "
+                     + #"C:\DEV\TUNING.ZIP;"# + "\r\n\r\nbody")
+        let items = RecordedAttachment.located(in: p)
+        XCTAssertEqual(items.map(\.filename), ["score.pdf", "TUNING.ZIP"])
+        XCTAssertEqual(items[0].url?.path, file.path)
+        XCTAssertNil(items[1].url)
+    }
 }
