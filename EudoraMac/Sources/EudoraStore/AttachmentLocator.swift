@@ -1,21 +1,46 @@
 import Foundation
 
-/// A detached attachment, as far as we can tell where it went.
+/// An attachment Eudora recorded by path rather than keeping in the message, as
+/// far as we can tell where it went.
 public struct LocatedAttachment: Hashable, Sendable {
+    /// Which of Eudora's two by-path records this came from.
+    ///
+    /// They look alike on screen and mean opposite things about where to look:
+    /// one names a file Eudora put in the `Attachments` folder, the other a file
+    /// that was never in the mail tree. Carrying the distinction is what lets the
+    /// missing-file message send the user somewhere useful instead of somewhere
+    /// wrong.
+    public enum Origin: Hashable, Sendable {
+        /// An `Attachment Converted:` marker in the body — received mail, whose
+        /// bytes Eudora wrote out to the `Attachments` folder. See
+        /// `DetachedAttachment`.
+        case detachedOnReceipt
+        /// An `X-Attachments:` header — my own sent copy, naming a file that sat
+        /// somewhere on the sending machine. See `RecordedAttachment`.
+        case recordedOnSend
+    }
+
     /// Bare filename, as recorded in the message.
     public let filename: String
     /// The full Windows path Eudora recorded, kept for display when the file
     /// can't be found — it is the only clue the user has left.
     public let recordedPath: String
-    /// Where the bytes actually are on this machine, if we found them.
+    /// Where the bytes actually are on this machine, if we found them. Always nil
+    /// for `.recordedOnSend`; see `RecordedAttachment.located(in:)`.
     public let url: URL?
+    public let origin: Origin
 
     public var isFound: Bool { url != nil }
 
-    public init(filename: String, recordedPath: String, url: URL?) {
+    /// `origin` defaults to the detached case: every existing caller is the
+    /// received-mail path, and defaulting keeps this initialiser source-compatible
+    /// with them.
+    public init(filename: String, recordedPath: String, url: URL?,
+                origin: Origin = .detachedOnReceipt) {
         self.filename = filename
         self.recordedPath = recordedPath
         self.url = url
+        self.origin = origin
     }
 }
 

@@ -12,9 +12,16 @@ final class MessageDigestTests: XCTestCase {
     private func bytes(_ s: String) -> [UInt8] { Array(s.utf8) }
 
     /// The verdict the full parse gives, for cross-checking the digest.
+    ///
+    /// The `X-Attachments` term is here rather than only in the digest because
+    /// this function is the *definition* of "has an attachment" that the digest
+    /// is being held to. Leaving it out would not test the digest's shortcut; it
+    /// would just assert that the two disagree.
     private func fullParseAttachment(_ msg: [UInt8]) -> Bool {
         let part = MIMEParser.parse(msg)
-        return part.walk().contains { $0.isAttachment } || DetachedAttachment.isPresent(in: part)
+        return part.walk().contains { $0.isAttachment }
+            || DetachedAttachment.isPresent(in: part)
+            || RecordedAttachment.isPresent(inHeaderValue: part.header(RecordedAttachment.headerName))
     }
 
     private func assertMatchesFullParse(_ s: String,
@@ -119,6 +126,53 @@ final class MessageDigestTests: XCTestCase {
         XCTAssertFalse(MessageDigest.isRealMultipart(
             contentType: "multipart/mixed; boundary=\"NEVER-APPEARS\"", body: bytes("flattened body")))
         XCTAssertTrue(MessageDigest.parse(bytes(s)).hasAttachment)   // via the marker
+        assertMatchesFullParse(s)
+    }
+
+    // MARK: attachment — the outgoing record (`X-Attachments`)
+
+    /// The shape that was invisible until `RecordedAttachment` existed, and the
+    /// commonest one in a real tree: my own sent copy, with no MIME part and no
+    /// marker — the header is the only evidence.
+    func testRecordedAttachmentHeaderAloneCounts() {
+        let s = "From: me@x\r\nTo: you@y\r\n"
+            + #"X-Attachments: \\Mac\Home\Documents\report.pdf;"# + "\r\n"
+            + "\r\nSee attached.\r\n"
+        XCTAssertTrue(MessageDigest.parse(bytes(s)).hasAttachment)
+        assertMatchesFullParse(s)
+    }
+
+    /// The empty header is on tens of thousands of messages and must never count.
+    func testEmptyRecordedAttachmentHeaderDoesNotCount() {
+        let s = "From: me@x\r\nTo: you@y\r\nX-Attachments: \r\n\r\nno files here\r\n"
+        XCTAssertFalse(MessageDigest.parse(bytes(s)).hasAttachment)
+        assertMatchesFullParse(s)
+        // Eudora's trailing semicolon with nothing before it is equally empty.
+        let t = "From: me@x\r\nX-Attachments: ;\r\n\r\nstill nothing\r\n"
+        XCTAssertFalse(MessageDigest.parse(bytes(t)).hasAttachment)
+        assertMatchesFullParse(t)
+    }
+
+    /// The header is read on the slow path too, so a genuine multipart carrying
+    /// one gets the same verdict as a flattened message would.
+    func testRecordedAttachmentOnRealMultipartTakesTheFullPath() {
+        let s = "From: me@x\r\nContent-Type: multipart/alternative; boundary=\"B\"\r\n"
+            + #"X-Attachments: \\Mac\Home\Documents\report.pdf;"# + "\r\n\r\n"
+            + "--B\r\nContent-Type: text/plain\r\n\r\nhello\r\n"
+            + "--B\r\nContent-Type: text/html\r\n\r\n<b>hello</b>\r\n"
+            + "--B--\r\n"
+        XCTAssertTrue(MessageDigest.isRealMultipart(
+            contentType: "multipart/alternative; boundary=\"B\"", body: bytes("--B\r\nx")))
+        XCTAssertTrue(MessageDigest.parse(bytes(s)).hasAttachment)
+        assertMatchesFullParse(s)
+    }
+
+    /// A message quoting the header in its body has no attachment: the header
+    /// block ends at the blank line, and nothing scans the body for this one.
+    func testRecordedAttachmentTextInBodyDoesNotCount() {
+        let s = "From: me@x\r\n\r\nhe wrote:\r\n"
+            + #"X-Attachments: \\Mac\Home\Documents\report.pdf;"# + "\r\n"
+        XCTAssertFalse(MessageDigest.parse(bytes(s)).hasAttachment)
         assertMatchesFullParse(s)
     }
 }

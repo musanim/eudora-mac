@@ -63,7 +63,9 @@ final class MessageDigestReadTests: XCTestCase {
         // Attachment flags, cross-checked against the full parse of each message.
         var full: [Int: Bool] = [:]
         store.forEachMessage(at: base) { i, _, part in
-            full[i] = part.walk().contains { $0.isAttachment } || DetachedAttachment.isPresent(in: part)
+            full[i] = part.walk().contains { $0.isAttachment }
+                || DetachedAttachment.isPresent(in: part)
+                || RecordedAttachment.isPresent(inHeaderValue: part.header(RecordedAttachment.headerName))
             return true
         }
         XCTAssertEqual(digest[r[0].index]?.hasAttachment, false)

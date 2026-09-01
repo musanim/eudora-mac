@@ -168,6 +168,17 @@ struct MessagePreview: Sendable {
     /// Attachments Eudora detached to disk. Shown after the body, as Eudora did,
     /// rather than as header chips — their bytes aren't in the message.
     let detached: [LocatedAttachment]
+    /// Files Eudora recorded as attached when *I* sent this message, from
+    /// `X-Attachments`. See `RecordedAttachment`.
+    ///
+    /// Separate from `detached` because it is shown somewhere else, and that is
+    /// the point. A detached attachment is an object: it may be on disk, it can
+    /// be revealed and saved, so it belongs in the bar after the body where the
+    /// actions are. A recorded one is only a *fact about the message* — a name
+    /// and a path that no longer exists — and reading it below a long body meant
+    /// scrolling past everything to find out whether an attachment had a name.
+    /// It sits with From/To/Date instead, which is where it gets looked for.
+    var recorded: [LocatedAttachment] = []
     let indexSourceNote: String  // shown subtly so we can see toc vs scan
 
     /// Supply the listing's cached date when the message itself carries none.
@@ -2925,6 +2936,25 @@ final class AppModel: ObservableObject {
         // Eudora's detached attachments: recorded in the body, bytes on disk.
         let detached = locator?.locateAll(in: part) ?? []
 
+        // ...and the ones Eudora recorded on the way *out*, whose bytes were
+        // never in the tree. No locator needed: there is nothing to look up.
+        //
+        // Suppressed when the message also kept the real MIME part, which 187 of
+        // `phaseX`'s 6,102 do: the file would otherwise appear twice, once as a
+        // working chip and once as a greyed row, reading as two attachments.
+        //
+        // Both sides go through `sanitizedFilename` before the comparison. The
+        // chip's name has already been through it, so comparing the raw recorded
+        // name would miss whenever sanitising changed anything — an encoded-word
+        // `filename=`, a path separator — and produce exactly the duplicate row
+        // this is here to prevent. A miss is still only cosmetic: a greyed row
+        // beside a working chip, never a wrong file.
+        let mimeNames = Set(attachments.map { $0.filename.lowercased() })
+        let recorded = RecordedAttachment.located(in: part).filter {
+            let name = sanitizedFilename($0.filename) ?? $0.filename
+            return !mimeNames.contains(name.lowercased())
+        }
+
         if let h = htmlPart {
             let dec = CharsetDecoder.smartDecode(h.decodedPayload(), declared: h.charset)
             // Turn every <img> into a safe box and collect the embedded-image
@@ -2935,6 +2965,7 @@ final class AppModel: ObservableObject {
                                   images: rendered.images,
                                   misleadingLinks: rendered.misleadingLinks,
                                   attachments: attachments, detached: detached,
+                                  recorded: recorded,
                                   indexSourceNote: sourceNote)
         }
         let text = textPart.map {
@@ -2944,6 +2975,7 @@ final class AppModel: ObservableObject {
                               isHTML: false, content: text,
                               images: [:],
                               attachments: attachments, detached: detached,
+                              recorded: recorded,
                               indexSourceNote: sourceNote)
     }
 
