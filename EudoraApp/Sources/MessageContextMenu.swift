@@ -133,8 +133,14 @@ final class MessageDoubleClickController: NSObject {
             // negative y and one in the empty strip right of the last column to
             // an x outside the table, so both fail this and pass through —
             // notably leaving the header-sort monitor's own handling alone.
+            //
+            // `visibleRect`, not `bounds`. See the note on the right-click
+            // monitor below: the table is the scroll view's document view, so
+            // its bounds include every unscrolled row, and a click in the
+            // *preview pane* lands on a real row below the fold. Here that
+            // reopens the composer whenever that row happens to be a draft.
             let point = table.convert(event.locationInWindow, from: nil)
-            guard table.bounds.contains(point) else { return event }
+            guard table.visibleRect.contains(point) else { return event }
             let row = table.row(at: point)
             guard row >= 0, row < self.model.rows.count else { return event }
 
@@ -221,8 +227,25 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
 
             // Only clicks inside the message list, and only on a real row —
             // anything else is passed through untouched.
+            //
+            // **`visibleRect`, not `bounds`, and the difference is a bug that
+            // shipped.** The table is the scroll view's document view, so its
+            // bounds are the whole content — every row scrolled above and below
+            // the fold included. A right-click in the *preview pane* converts to
+            // a point below the visible list that is still inside `bounds`, and
+            // `row(at:)` returns a perfectly valid index: the row that far below
+            // the last visible one. `menuNeedsUpdate` then selects it, so
+            // right-clicking an attachment in the header block jumped the
+            // selection to an unrelated message — and the menu, anchored off
+            // that row's geometry, appeared under the pointer and looked right.
+            // `visibleRect` is by definition a subset of `bounds`, so this can
+            // only reject clicks that were never over the list.
+            //
+            // The tell, if it ever regresses: the misbehaviour disappears when
+            // the list is scrolled to the bottom, because then there are no
+            // unscrolled rows left to land on.
             let point = table.convert(event.locationInWindow, from: nil)
-            guard table.bounds.contains(point) else { return event }
+            guard table.visibleRect.contains(point) else { return event }
             let row = table.row(at: point)
             guard row >= 0 else { return event }
 
@@ -344,7 +367,14 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         // fallbacks in case the menu is ever reached the ordinary way.
         var row = pendingRow ?? table.clickedRow
         if row < 0, let event = NSApp.currentEvent {
-            row = table.row(at: table.convert(event.locationInWindow, from: nil))
+            // Same containment test as the monitor, and for the same reason —
+            // this path runs on the *second* `menuNeedsUpdate` of a right-click,
+            // when `pendingRow` has been consumed and `clickedRow` is -1, so
+            // without it the off-screen-row bug comes back here. Falling to nil
+            // leaves the existing selection alone, which is the conservative
+            // branch the caller already handles.
+            let point = table.convert(event.locationInWindow, from: nil)
+            row = table.visibleRect.contains(point) ? table.row(at: point) : -1
         }
         pendingRow = nil
         guard row >= 0, row < model.rows.count else { return nil }
