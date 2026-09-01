@@ -10,6 +10,7 @@ let package = Package(
         .library(name: "EudoraNet", targets: ["EudoraNet"]),
         .library(name: "EudoraRichText", targets: ["EudoraRichText"]),
         .executable(name: "eudora-spike", targets: ["eudora-spike"]),
+        .executable(name: "eudora-relink", targets: ["eudora-relink"]),
     ],
     targets: [
         // The reusable interop layer — the real Phase 1 seed.
@@ -35,6 +36,11 @@ let package = Package(
 
         // Phase 0 spike, in the target language: tree / list / dump / search.
         .executableTarget(name: "eudora-spike", dependencies: ["EudoraStore", "EudoraSearch"]),
+
+        // Points X-Attachments headers at where the files actually are. A
+        // one-off migration in principle, but kept because it is re-runnable
+        // and idempotent, and the list of locations will grow.
+        .executableTarget(name: "eudora-relink", dependencies: ["EudoraStore"]),
 
         // Tests (each builds its own temp fixture).
         .testTarget(name: "EudoraStoreTests", dependencies: ["EudoraStore"]),
