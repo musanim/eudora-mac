@@ -394,11 +394,16 @@ struct FindView: View {
             switch r.field {
             case .date:
                 criteria.append(.date(op: r.dateOp, day: r.date))
-            case .anywhere, .headers, .subject:
+            case .anywhere, .headers, .subject, .body:
                 let t = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !t.isEmpty else { continue }
-                let target: TextTarget = r.field == .headers ? .headers
-                                       : r.field == .subject ? .subject : .anywhere
+                let target: TextTarget
+                switch r.field {
+                case .headers: target = .headers
+                case .subject: target = .subject
+                case .body:    target = .body
+                default:       target = .anywhere
+                }
                 criteria.append(.text(target: target, op: r.textOp, value: t))
             }
         }

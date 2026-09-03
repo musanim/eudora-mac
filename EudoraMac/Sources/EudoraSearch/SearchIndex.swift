@@ -21,15 +21,21 @@ public struct SearchHit: Sendable {
 // them into SQL over the FTS5 table's stored columns.
 
 /// The "where in the message" field. `date` is handled separately from the
-/// three text targets because it uses date operators and a calendar value.
+/// four text targets because it uses date operators and a calendar value.
+///
+/// `body` exists because Anywhere includes the raw header block, and the
+/// `Received:` trace lines in it say `for stephen@…` on practically every
+/// message ever delivered — so an Anywhere search for a phrase like
+/// "for Stephen" matched the whole tree and showed none of it in the snippet.
 public enum SearchWhere: String, CaseIterable, Identifiable, Sendable {
-    case anywhere, headers, subject, date
+    case anywhere, headers, subject, body, date
     public var id: String { rawValue }
     public var label: String {
         switch self {
         case .anywhere: return "Anywhere"
         case .headers:  return "Headers"
         case .subject:  return "Subject"
+        case .body:     return "Body"
         case .date:     return "Date"
         }
     }
@@ -66,7 +72,7 @@ public enum DateMatchKind: String, CaseIterable, Identifiable, Sendable {
 
 /// Which stored columns a text target searches.
 public enum TextTarget: Sendable {
-    case anywhere, headers, subject
+    case anywhere, headers, subject, body
 
     /// FTS5 column names this target scans.
     var columns: [String] {
@@ -74,6 +80,10 @@ public enum TextTarget: Sendable {
         case .anywhere: return ["headers", "subject", "body", "attachments", "sender", "recipients"]
         case .headers:  return ["headers"]
         case .subject:  return ["subject"]
+        // The decoded text of the message alone — no headers, no attachment
+        // names — which is also the column the snippet is built from, so a
+        // Body hit is always visible in its result row.
+        case .body:     return ["body"]
         }
     }
 }

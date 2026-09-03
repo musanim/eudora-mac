@@ -68,6 +68,22 @@ final class EudoraSearchTests: XCTestCase {
         XCTAssertEqual(try index.search("zzznotpresent").count, 0)
     }
 
+    /// The case that motivated the Body target: every delivered message carries
+    /// a `Received: … for <recipient>` trace line, so an Anywhere search for a
+    /// phrase beginning "for " matches the whole tree. Body must not see it.
+    func testBodyTargetIgnoresHeaders() throws {
+        func hits(_ target: TextTarget, _ value: String) throws -> Int {
+            try index.search(SearchQuery(criteria: [
+                .text(target: target, op: .contains, value: value)
+            ])).count
+        }
+        XCTAssertEqual(try hits(.anywhere, "for me"), 3)   // the Received: line
+        XCTAssertEqual(try hits(.body, "for me"), 0)
+        XCTAssertEqual(try hits(.body, "paddle"), 1)
+        XCTAssertEqual(try hits(.body, "baidarka"), 0)     // subject only
+        XCTAssertEqual(try hits(.body, "kayak"), 0)        // sender only
+    }
+
     // MARK: fixture
 
     private func buildFixture() throws {
@@ -88,6 +104,8 @@ final class EudoraSearchTests: XCTestCase {
 
     private func message(from: String, subject: String, ctype: String, body: String) -> Data {
         let head = [
+            "Received: from mx.example.com by mail.example.com",
+            "\tfor me@example.com; Mon, 01 Jan 2001 00:00:00 +0000",
             "From: \(from)",
             "To: me@example.com",
             "Subject: \(subject)",
