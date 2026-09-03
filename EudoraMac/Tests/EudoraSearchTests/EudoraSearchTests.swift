@@ -84,26 +84,61 @@ final class EudoraSearchTests: XCTestCase {
         XCTAssertEqual(try hits(.body, "kayak"), 0)        // sender only
     }
 
+    /// Attachment name covers all three records Eudora leaves: a detached
+    /// attachment's `Attachment Converted:` note (m1), a sent copy's
+    /// `X-Attachments:` header (m2), and a real MIME part (m3). Bare filenames,
+    /// not the recorded paths.
+    func testAttachmentTargetSeesAllThreeRecords() throws {
+        func hits(_ target: TextTarget, _ value: String) throws -> Int {
+            try index.search(SearchQuery(criteria: [
+                .text(target: target, op: .contains, value: value)
+            ])).count
+        }
+        XCTAssertEqual(try hits(.attachment, "boat plan.pdf"), 1) // detached
+        XCTAssertEqual(try hits(.attachment, "tuning.zip"), 1)    // recorded on send
+        XCTAssertEqual(try hits(.attachment, "score.png"), 1)     // MIME part
+        XCTAssertEqual(try hits(.attachment, "Attach\\"), 0)      // directory dropped
+        XCTAssertEqual(try hits(.attachment, "paddle"), 0)        // body text isn't a name
+        XCTAssertEqual(try hits(.anywhere, "tuning.zip"), 1)
+    }
+
     // MARK: fixture
 
     private func buildFixture() throws {
+        // Each carries an attachment in a different one of Eudora's three
+        // records; see `testAttachmentTargetSeesAllThreeRecords`.
         let m1 = message(from: "alice@kayak.org", subject: "Baidarka build night",
                          ctype: "text/plain; charset=us-ascii",
-                         body: "Bring your Greenland paddle.")
+                         body: "Bring your Greenland paddle.\r\n"
+                             + "Attachment Converted: \"C:\\Eudora\\Attach\\boat plan.pdf\"")
         let m2 = message(from: "euro@example.fr", subject: "Cafe",
                          ctype: "text/plain; charset=iso-8859-1",   // lie: body is UTF-8
+                         extraHeaders: ["X-Attachments: C:\\DEV\\TUNING.ZIP;"],
                          body: "Fee: 5€. Café résumé.")
         let m3 = message(from: "news@example.com", subject: "Newsletter",
-                         ctype: "text/html; charset=us-ascii",
-                         body: "<html><body><b>Fugue</b> in G minor</body></html>")
+                         ctype: "multipart/mixed; boundary=\"BND\"",
+                         body: [
+                             "--BND",
+                             "Content-Type: text/html; charset=us-ascii",
+                             "",
+                             "<html><body><b>Fugue</b> in G minor</body></html>",
+                             "--BND",
+                             "Content-Type: image/png; name=\"score.png\"",
+                             "Content-Disposition: attachment; filename=\"score.png\"",
+                             "Content-Transfer-Encoding: base64",
+                             "",
+                             "iVBORw0KGgo=",
+                             "--BND--",
+                         ].joined(separator: "\r\n"))
         try buildMbox([m1, m2, m3]).write(to: root.appendingPathComponent("In.mbx"))
 
         let descmap = "In,In,I,N\r\n"
         try Data(descmap.utf8).write(to: root.appendingPathComponent("descmap.pce"))
     }
 
-    private func message(from: String, subject: String, ctype: String, body: String) -> Data {
-        let head = [
+    private func message(from: String, subject: String, ctype: String,
+                         extraHeaders: [String] = [], body: String) -> Data {
+        let head = ([
             "Received: from mx.example.com by mail.example.com",
             "\tfor me@example.com; Mon, 01 Jan 2001 00:00:00 +0000",
             "From: \(from)",
@@ -111,7 +146,7 @@ final class EudoraSearchTests: XCTestCase {
             "Subject: \(subject)",
             "Date: Mon, 01 Jan 2001 00:00:00 +0000",
             "Content-Type: \(ctype)",
-        ].joined(separator: "\r\n") + "\r\n\r\n"
+        ] + extraHeaders).joined(separator: "\r\n") + "\r\n\r\n"
         return Data((head + body + "\r\n").utf8)
     }
 

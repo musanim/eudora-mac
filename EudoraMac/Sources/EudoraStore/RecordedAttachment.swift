@@ -171,7 +171,10 @@ public enum RecordedAttachment {
     /// "file extension" of `uuencode-datafork)`. The trailing parenthetical is
     /// dropped and the quotes stripped; `recordedPath` still carries the original
     /// text, so the tooltip loses nothing.
-    static func displayName(fromRecordedPath path: String) -> String {
+    ///
+    /// Public for the search indexer, which wants the names without the
+    /// filesystem probe `located(in:)` makes.
+    public static func displayName(fromRecordedPath path: String) -> String {
         var s = path.trimmingCharacters(in: .whitespaces)
         if s.hasSuffix(")"), let open = s.range(of: " (type:", options: .backwards) {
             s = String(s[s.startIndex..<open.lowerBound]).trimmingCharacters(in: .whitespaces)

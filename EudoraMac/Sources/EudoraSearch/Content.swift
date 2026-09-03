@@ -47,6 +47,17 @@ enum ContentExtractor {
             }
         }
 
+        // MIME parts are the minority in a real Eudora tree. Received mail
+        // usually carries only an `Attachment Converted:` note where the part
+        // used to be, and a sent copy only an `X-Attachments:` header naming the
+        // file on the sending machine. All three are attachments to the person
+        // searching, so the column holds all three names. (Both records are
+        // already reachable through Anywhere — one is body text, the other a
+        // header — but only from here can an Attachment search find them.)
+        attachments += DetachedAttachment.filenames(in: part)
+        attachments += RecordedAttachment.recordedPaths(in: part)
+            .map(RecordedAttachment.displayName(fromRecordedPath:))
+
         let recipients = [to, cc].filter { !$0.isEmpty }.joined(separator: " ")
         return MessageContent(sender: sender,
                               recipients: recipients,
