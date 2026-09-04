@@ -5845,6 +5845,7 @@ final class AppModel: ObservableObject {
         }
         // Already there — nothing changed, so no teardown and no banner.
         guard moved else { return }
+        sortIfSingleLetterGroup(directory: destDir, groupDisplay: destinationID == nil ? nil : destName)
 
         // The move changes this item's id (its path prefix). If it — or, for a
         // folder, anything inside it — was on screen, that selection is about to
@@ -5938,6 +5939,29 @@ final class AppModel: ObservableObject {
             }
         } catch {
             showError("Couldn't sort: \(error.localizedDescription)")
+        }
+    }
+
+    /// Keep an alphabetical group alphabetical after something is added to it.
+    ///
+    /// The tree is otherwise in file order, on purpose (see `sortEntries`), and
+    /// that is right for the hand-arranged levels. But the per-letter groups
+    /// under PEOPLE — A, B, C… — have no hand order; they are alphabetical or
+    /// they are wrong, and a mailbox created or moved into one landed at the
+    /// bottom until Stephen remembered to sort. The rule is the group's display
+    /// name being a single character: that is what names those groups and
+    /// nothing else, and it costs no setting.
+    ///
+    /// Silent on success — the create or move already has its banner — and the
+    /// sort is never allowed to fail the add: by the time this runs the mailbox
+    /// exists, so a sort that throws is reported and the add stands.
+    private func sortIfSingleLetterGroup(directory: URL, groupDisplay: String?) {
+        guard let groupDisplay,
+              groupDisplay.trimmingCharacters(in: .whitespaces).count == 1 else { return }
+        do {
+            try MailboxTreeMutator.sortEntries(directory: directory)
+        } catch {
+            showError("Added, but couldn't re-sort \u{201C}\(groupDisplay)\u{201D}: \(error.localizedDescription)")
         }
     }
 
@@ -6095,6 +6119,9 @@ final class AppModel: ObservableObject {
             showError("Couldn't create \u{201C}\(name)\u{201D}: \(error.localizedDescription)")
             return nil
         }
+        // Before `reloadTree` below, so the walk finds the sorted order.
+        sortIfSingleLetterGroup(directory: directory,
+                                groupDisplay: idPrefix.flatMap { itemsByID[$0]?.display })
 
         // The same id and base derivations `buildItems` uses, so the async
         // tree walk resolves to an identical item and nothing jumps.
