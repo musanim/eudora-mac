@@ -1050,12 +1050,13 @@ struct MailboxRow: View {
                 // already made for the In badge. See the note where `hasUnread`
                 // was removed from `MailboxItem`.
                 .fontWeight(wantsAttention ? .semibold : .regular)
-            // Eudora's green "unsent" glyph, just right of the label, when Out
-            // holds mail waiting to go. Native art, drawn crisp (no smoothing),
-            // at its own size. Only ever set for the Out row — see
+            // Eudora's "unsent" glyph, just right of the label, when Out holds
+            // mail waiting to go — grey here, green in the message list; see
+            // `TreeIcon.unsent`. Native art, drawn crisp (no smoothing), at its
+            // own size. Only ever set for the Out row — see
             // `MailboxItem.hasUnsent`.
             if item.hasUnsent {
-                Image(RowIcon.unsent)
+                Image(TreeIcon.unsent)
                     .interpolation(.none)
                     .help("Unsent mail waiting to be sent")
             }
@@ -1342,11 +1343,12 @@ enum RowIcon {
 /// isn't using it, and Eudora 7's 14 px blue-lavender ball is neither big enough
 /// nor saturated enough to notice from there.
 ///
-/// So `newMail` is the same art, recoloured and enlarged: 20 pt, and green to
-/// match Out's unsent glyph. Sharing the colour is deliberate rather than
-/// careless — both mean "there is something here you'll want to do", which is the
-/// only thing that needs to carry at that distance; *which* mailbox is saying it
-/// is told by which row it's on.
+/// So `newMail` is the same art, recoloured and enlarged: 20 pt, and green —
+/// originally to match Out's unsent glyph, on the reasoning that both meant
+/// "there is something here you'll want to do". That turned out to be one green
+/// ball too many: drafts in Out are the normal state, not a call to action, so
+/// the tree's unsent ball is now grey (`unsent` below) and green in the tree
+/// means new mail and nothing else.
 ///
 /// The message rows keep `RowIcon.unread` unchanged: that is Eudora 7's own
 /// glyph, and it is read close up where it works fine.
@@ -1364,6 +1366,12 @@ enum RowIcon {
 /// would need checking again.
 enum TreeIcon {
     static let newMail = "TreeNewMail"
+    /// Out's unsent ball, grey. The message rows keep the green `RowIcon.unsent`;
+    /// in the tree the green is In's new-mail signal, and a second green ball
+    /// beside Out read as a second thing wanting attention when it only means
+    /// "there are drafts here". Same art at the same size, so it is drawn like a
+    /// row icon (1x, `.interpolation(.none)`). See `assets/make-tree-unsent.py`.
+    static let unsent = "TreeUnsent"
 }
 
 /// The Who column's direction marker — a small "S ▶"/"▶ S" glyph saying which
