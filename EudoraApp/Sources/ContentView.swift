@@ -359,7 +359,6 @@ struct SidebarView: View {
                             onMove: { model.moveTreeItem($0, up: $1) },
                             onRename: { model.renameTreeItem($0) },
                             onMoveToGroup: { model.moveIntoGroup($0, into: $1) },
-                            onSortSiblings: { model.sortSiblingsAlphabetically($0) },
                             onSortContents: { model.sortFolderContents($0) },
                             recentFilings: { model.recentFilings() },
                             onPickRecent: { model.openRecent($0) })
@@ -428,8 +427,6 @@ struct MailboxTree: View, Equatable {
     /// Move a mailbox/folder into a destination folder (`nil` = the tree root /
     /// Top Level). See `AppModel.moveIntoGroup`.
     let onMoveToGroup: (_ item: MailboxItem.ID, _ destination: MailboxItem.ID?) -> Void
-    /// Sort the list this item sits in. See `AppModel.sortSiblingsAlphabetically`.
-    let onSortSiblings: (MailboxItem.ID) -> Void
     /// Sort what's inside this folder. Folders only.
     let onSortContents: (MailboxItem.ID) -> Void
 
@@ -847,11 +844,20 @@ struct MailboxTree: View, Equatable {
             Button("Rename…") { onRename(item.id) }
             Divider()
             moveItems(for: item)
-            // Two sorts on a folder, and the names carry the difference rather
-            // than leaving it to be inferred from what was clicked: the first
-            // sorts the list this folder is *in*, like Move Up and Move Down
-            // beside it; the second sorts what's inside it.
-            Button("Sort Alphabetically") { onSortSiblings(item.id) }
+            // One sort, and it is the folder's *contents*. There used to be a
+            // second, "Sort Alphabetically", which sorted the list the clicked
+            // item sat *in* — so D's was byte-for-byte the same operation as
+            // ORGANIZATIONS' contents sort, reached from a different row. Two
+            // names one word apart for one action, with the difference resting
+            // on the reader knowing that a right-click picks the level and not
+            // the item. Removed in favour of the unambiguous one.
+            //
+            // The cost is the **top level**, which is nobody's contents and has
+            // no row to right-click, so it can no longer be sorted from the UI.
+            // Deliberate: that level is hand-arranged (system mailboxes, then
+            // plain mailboxes, then folders in a chosen order), sorting it is
+            // irreversible — see `AppModel.sortEntries` on why the `.bak` is not
+            // an undo — and the command was one slip of the pointer away.
             Button("Sort Contents Alphabetically") { onSortContents(item.id) }
             moveToGroupMenu(for: item)
             Divider()
@@ -864,7 +870,9 @@ struct MailboxTree: View, Equatable {
             Button("Rename…") { onRename(item.id) }
             Divider()
             moveItems(for: item)
-            Button("Sort Alphabetically") { onSortSiblings(item.id) }
+            // No sort item on a mailbox: the only one it ever had sorted the
+            // list it sits in, which is now the enclosing folder's job. See the
+            // folder branch above.
             moveToGroupMenu(for: item)
             Divider()
             if mailboxIsDeletablyEmpty(item.id) {

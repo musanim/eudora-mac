@@ -5897,29 +5897,23 @@ final class AppModel: ObservableObject {
         reloadTree()
     }
 
-    /// Sort the list this item sits in — its siblings — alphabetically.
-    ///
-    /// The level, not the item: right-clicking a folder sorts the folder's
-    /// siblings, exactly as Move Up and Move Down move the folder among them.
-    /// `sortFolderContents` is the separate command for what's *inside* a folder,
-    /// named differently because it does a different thing.
-    func sortSiblingsAlphabetically(_ id: MailboxItem.ID) {
-        guard let item = itemsByID[id] else { return }
-        sortEntries(in: item.base.deletingLastPathComponent(), what: "that list")
-    }
-
     /// Sort what's inside a folder alphabetically.
     ///
     /// A folder's `base` *is* its `.fol` directory (see `MailStore.build`), so
-    /// this is the same call with a different directory. The wording matters:
-    /// "the contents of X" rather than "X", because the two menu items are one
-    /// word apart and "Sorted “Projects”" would read like the other one.
+    /// the directory passed here is the one whose `descmap.pce` gets rewritten.
+    /// The banner says "the contents of X" rather than "X" because a folder row
+    /// has two lists near it — the one it holds and the one it sits in — and
+    /// only the first is what this touches. The command for the second was
+    /// removed; see the context menu in `ContentView` for why, and for the one
+    /// thing that went with it (the top level can no longer be sorted).
     func sortFolderContents(_ id: MailboxItem.ID) {
         guard let item = itemsByID[id], item.isFolder else { return }
         sortEntries(in: item.base, what: "the contents of \u{201C}\(item.display)\u{201D}")
     }
 
-    /// Shared by both sort commands.
+    /// The menu-driven sort. `what` names the list in the banner; kept as a
+    /// parameter although `sortFolderContents` is now its only caller, since the
+    /// wording is the whole point of the message.
     ///
     /// **There is no undo, and the `.bak` is not one.** `MailboxIO.backupOnce`
     /// copies only if no `.bak` exists yet, so by the time anyone sorts, some
