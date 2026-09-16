@@ -25,10 +25,18 @@ struct ComposeWindow: View {
                     .id(draftID)
                     .navigationTitle(title(for: draft))
             } else {
-                // A window restored by macOS at launch, pointing at a draft
-                // that no longer exists — state restoration reopens windows by
-                // their value, and `openDrafts` starts empty. Say so plainly
+                // A compose window with no draft behind it. Say so plainly
                 // rather than showing an editor bound to nothing.
+                //
+                // This used to blame state restoration, and that was wrong.
+                // 2026sep14: the real source is SwiftUI satisfying an *external
+                // event* — a `mailto:` arriving at the running app — by opening
+                // a window from a group with no value. It showed up here only
+                // while the main group was refusing those events, which is a
+                // change that has since been reverted; see the note beside
+                // `.commands` in `EudoraApp` and the sep14 entry in
+                // EudoraDevelopmentNotes.txt. Not fixed yet, so this
+                // placeholder still earns its place.
                 VStack(spacing: 8) {
                     Text("This message is no longer open.")
                         .foregroundStyle(.secondary)

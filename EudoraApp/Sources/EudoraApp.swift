@@ -1,6 +1,35 @@
 import SwiftUI
 import AppKit
 
+/// A diagnostic line, to `~/Library/Logs/Eudora-diagnostics.log` as well as stdout.
+///
+/// **stdout is not enough, and 2026sep14 is why.** A `print` is only visible when
+/// Eudora was started from Xcode or a terminal — and starting the binary directly
+/// bypasses LaunchServices, which turns out to change the behaviour being
+/// measured: a direct launch produced THREE windows where `open
+/// /Applications/Eudora.app` produced one. An afternoon of instrumentation went
+/// into the artefact rather than the app. Anything that needs to be observed
+/// under a normal launch has to be written to a file.
+///
+/// Deliberately cheap and best-effort: a diagnostic that throws, blocks or
+/// crashes is worse than one that silently misses a line.
+func eudoraDiag(_ message: String) {
+    print(message)
+    let stamp = DateFormatter()
+    stamp.dateFormat = "HH:mm:ss.SSS"
+    let line = stamp.string(from: Date()) + "  " + message + "\n"
+    guard let data = line.data(using: .utf8) else { return }
+    let url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/Eudora-diagnostics.log")
+    if let handle = try? FileHandle(forWritingTo: url) {
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
+    } else {
+        try? data.write(to: url)
+    }
+}
+
 @main
 struct EudoraApp: App {
     @StateObject private var model = AppModel()
@@ -43,6 +72,17 @@ struct EudoraApp: App {
                 // implementing that delegate method silently stops `.onOpenURL`
                 // firing, so the two must never both be present.
         }
+        // NB: no `handlesExternalEvents` on this scene, and that is a decision,
+        // not an omission. SwiftUI opens a second main window to satisfy the
+        // external event a `mailto:` represents — the 2026sep03 bug — and BOTH
+        // settings that could suppress it were tried on 2026sep14 and both
+        // failed, in opposite directions: `matching: []` killed the cold launch
+        // outright (no window at all), and the `preferring:`/`allowing:` pairing
+        // was applied and simply didn't win. See EudoraDevelopmentNotes.txt,
+        // "The Dock tile, and the mailto: that went nowhere". The extra window
+        // is closed on sight in `MainWindowAccessor` instead — `isExtra` and
+        // `closeExtra` — and this scene is left plain on purpose, because a cold
+        // launch depends on this very mechanism to make its first window.
         .commands { eudoraCommands }
 
         // One window per message being composed, as Eudora had — several can be
@@ -342,6 +382,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// so in practice that is all that arrives; the model checks the scheme
     /// again regardless.
     func application(_ application: NSApplication, open urls: [URL]) {
+        if Self.diagnoseMailtoForward {
+            eudoraDiag("[trace] application(open:) \(urls.count) url(s), "
+                  + "handler installed=\(onOpenURLs != nil)")
+        }
         guard let handler = onOpenURLs else {
             openURLs += urls
             return
@@ -370,17 +414,123 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static let showYourselfNotification =
         Notification.Name("com.stephen.eudora.app.showYourself")
 
+    /// Sent by a duplicate instance that was launched *carrying* a `mailto:`,
+    /// handing the URL to the survivor before exiting. Separate from
+    /// `showYourselfNotification` rather than a payload on it: the plain case
+    /// stays byte-for-byte what it was, and a notification that can make Eudora
+    /// open a composer deserves its own name.
+    ///
+    /// **This is a door, and a deliberate one.** `DistributedNotificationCenter`
+    /// is system-wide, so after this any process on the machine can ask Eudora to
+    /// open a compose window with contents of its choosing. Judged acceptable
+    /// because it is the same trust level as the thing it carries: a `mailto:`
+    /// is already attacker-influenced text from a web page, `MailtoLink` refuses
+    /// `bcc` and `from` and folds CR/LF, and the result is a window put in front
+    /// of a person, never a send. If that ever stops being true, this is the
+    /// first thing to re-examine.
+    static let openURLsNotification =
+        Notification.Name("com.stephen.eudora.app.openURLs")
+
+    /// Off once this is settled. It answers the one thing that can't be reasoned
+    /// out from the code: whether the `GURL` event is actually deliverable during
+    /// the wait in `applicationWillFinishLaunching`, and how long it takes to
+    /// arrive. Left **on** for now because the behaviour has never been observed.
+    static let diagnoseMailtoForward = true
+
+    /// Says when a reopen is asked for, and with what. On while the
+    /// two-main-windows fix in `applicationShouldHandleReopen` is being confirmed:
+    /// without it, "the second window stopped appearing" is only the symptom
+    /// going away, and this is what shows the reopen fired and was refused.
+    /// Also the thing to switch on first if a second window is ever seen again.
+    static let diagnoseReopen = true
+
+    /// How long a duplicate waits for a launch URL before giving up.
+    ///
+    /// Only spent when no URL is coming — the ordinary "double-clicked the app
+    /// while it was already running" case — and mostly invisible there, because
+    /// the survivor is raised *before* the wait starts; what it does cost is a
+    /// Dock icon for the doomed process that lingers this long. A URL that does
+    /// arrive ends the wait at once.
+    ///
+    /// **Deliberately long while `diagnoseMailtoForward` is on.** At half a
+    /// second, "no URL arrived" and "it arrived too late" and "the pump doesn't
+    /// dispatch Apple Events at all" are one indistinguishable outcome. Three
+    /// seconds separates them: if the diagnostic still reports nothing, the wait
+    /// is not the reason. Drop this to 0.5 once the log says how long it really
+    /// takes.
+    private static let launchURLWait: TimeInterval = 3.0
+
+    /// The `GURL` Apple Event, spelled out rather than imported.
+    ///
+    /// These are `kInternetEventClass`, `kAEGetURL` and `keyDirectObject`, which
+    /// live in CoreServices' AE headers. Written as literals so this file needs
+    /// no import beyond AppKit — `AEEventClass`, `AEEventID` and `AEKeyword` come
+    /// with `NSAppleEventDescriptor` — and so a four-character code that would
+    /// otherwise be invisible is readable. None has the high bit set, so the
+    /// `UInt32` conversions can't trap.
+    private static let getURLEventClass = AEEventClass(0x4755_524C)  // 'GURL'
+    private static let getURLEventID    = AEEventID(0x4755_524C)     // 'GURL'
+    private static let directObjectKey  = AEKeyword(0x2D2D_2D2D)     // '----'
+
+    /// URLs the hand-installed `GURL` handler collected. Duplicate-instance only.
+    private var capturedLaunchURLs: [String] = []
+
     override init() {
         super.init()
         Self.shared = self
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // A census two seconds in, while the two-main-windows bug is being
+        // chased. Says what each window actually *is* — its class, whether
+        // AppKit considers it restorable, and its frame — which is the thing
+        // neither the preferences plist nor the absence of a saved-state
+        // directory could answer. Off once this is settled.
+        if Self.diagnoseReopen {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                eudoraDiag("[windows] census: \(NSApp.windows.count) window(s)")
+                for w in NSApp.windows {
+                    eudoraDiag("[windows]  \(type(of: w)) vis=\(w.isVisible) "
+                          + "restorable=\(w.isRestorable) "
+                          + "id=\(w.identifier?.rawValue ?? "nil") "
+                          + "frame=\(NSStringFromRect(w.frame)) "
+                          + "title=\u{201C}\(w.title)\u{201D}")
+                }
+            }
+        }
+
         // Only the survivor listens; a duplicate has already exited by here.
         DistributedNotificationCenter.default().addObserver(
             forName: Self.showYourselfNotification, object: nil, queue: .main
         ) { _ in
             Task { @MainActor in AppDelegate.revealWindows() }
+        }
+
+        // A `mailto:` a duplicate was launched to open and handed over on its way
+        // out. Fed through `application(_:open:)` rather than to the model
+        // directly, so it takes exactly the path a normal link takes — including
+        // the buffering that covers a URL arriving before `ContentView` has
+        // installed `onOpenURLs`.
+        DistributedNotificationCenter.default().addObserver(
+            forName: Self.openURLsNotification, object: nil, queue: .main
+        ) { note in
+            // Strings, not URLs: see `openURLsNotification`. `URL(string:)`
+            // rejects what it can't parse, and `MailtoLink` checks the scheme
+            // again, so a malformed or non-mailto payload gets no further.
+            guard let strings = note.userInfo?["urls"] as? [String] else { return }
+            let urls = strings.compactMap(URL.init(string:))
+            guard !urls.isEmpty else { return }
+            if Self.diagnoseMailtoForward {
+                eudoraDiag("[mailto] survivor received \(urls.count) forwarded URL(s)")
+            }
+            // Captures nothing, like the observer above: the closure is
+            // `@Sendable` in recent SDKs, and holding an `AppDelegate` across the
+            // `Task` hop would be a Sendable warning for no gain. `shared` is set
+            // in `init`, so it is there.
+            Task { @MainActor in
+                AppDelegate.revealWindows()
+                AppDelegate.shared?.application(NSApp, open: urls)
+            }
         }
     }
 
@@ -415,9 +565,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// system asks this before deciding what a reopen means; answering it by
     /// restoring the windows is what makes a Dock click behave the way every
     /// other Mac app does.
+    ///
+    /// **Returned `false` for a day on 2026sep14 as the fix for the
+    /// two-main-windows bug, and returns `true` again now.** The reasoning below
+    /// still looks right; what it lacks is a reproduction that reaches here at
+    /// all. See the note in the body.
+    ///
+    /// The return value is not "did I handle it" — it is "AppKit, go on and do
+    /// your own default reopen as well", and for a SwiftUI app with a
+    /// `WindowGroup` that default includes *making a new window from the group*.
+    /// Returning `true` unconditionally is therefore a standing invitation to a
+    /// second main window, and on 2026sep14 it was caught doing exactly that:
+    /// clicking a `mailto:` while Eudora was running produced a second main
+    /// window, in one process (`ps` confirmed a single pid while both were on
+    /// screen), sized wrong because both windows save their frame to the same
+    /// autosave key. That is the sighting recorded on 2026sep01 as cause
+    /// unknown, whose untested-suspects list named this and a mailto: arriving —
+    /// which turn out to be the same thing, since delivering a URL to a running
+    /// app sends a reopen along with it.
+    ///
+    /// Nothing is lost by refusing. The case this method exists for — a Dock
+    /// click with every window minimised — is handled above by
+    /// `revealWindows()`, explicitly, rather than by asking AppKit to do it; and
+    /// activation on a Dock click comes from the Dock, not from this return
+    /// value. There is no legitimate reason for a reopen to create a main
+    /// window here: the main window cannot be closed without quitting the app
+    /// (`CloseToQuitProxy`), so if the process is alive its window exists and
+    /// wants revealing, never replacing.
     func applicationShouldHandleReopen(_ sender: NSApplication,
                                        hasVisibleWindows: Bool) -> Bool {
+        if Self.diagnoseReopen {
+            eudoraDiag("[reopen] asked, hasVisibleWindows \(hasVisibleWindows); refusing the default")
+        }
         if !hasVisibleWindows { Self.revealWindows() }
+        // REVERTED to `true` on 2026sep14, pending evidence. Returning `false`
+        // fixed nothing — the two-window case turned out not to go through this
+        // method at all, which the diagnostic above proves by never printing —
+        // and an unexplained behaviour change is not worth carrying. The
+        // reasoning above still looks right and is kept for whoever needs it;
+        // what is missing is a reproduction that actually reaches here.
         return true
     }
 
@@ -511,6 +697,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             other.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
         }
 
+        // Hand over the `mailto:` this process was launched to open, if there was
+        // one, so the click does something instead of nothing. See
+        // `captureLaunchURLs` for why this can't simply be left to
+        // `application(_:open:)`.
+        forwardLaunchURLs(to: mine)
+
         // `exit`, not `NSApp.terminate`. `terminate:` is documented as possibly
         // *returning* rather than terminating when the app hasn't finished
         // launching — in which case this duplicate would carry on, build a
@@ -518,6 +710,112 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `applicationShouldTerminate` is hard-wired to `.terminateNow` for a
         // duplicate and `applicationWillTerminate` is a deliberate no-op for it.
         exit(0)
+    }
+
+    /// Collect the launch `mailto:` and pass it to the survivor.
+    ///
+    /// The problem this solves: a `mailto:` reaches the *running* Eudora only
+    /// when the running copy is also the copy LaunchServices has registered — it
+    /// registers by bundle PATH, so a build launched from Xcode, or a second copy
+    /// at another path, never receives one. What happens instead is that
+    /// LaunchServices starts a fresh process from the registered path, the guard
+    /// above kills it as a duplicate, and the URL dies with it. The link appears
+    /// to do nothing at all. Recorded as known-and-unfixed in
+    /// `EudoraDevelopmentNotes.txt` under "mailto: links open a Eudora composer".
+    ///
+    /// **Why the delegate method isn't enough.** `application(_:open:)` is called
+    /// from AppKit's own `GURL` handler, which AppKit installs in
+    /// `finishLaunching` — after `applicationWillFinishLaunching` returns. This
+    /// process never gets that far, so its own handler has to go in by hand.
+    ///
+    /// **Why it waits here rather than returning and exiting later.** Returning
+    /// lets launching continue: scenes are built, `ContentView.onAppear` runs,
+    /// the tree is opened and the lock taken — exactly the concurrent-writer
+    /// hazard the guard exists to prevent. Staying inside this method keeps the
+    /// duplicate inert for free: no window, no tree, no lock.
+    ///
+    /// **If the diagnostic says the event never arrives, this design is wrong and
+    /// the fallback is known.** Don't exit here at all: post `showYourself`,
+    /// activate, return — and exit at the top of `applicationDidFinishLaunching`
+    /// after forwarding whatever `application(_:open:)` buffered into `openURLs`.
+    /// AppKit dispatches the launch `GURL` between will- and did-FinishLaunching,
+    /// so the URL is in hand by then, and the inertness this method buys is not
+    /// actually lost in that window: `TreeLock.take` is reached only through
+    /// `model.openDefaultIfAvailable()`, which `ContentView` defers 100 ms past
+    /// `onAppear`, itself well after `applicationDidFinishLaunching`. Written
+    /// down because it cost a review pass to establish.
+    private func forwardLaunchURLs(to bundleID: String) {
+        let started = Date()
+        let urls = captureLaunchURLs()
+        guard !urls.isEmpty else {
+            if Self.diagnoseMailtoForward {
+                eudoraDiag("[mailto] no launch URL after "
+                      + "\(Int(Date().timeIntervalSince(started) * 1000)) ms; exiting quietly")
+            }
+            return
+        }
+        if Self.diagnoseMailtoForward {
+            eudoraDiag("[mailto] captured \(urls.count) URL(s) in "
+                  + "\(Int(Date().timeIntervalSince(started) * 1000)) ms; forwarding")
+        }
+        // `deliverImmediately: true` for the same reason the other notification
+        // uses it: this process is about to exit, and a queued notification would
+        // go with it. The payload is `[String]` rather than `[URL]` because a
+        // distributed notification's userInfo has to be property-list types.
+        DistributedNotificationCenter.default().postNotificationName(
+            Self.openURLsNotification,
+            object: bundleID, userInfo: ["urls": urls], deliverImmediately: true)
+    }
+
+    /// Install a `GURL` handler, pump the runloop until a URL arrives or the wait
+    /// runs out, and return whatever was collected.
+    ///
+    /// The wait is bounded and ends early on the first URL, so the only case that
+    /// pays the full cost is the one with no URL at all.
+    private func captureLaunchURLs() -> [String] {
+        let manager = NSAppleEventManager.shared()
+        manager.setEventHandler(self,
+                                andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
+                                forEventClass: Self.getURLEventClass,
+                                andEventID: Self.getURLEventID)
+        defer {
+            manager.removeEventHandler(forEventClass: Self.getURLEventClass,
+                                       andEventID: Self.getURLEventID)
+        }
+
+        // Nothing must reach the screen from a process that is leaving. The
+        // splash watcher was armed in `App.init`, before any of this, and pumping
+        // below lets a window sighting reach it. See `SplashWindow.disarm`.
+        SplashWindow.disarm()
+
+        // **`NSApp.nextEvent`, not `RunLoop.run`.** In a Cocoa process an
+        // incoming Apple Event is turned into a Carbon `EventRef` and queued; it
+        // is dispatched to the installed handler from inside AppKit's own event
+        // fetch. A bare `CFRunLoopRunInMode` can take delivery of the mach
+        // message and leave the event sitting in that queue undispatched — so the
+        // obvious loop would wait the full time and report nothing, every time,
+        // indistinguishably from no URL having been sent. Pumping the
+        // application's event machinery is what actually dispatches it.
+        //
+        // `NSApp` exists here: SwiftUI creates it before installing this
+        // delegate. Sending events on is safe — there are no windows yet, so
+        // there is nowhere for them to land.
+        let deadline = Date().addingTimeInterval(Self.launchURLWait)
+        while capturedLaunchURLs.isEmpty, Date() < deadline {
+            guard let event = NSApp.nextEvent(matching: .any, until: deadline,
+                                              inMode: .default, dequeue: true) else { continue }
+            NSApp.sendEvent(event)
+        }
+        return capturedLaunchURLs
+    }
+
+    /// The hand-installed `GURL` handler. Duplicate-instance only — the survivor
+    /// uses AppKit's, which arrives at `application(_:open:)`.
+    @objc private func handleGetURLEvent(_ event: NSAppleEventDescriptor,
+                                         withReplyEvent reply: NSAppleEventDescriptor) {
+        guard let string = event.paramDescriptor(forKeyword: Self.directObjectKey)?
+            .stringValue else { return }
+        capturedLaunchURLs.append(string)
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

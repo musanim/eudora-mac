@@ -1151,6 +1151,10 @@ final class AppModel: ObservableObject {
     /// once at launch, and the captured `OpenWindowAction` keeps working
     /// afterwards, including when no window is on screen.
     ///
+    /// *Once* is enforced: `ContentView.onAppear` writes here only while this is
+    /// nil. A second main window's `onAppear` would otherwise replace the action
+    /// with one captured from a window `MainWindowAccessor` is about to close.
+    ///
     /// This replaced a published queue that `ContentView` drained. The queue had
     /// a hole: with the main window closed nothing was draining it, so ⌘N wrote
     /// an empty record into Out and no window ever appeared — a silent orphan
@@ -3031,6 +3035,9 @@ final class AppModel: ObservableObject {
 
     /// A `mailto:` link, from a browser or any other app.
     func handleMailto(_ url: URL) {
+        if AppDelegate.diagnoseMailtoForward {
+            eudoraDiag("[trace] handleMailto \(url.scheme ?? "?"):…")
+        }
         guard let link = MailtoLink.parse(url) else { return }
         pendingMailtos.append(link)
         drainPendingMailtos()

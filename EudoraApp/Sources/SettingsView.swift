@@ -40,6 +40,28 @@ enum SettingsWindowState {
     private static let openKey = "SettingsWindowWasOpen"
     private static let scrollKey = "SettingsWindowScrollY"
 
+    /// How many quarter-seconds `reopenIfItWasOpen` waits for the splash.
+    ///
+    /// Named because the number is load-bearing twice — it is the recursion's
+    /// starting count *and* how the outermost call recognises itself. Two
+    /// spellings of 40 would let a change to one silently disarm the other.
+    private static let reopenAttempts = 40
+
+    /// Whether the launch-time reopen has already been set going.
+    ///
+    /// `wasOpen` is a `UserDefaults` value written at quit and never cleared
+    /// during a run, and `reopenIfItWasOpen` is called from the main scene's
+    /// `.onAppear` — which fires again for the second main window SwiftUI opens
+    /// to satisfy a `mailto:` (see `MainWindowAccessor.isExtra`). Without this,
+    /// quitting with Settings open meant that every later mailto click activated
+    /// Eudora and re-opened a Settings window the user had since closed.
+    ///
+    /// Cleared again if the wait for the splash runs out, so that a launch whose
+    /// splash outlives the budget still gets another attempt rather than losing
+    /// the reopen for good — `AppModel.splashHeldForRestore` deliberately holds
+    /// the splash past the tree open, so the margin is thinner than 10 s looks.
+    private static var reopenStarted = false
+
     static var wasOpen: Bool {
         get { UserDefaults.standard.bool(forKey: openKey) }
         set { UserDefaults.standard.set(newValue, forKey: openKey) }
@@ -115,14 +137,25 @@ enum SettingsWindowState {
     /// tree open blocks the main thread for several seconds, so any fixed delay
     /// short enough to feel responsive would land inside that window.
     @MainActor
-    static func reopenIfItWasOpen(attemptsLeft: Int = 40) {
-        if SettingsWindowTracker.diagnose, attemptsLeft == 40 {
+    static func reopenIfItWasOpen(attemptsLeft: Int = reopenAttempts) {
+        // Only the outermost call; the waiting-for-the-splash retries below come
+        // back in with a lower count and must not be turned away.
+        if attemptsLeft == reopenAttempts {
+            guard !reopenStarted else { return }
+            reopenStarted = true
+        }
+        if SettingsWindowTracker.diagnose, attemptsLeft == reopenAttempts {
             print("Settings diag: at launch, wasOpen=\(wasOpen), "
                   + "splash showing=\(SplashWindow.isShowing)")
         }
         guard wasOpen else { return }
         guard !SplashWindow.isShowing else {
-            guard attemptsLeft > 0 else { return }
+            guard attemptsLeft > 0 else {
+                // Budget spent without the splash ever coming down. Let a later
+                // caller have a fresh one; see `reopenStarted`.
+                reopenStarted = false
+                return
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                 reopenIfItWasOpen(attemptsLeft: attemptsLeft - 1)
             }

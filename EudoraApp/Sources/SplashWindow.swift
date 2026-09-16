@@ -37,6 +37,10 @@ enum SplashWindow {
     /// `hide()` is a no-op, so the app behaves exactly as it did before the
     /// splash existed — which is how the window-never-appears bug was pinned on
     /// this file. Worth keeping for the next such question.
+    // Ruled out as the cause of the second main window on 2026sep14: with this
+    // false, two main windows still appeared. Worth recording, because creating
+    // a borderless NSWindow during SwiftUI's own window-creation pass — and
+    // hiding the main window with alphaValue — is a fair suspect on its face.
     static let enabled = true
 
     private static var window: NSWindow?
@@ -70,6 +74,25 @@ enum SplashWindow {
             // Synchronously — see the type's note on isolation.
             mainWindowDidAppear(candidate)
         }
+    }
+
+    /// Stop watching, without showing or hiding anything.
+    ///
+    /// For a duplicate instance, which is about to `exit(0)` and must put nothing
+    /// on screen. `arm()` has already run by then — it happens in `App.init`,
+    /// before any delegate callback — and the duplicate pumps the run loop while
+    /// it waits for a launch URL, which is enough for a window sighting to reach
+    /// the observer above and flash a splash up from a process that is leaving.
+    /// See `AppDelegate.applicationWillFinishLaunching`.
+    ///
+    /// Distinct from `hide()`: that one is the end of a splash that was shown, so
+    /// it sets `hasRun` and reveals the hidden main window. Here there is no
+    /// splash and no hidden window, and nothing should be revealed.
+    static func disarm() {
+        if let windowWatcher = windowWatcher {
+            NotificationCenter.default.removeObserver(windowWatcher)
+        }
+        windowWatcher = nil
     }
 
     /// Puts the splash on screen immediately. Safe to call more than once.
@@ -139,6 +162,15 @@ enum SplashWindow {
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) { hide() }
     }
 
+    /// The window `MainWindowAccessor` settled on, once it has.
+    ///
+    /// Held here rather than read from `MainWindowAccessor.resolved` at the
+    /// point of use. That type conforms to `NSViewRepresentable`, so it and its
+    /// statics are main-actor isolated, and this enum is deliberately not — see
+    /// the type's note on isolation. `mainWindowDidAppear(_:resolved:)` is told
+    /// instead, from a caller that is already on the main actor.
+    private static weak var realMainWindow: NSWindow?
+
     /// The main window, as reported by `MainWindowAccessor` — never guessed at.
     ///
     /// Scanning `NSApp.windows` was a race: at `onAppear` the real window may
@@ -150,12 +182,28 @@ enum SplashWindow {
 
     /// Called by `MainWindowAccessor` as soon as SwiftUI's window exists, and
     /// again whenever it moves or resizes.
-    static func mainWindowDidAppear(_ main: NSWindow) {
+    /// - Parameter resolved: `true` only from `MainWindowAccessor.attach`, which
+    ///   is where the real main window is identified. It records the window for
+    ///   the guard below; every other caller passes `false`.
+    static func mainWindowDidAppear(_ main: NSWindow, resolved: Bool = false) {
+        if resolved { realMainWindow = main }
         guard enabled, !hasRun else { return }
         // The watcher sees every window, including the splash itself and any
         // panel AppKit puts up; only SwiftUI's real window qualifies.
         guard main !== window, main.styleMask.contains(.titled),
               main.frame.width > 1, main.frame.height > 1 else { return }
+        // The watcher armed in `arm()` sees EVERY window in the app, and a
+        // `WindowGroup`'s second main window passes the test above. Latching one
+        // would hide it at alpha 0 in the real window's place and leave the
+        // half-built real window visible beside the splash. So once the accessor
+        // has said which window is real, nothing else qualifies.
+        //
+        // The interval this covers is narrow and real: after `attach` resolves
+        // the first window and before `hide()` runs — which
+        // `AppModel.splashHeldForRestore` deliberately extends. Before the first
+        // `attach` this is inert, which is the cold-launch tie-break noted in
+        // `MainWindowAccessor.isExtra`.
+        if let real = realMainWindow, main !== real { return }
         knownMainWindow = main
 
         // First sight of the window is the moment to put the splash up: earlier
@@ -220,7 +268,45 @@ enum SplashWindow {
 /// restores a saved frame after the window first appears.
 struct MainWindowAccessor: NSViewRepresentable {
     /// The main window, once it exists. Weak: it belongs to AppKit.
+    ///
+    /// The *first* one also settles which window is real, for `isExtra`.
     static weak var resolved: NSWindow?
+
+    /// Master switch for closing a second main window. With this false the app
+    /// behaves exactly as it did before — which is how to tell, if something
+    /// odd ever appears around windows, whether this is the cause.
+    static let closesExtraWindows = true
+
+    /// Logs each second main window this closes.
+    ///
+    /// On until the behaviour has been seen working, because "the second window
+    /// stopped appearing" is also what a fix that never runs looks like, and
+    /// this is what tells the two apart.
+    static let diagnoseExtraWindow = true
+
+    /// The extra windows already dismissed, so a second `attach` for one of them
+    /// doesn't close it twice.
+    ///
+    /// A list rather than a single slot: two extra windows at once has not been
+    /// observed, but it has not been ruled out either, and one slot would let a
+    /// pair ping-pong — each `attach` evicting the other and re-closing it and
+    /// re-logging it on every SwiftUI update pass, which would make the
+    /// diagnostic below useless exactly when it was needed. Weak boxes rather
+    /// than `ObjectIdentifier`, which a later window could reuse the address of.
+    private static var dismissed: [WeakWindow] = []
+
+    private final class WeakWindow {
+        weak var window: NSWindow?
+        init(_ window: NSWindow) { self.window = window }
+    }
+
+    /// Records `window` as dismissed, answering whether it was new.
+    private static func markDismissed(_ window: NSWindow) -> Bool {
+        dismissed.removeAll { $0.window == nil }
+        guard !dismissed.contains(where: { $0.window === window }) else { return false }
+        dismissed.append(WeakWindow(window))
+        return true
+    }
 
     func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
 
@@ -264,21 +350,51 @@ struct MainWindowAccessor: NSViewRepresentable {
         // visible as a flash of the wrong layout before things corrected.
         if let window = nsView.window {
             attach(window, context: context)
-        } else {
+        } else if !context.coordinator.retrying {
+            // One chain at a time: SwiftUI updates this representable on every
+            // model change, and the shared `AppModel` publishes constantly.
+            context.coordinator.retrying = true
             DispatchQueue.main.async {
-                guard let window = nsView.window else { return }
-                attach(window, context: context)
+                retryAttach(nsView, context: context, attemptsLeft: 20)
             }
         }
     }
 
+    /// The deferred half of `updateNSView`, retried rather than attempted once.
+    ///
+    /// A single hop was enough while this only positioned the splash: if it
+    /// missed, the next SwiftUI update tried again and the cost was a misplaced
+    /// splash for a moment. It is not enough now that a missed sighting leaves a
+    /// second main window on screen until some unrelated model change happens to
+    /// drive an update pass. Same shape as `MinimizeKeyStripper.strip` and
+    /// `SettingsWindowTracker.attachScrollRecorder`.
+    private func retryAttach(_ nsView: NSView, context: Context, attemptsLeft: Int) {
+        if let window = nsView.window {
+            context.coordinator.retrying = false
+            attach(window, context: context)
+        } else if attemptsLeft > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                retryAttach(nsView, context: context, attemptsLeft: attemptsLeft - 1)
+            }
+        } else {
+            // Gave up. The next SwiftUI update starts a fresh chain.
+            context.coordinator.retrying = false
+        }
+    }
+
     private func attach(_ window: NSWindow, context: Context) {
+        // Turned away before anything else can take it for the real one.
+        if Self.closesExtraWindows, isExtra(window) {
+            closeExtra(window)
+            return
+        }
+
         // Published for anyone who needs *this* window rather than whichever one
         // AppKit currently considers main. `NSApp.mainWindow` is nil while the
         // app is inactive and during parts of launch — which is exactly when the
         // indexing bar appears and `ContentView` needs to force a relayout.
         Self.resolved = window
-        SplashWindow.mainWindowDidAppear(window)
+        SplashWindow.mainWindowDidAppear(window, resolved: true)
         installCloseToQuit(window, coordinator: context.coordinator)
 
         guard context.coordinator.observers.isEmpty else { return }
@@ -293,11 +409,103 @@ struct MainWindowAccessor: NSViewRepresentable {
         }
     }
 
+    /// Whether SwiftUI has opened a *second* main window.
+    ///
+    /// It opens one from a `WindowGroup` to satisfy an external event, and a
+    /// `mailto:` arriving at a running Eudora is one — the 2026sep03 sighting,
+    /// diagnosed 2026sep14. The window exists *before* the URL reaches any
+    /// Eudora code, so there is nothing in our own handling to correct, and both
+    /// `handlesExternalEvents` spellings were tried and both failed, in opposite
+    /// directions. Closing it on sight is what is left. See
+    /// EudoraDevelopmentNotes.txt, "The Dock tile, and the mailto: that went
+    /// nowhere".
+    ///
+    /// The test is "we already have one, and it still exists". `resolved` is
+    /// weak, but a closed `NSWindow` is deallocated only when
+    /// `isReleasedWhenClosed` is set, so a non-nil reference does not by itself
+    /// prove the window is alive; `NSApp.windows` holds every window the
+    /// application still owns, closed ones included, so this is an existence
+    /// test and not a liveness one. That is as much as can be asked for here,
+    /// and the asymmetry is what makes it enough: answering `false` wrongly
+    /// adopts the new window, which is visible and recoverable, while answering
+    /// `true` wrongly would close Eudora's only window and leave the app running
+    /// with nothing on screen.
+    ///
+    /// There is no legitimate second main window to protect: closing the main
+    /// window quits the app (`CloseToQuitProxy`), so while the process lives its
+    /// window exists. The one shape that would defeat this is SwiftUI destroying
+    /// and re-creating the group's window while the old `NSWindow` object is
+    /// still retained — impossible while that stays true, and the thing to
+    /// re-examine first if it ever stops being.
+    ///
+    /// **THE COLD-LAUNCH TIE-BREAK, and it is a real hole.** With `resolved`
+    /// still nil this answers `false` for everything, so on a launch that builds
+    /// more than one window the survivor is simply whichever `attach` ran first.
+    /// Nothing checks that it is the window SwiftUI went on to manage — and
+    /// `ContentView.onAppear` picks the window whose `openWindow` the model
+    /// keeps by a *separate* first-past-the-post race, so the two can disagree
+    /// and the disagreement is then permanent. Not fixed because a normal
+    /// LaunchServices launch makes exactly one window; the three-window readings
+    /// on 2026sep14 were the direct-binary-launch artefact. If a cold launch
+    /// ever produces two, fix it here and in `ContentView` together.
+    private func isExtra(_ window: NSWindow) -> Bool {
+        guard let first = Self.resolved, first !== window else { return false }
+        return NSApp.windows.contains { $0 === first }
+    }
+
+    /// Takes the second main window off the screen now, and out of existence on
+    /// the next run-loop turn.
+    ///
+    /// Two steps because of who may be calling. `attach` runs either from
+    /// `updateNSView` — SwiftUI updating a view that is *inside the window being
+    /// closed*, where closing synchronously would tear the hierarchy down
+    /// underneath its own caller — or from the deferred hop a turn later, which
+    /// is the usual route for a brand-new window. Deferring covers both. The
+    /// `orderOut` is what keeps the window from being seen in the meantime; it
+    /// will still have been on screen for a turn or so, so expect a flash rather
+    /// than a window that never appears.
+    ///
+    /// `close()`, never `performClose(_:)`: `performClose` consults the window
+    /// delegate, and a main window's delegate is `CloseToQuitProxy`, which
+    /// answers by quitting Eudora. `close()` asks nobody.
+    ///
+    /// Note what has deliberately *not* happened by the time this is called:
+    /// `resolved` still points at the real window, no `CloseToQuitProxy` was
+    /// installed, and no move/resize observers were registered. `SplashWindow`
+    /// is not told from here either — though it can still see the window through
+    /// the app-wide watcher `arm()` registers, which is why
+    /// `mainWindowDidAppear` has its own check against `resolved`.
+    private func closeExtra(_ window: NSWindow) {
+        // `attach` can run more than once for the same window — SwiftUI updates
+        // the representable on every model change, and the shared `AppModel`
+        // publishes constantly during the mailto flow. `nsView.window` keeps
+        // answering after `close()`, so without this the window is closed twice.
+        guard Self.markDismissed(window) else { return }
+
+        if Self.diagnoseExtraWindow {
+            eudoraDiag("[windows] second main window closed on sight — "
+                       + "key=\(window.isKeyWindow) "
+                       + "frame=\(NSStringFromRect(window.frame))")
+        }
+        window.orderOut(nil)
+        // Belt and braces against the same double close: an unbalanced release
+        // of a window that was released on close is a crash a long way from
+        // here. The splash panel is set the same way, for the same reason. The
+        // cost is that the closed window lingers in `NSApp.windows` for the life
+        // of the process; nothing reads that list without filtering on
+        // `isVisible` or `isMiniaturized`, but the `[windows]` census will count
+        // it.
+        window.isReleasedWhenClosed = false
+        DispatchQueue.main.async { window.close() }
+    }
+
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator: @unchecked Sendable {
         var observers: [NSObjectProtocol] = []
         var closeProxy: CloseToQuitProxy?
+        /// A deferred `attach` chain is running; see `retryAttach`.
+        var retrying = false
         deinit { observers.forEach(NotificationCenter.default.removeObserver) }
     }
 }

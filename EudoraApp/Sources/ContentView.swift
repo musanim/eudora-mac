@@ -208,6 +208,13 @@ struct ContentView: View {
         // the thread for seconds in the very iteration that would have put the
         // splash on screen. A short delay guarantees an idle pass first.
         .onAppear {
+            // Fires once per *main window*, so a second line here is a second
+            // main window — the whole question on 2026sep14. Its position in the
+            // log relative to the `[trace] application(open:)` line says whether
+            // the window is made before the URL is delivered or because of it.
+            if AppDelegate.diagnoseMailtoForward {
+                eudoraDiag("[trace] ContentView.onAppear — a main window was built")
+            }
             // Drafts are assembled from the account's From identity, and they
             // can be created from places that never see the AccountStore — the
             // message list's right-click Reply, for one. Handed over once here.
@@ -220,7 +227,24 @@ struct ContentView: View {
             // `openWindow(id:value:)` brings an existing window for the same
             // value forward rather than opening a second, which is what makes
             // double-clicking an already-open draft focus it.
-            model.presentDraftWindow = { openWindow(id: ComposeWindow.groupID, value: $0) }
+            //
+            // FIRST WINDOW WINS, and that is not belt-and-braces. SwiftUI opens
+            // a second main window to satisfy an external event (see
+            // `MainWindowAccessor.isExtra`), that window's `onAppear` runs, and
+            // `MainWindowAccessor` then closes it. Overwriting here would leave
+            // the model holding an action captured from a window that no longer
+            // exists — and the symptom, a `mailto:` that opens nothing, is the
+            // original bug wearing a different hat. The main window cannot close
+            // without quitting (`CloseToQuitProxy`), so the first one to get
+            // here is the one that lasts.
+            if model.presentDraftWindow == nil {
+                model.presentDraftWindow = {
+                    if AppDelegate.diagnoseMailtoForward {
+                        eudoraDiag("[trace] openWindow(compose) for draft \($0)")
+                    }
+                    openWindow(id: ComposeWindow.groupID, value: $0)
+                }
+            }
             // Route the app-terminate decision through the model, so Quit by any
             // route asks about unsaved compose windows first. Set here because
             // this is where the model is in hand; the closure is main-actor work

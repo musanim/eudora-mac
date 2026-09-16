@@ -122,6 +122,152 @@ schemes:
     build:
       targets:
         EudoraApp: all
+      # Keep /Applications/Eudora.app as the copy that was built last, so the
+      # Dock tile can point at one stable path instead of a DerivedData one.
+      #
+      # This is not cosmetic. LaunchServices resolves a handler to a bundle
+      # PATH, so the copy registered for mailto: and the copy actually running
+      # have to be the same one, or the link launches a second process that the
+      # single-instance guard then kills. The /Applications copy had been stale
+      # since 2026aug04 and the registered handler was a path under dist/, which
+      # is how that was found.
+      #
+      # **A scheme post-action, NOT a postBuildScripts phase, and that is the
+      # whole point.** Xcode signs the product *after* every build phase has
+      # run, so a trailing build phase copies the app before it has a signature.
+      # Tried on 2026sep14: it installed an unsigned bundle and the kernel
+      # killed it on launch with "Killed: 9". Incremental builds hid it at first
+      # — when nothing relinks, the copy picks up a binary still signed from an
+      # earlier run, so it worked twice before failing. A post-action runs after
+      # the whole build action, signature included. release.sh builds with
+      # `-scheme`, so this runs for a release too.
+      #
+      # Every configuration on purpose: Debug is what gets used between
+      # releases, and a tile that launches last month's build is the thing being
+      # fixed. So the Dock tile is usually a Debug build.
+      #
+      # A Release build lands here *before* release.sh staples it, which is
+      # harmless locally (nothing built on this machine is quarantined) but
+      # means **"does the shipped build pass Gatekeeper" must be tested against
+      # dist/, never against /Applications.**
+      postActions:
+        # settingsTarget is what puts BUILT_PRODUCTS_DIR, WRAPPER_NAME and the
+        # rest in the environment; without it a post-action gets almost nothing.
+        - name: Copy to /Applications
+          settingsTarget: EudoraApp
+          script: |
+            # A post-action's output does NOT appear in Xcode's build log — that
+            # is the price of running after signing — so this keeps its own log.
+            # Read it with:  tail -40 ~/Library/Logs/Eudora-install.log
+            LOG="$HOME/Library/Logs/Eudora-install.log"
+            /bin/mkdir -p "$(/usr/bin/dirname "$LOG")"
+            say() { echo "$(/bin/date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+            set -uo pipefail
+
+            if [ -z "${BUILT_PRODUCTS_DIR:-}" ] || [ -z "${WRAPPER_NAME:-}" ]; then
+                say "skipped: no BUILT_PRODUCTS_DIR/WRAPPER_NAME (settingsTarget missing?)"
+                exit 0
+            fi
+
+            SRC="${BUILT_PRODUCTS_DIR}/${WRAPPER_NAME}"
+            DEST="/Applications/${WRAPPER_NAME}"
+            STEM="${WRAPPER_NAME%.app}"
+            NEW="/Applications/.${STEM}-new.app"
+            OLD="/Applications/.${STEM}-old.app"
+            LOCK="/Applications/.${STEM}-install.lock"
+
+            say "start: ${CONFIGURATION:-?} $SRC"
+
+            if [ ! -x "${BUILT_PRODUCTS_DIR}/${EXECUTABLE_PATH:-nonesuch}" ]; then
+                say "skipped: no runnable app at $SRC"
+                exit 0
+            fi
+
+            # The guard this episode bought. An unsigned or broken bundle in
+            # /Applications is killed on launch by the kernel, and the symptom
+            # ("Killed: 9") names nothing. Verify before installing, never after.
+            # `codesign --verify <path>`, redirected. There is no --quiet option;
+            # passing one exits 2, which reads as "invalid" and refuses every
+            # install. Cost a build round trip on 2026sep14.
+            if ! /usr/bin/codesign --verify "$SRC" >/dev/null 2>&1; then
+                say "REFUSED: $SRC is not validly signed; /Applications left alone"
+                exit 0
+            fi
+
+            # release.sh runs its own xcodebuild and can overlap an Xcode build.
+            # Both would use these fixed staging names, so take a lock; one older
+            # than ten minutes is from a run that died holding it.
+            [ -d "$LOCK" ] && [ -z "$(/usr/bin/find "$LOCK" -maxdepth 0 -mmin -10)" ] \
+                && /bin/rmdir "$LOCK" 2>/dev/null
+            if ! /bin/mkdir "$LOCK" 2>/dev/null; then
+                say "skipped: another build is already installing"
+                exit 0
+            fi
+
+            # This is a convenience and must never leave /Applications without an
+            # app, nor strand a signed .Eudora-new.app in a directory
+            # LaunchServices scans — that stray copy would be a fresh instance of
+            # the very bug this exists to fix.
+            finish() {
+                if [ ! -e "$DEST" ] && [ -d "$OLD" ]; then
+                    /bin/mv "$OLD" "$DEST" && say "restored the previous $DEST"
+                fi
+                /bin/rm -rf "$NEW" "$OLD"
+                /bin/rmdir "$LOCK" 2>/dev/null
+                exit 0
+            }
+            trap finish EXIT INT TERM HUP
+
+            # Recovery from a run killed outright between the two moves below.
+            # Must come BEFORE any rm: at that moment $OLD is the only copy of
+            # the app that exists.
+            if [ ! -e "$DEST" ] && [ -d "$OLD" ]; then
+                /bin/mv "$OLD" "$DEST"
+                say "recovered $DEST from an interrupted earlier build"
+            fi
+            /bin/rm -rf "$NEW" "$OLD"
+
+            # Never write over a bundle that is running: the live process keeps
+            # reading from it, and replacing it underneath gives a crash that
+            # reads as a code bug.
+            RUNNING="^/Applications/${EXECUTABLE_FOLDER_PATH:-$WRAPPER_NAME/Contents/MacOS}/"
+            if /usr/bin/pgrep -f "$RUNNING" >/dev/null 2>&1; then
+                say "skipped: $DEST is running — quit it and build again"
+                exit 0
+            fi
+
+            # Absolute /usr/bin/ditto: Humdrum ships its own `ditto` earlier in
+            # PATH on this machine, the trap scripts/release.sh documents. ditto
+            # rather than cp -R because it carries extended attributes and the
+            # code signature across intact.
+            /usr/bin/ditto "$SRC" "$NEW" || { say "ditto failed"; exit 0; }
+
+            # Checked again: the guard above was a whole copy ago, and the rm at
+            # the end is what would pull the bundle out from under a process
+            # launched in between. (The renames are safe — a running process
+            # follows a rename.)
+            if /usr/bin/pgrep -f "$RUNNING" >/dev/null 2>&1; then
+                say "skipped: $DEST started while copying"
+                exit 0
+            fi
+
+            if [ -e "$DEST" ]; then /bin/mv "$DEST" "$OLD"; fi
+            /bin/mv "$NEW" "$DEST" || { say "final move failed"; exit 0; }
+            /bin/rm -rf "$OLD"
+
+            # LaunchServices caches by bundle PATH and doesn't reliably notice a
+            # bundle replaced at the same path. This refreshes the record only:
+            # it does NOT set the default mailto: handler (that is the button in
+            # Settings ▸ Default email app) and does not refresh the Dock tile's
+            # cached icon, for which the tile must be removed and re-added.
+            /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST" || true
+
+            if /usr/bin/codesign --verify "$DEST" >/dev/null 2>&1; then
+                say "installed ${CONFIGURATION:-?} build at $DEST (signature verified)"
+            else
+                say "INSTALLED BUT UNSIGNED at $DEST — do not launch it"
+            fi
     run:
       config: Debug
       # Silence the unified-logging chatter Xcode echoes from Apple frameworks —
