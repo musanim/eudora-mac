@@ -990,6 +990,19 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Windows") {
+                // Stephen's own wording for the label, American spelling and
+                // all, which is why it differs from the rest of the file.
+                Toggle("Stephen\u{2019}s special night-mode behavior",
+                       isOn: $model.nightModeComposePlacement)
+                Text("Off, a new message window opens wherever macOS last left one \u{2014} "
+                        + "the ordinary way, and the right one on a single display. On, "
+                        + "every new message window opens centred: on the built-in display "
+                        + "when the main window is there, and on the primary display "
+                        + "otherwise. A window that is already open is never moved.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             Section("Mailboxes") {
                 Toggle("Show Junk mailbox", isOn: $model.showJunkMailbox)
                 Text("Off hides the Junk mailbox from the sidebar and the move/search "

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CoreGraphics   // CGDisplayIsBuiltin
 
 /// The contents of one compose window: the editor for a single draft, plus the
 /// machinery for closing it.
@@ -48,9 +49,9 @@ struct ComposeWindow: View {
                 .padding(24)
             }
         }
-        // Puts the window on the same display as the main window when the frame
-        // SwiftUI restored lands on a different one. See the type.
-        .background(ComposeWindowPlacer())
+        // Puts the window on the display it ought to open on, when Stephen's
+        // night-mode placement is switched on in Settings. See the type.
+        .background(ComposeWindowPlacer(enabled: model.nightModeComposePlacement))
     }
 
     /// The saved subject, or "New Message". Doesn't track what's being typed —
@@ -187,14 +188,41 @@ struct WindowCloseGuard: NSViewRepresentable {
     }
 }
 
-/// Opens a compose window on the same display as the main window.
+/// Opens a compose window on the display it ought to open on.
 ///
-/// **Why this is needed.** SwiftUI restores a `WindowGroup`'s remembered frame,
-/// and that frame is stored in absolute screen coordinates together with the
-/// screen it was saved on, so a compose window that was on another display when
-/// it closed reopens there — however far that is from the window being worked
-/// in. Confirmed 2026sep18 by reading the saved frame out of the preferences
-/// domain:
+/// **Off unless `AppModel.nightModeComposePlacement` is on**, which it is not by
+/// default. With it off this does nothing whatever and SwiftUI's remembered
+/// frame stands — stock macOS behaviour, and the right behaviour for anyone
+/// running the shared build on one display.
+///
+/// **The rule, when it is on**, which is Stephen's and is deliberately not
+/// "follow the main window":
+///
+/// - Main window on the **built-in** display — in practice night mode, when
+///   `night-mode.lua` has moved it there and blacked out the externals, but the
+///   test is the display and not the mode, so an undocked laptop or a window
+///   dragged there by hand gets the same answer — the composer opens there too,
+///   because that is the only screen he can see.
+/// - Main window **anywhere else** — the composer opens centred on the
+///   **primary** display, whichever display the main window is on, because the
+///   primary is where he edits.
+///
+/// **Every new compose window, every time** — not only the ones arriving from
+/// the wrong display. A remembered frame on the right display is no better than
+/// one on the wrong display: it is wherever the last composer happened to be
+/// dragged to, and a reply is a transient thing that should appear where the
+/// eyes already are.
+///
+/// A window that is *already open* is a different case, and is never touched: a
+/// window is placed once, and `openWindow(id:value:)` brings an existing
+/// composer forward rather than opening a second, so a draft being edited in a
+/// window moved somewhere deliberately stays exactly where it was put.
+///
+/// **Why it is needed at all.** SwiftUI restores a `WindowGroup`'s remembered
+/// frame, stored in absolute screen coordinates together with the screen it was
+/// saved on, so a compose window that was on another display when it closed
+/// reopens there. Confirmed 2026sep18 by reading the saved frame out of the
+/// preferences domain:
 ///
 ///     "NSWindow Frame compose-AppWindow-1" = "-1342 831 844 1291
 ///                                             -2056 831 2056 1291"
@@ -202,40 +230,56 @@ struct WindowCloseGuard: NSViewRepresentable {
 /// The last four numbers are the screen. Origin `-2056, 831` is the built-in
 /// display; the main window and every other saved window named the primary,
 /// whose frame begins at `0 0`. What puts it there is `night-mode.lua`, which
-/// sweeps compose windows onto the built-in as they appear — and AppKit then
-/// saves that frame when the window closes, so one night teaches every later
-/// reply to open on the wrong display.
+/// sweeps compose windows onto the built-in as they appear — and the move posts
+/// `windowDidMove`, on which SwiftUI saves the frame, so one night teaches every
+/// later reply to open on the wrong display.
 ///
 /// **This does not cure the cause, and is not meant to.** Night mode still
 /// sweeps, and AppKit still saves the swept frame, so the bad frame is re-learnt
-/// every night and corrected again the next morning. What makes that stable
-/// rather than a running battle is that moving the window *rewrites* the
-/// autosave — `setFrame` posts `windowDidMove`, SwiftUI saves — so one reply
-/// puts the remembered frame back on the right display for the rest of the day.
-///
-/// **The trade, stated plainly.** Because the policy is unconditional, a
-/// compose window deliberately parked on a second display does not stay there:
-/// the next reply is pulled to the main window's display, and the autosave
-/// rewrite means that choice is gone from disk, not merely from this window.
-/// Turn `followsMainWindowDisplay` off if that is ever the preferred behaviour.
-/// What *is* preserved: the remembered size, always; and the remembered
-/// position whenever it was already on the main window's display, since nothing
-/// happens at all in that case. A window moved by hand after it opens is never
-/// moved again, because each window is placed once.
+/// every night. What makes that stable rather than a running battle is that
+/// moving the window *rewrites* the autosave — `setFrame` posts `windowDidMove`,
+/// SwiftUI saves — so the first reply of the day puts the remembered frame back
+/// where it belongs and the rest of the day is undisturbed. The same mechanism
+/// is why the remembered frame is of no use to a new window anyway: it is
+/// rewritten by every placement, so it only ever records where the last
+/// composer was put.
 struct ComposeWindowPlacer: NSViewRepresentable {
-    /// Master switch. With this false the app behaves as it did before — which
-    /// is how to tell, if compose windows ever land somewhere surprising,
-    /// whether this is the cause.
-    static let followsMainWindowDisplay = true
+    /// `AppModel.nightModeComposePlacement`, handed in by `ComposeWindow`.
+    let enabled: Bool
 
-    /// Logs each window it moves, and each one it deliberately leaves alone.
-    /// On until the behaviour has been watched across a night-mode cycle, which
-    /// is the case it exists for.
+    /// Logs the screen census, every window it places and which of the two rules
+    /// decided, and every window it gives up on. On until the behaviour has been
+    /// watched across a night-mode cycle, which is the case it exists for.
     static let diagnoseComposePlacement = true
 
-    /// How many windows have been placed, for the cascade. Never reset: the
-    /// modulo keeps the offset bounded.
-    private static var placements = 0
+    /// The composers this has placed, weakly, for the cascade.
+    ///
+    /// Counting the ones still on screen rather than the ones ever placed is
+    /// what makes a single reply land *exactly* centred, which is the point of
+    /// the feature; the step only appears when a new window would otherwise
+    /// cover one that is already up.
+    private static var placedWindows: [WeakWindow] = []
+
+    private final class WeakWindow {
+        weak var window: NSWindow?
+        init(_ window: NSWindow) { self.window = window }
+    }
+
+    /// How many placed composers other than `window` are on screen now.
+    ///
+    /// Only dead entries are removed. `isVisible` is false while a window is
+    /// minimised *and* while the whole app is hidden (⌘H), so pruning on it
+    /// would strike live windows off the list for good — and nothing ever puts
+    /// one back, so the next composer but one would land exactly on top of a
+    /// restored window. Filter on it; delete on `nil`.
+    @MainActor
+    private static func liveCount(excluding window: NSWindow) -> Int {
+        placedWindows.removeAll { $0.window == nil }
+        return placedWindows.filter { $0.window !== window && $0.window?.isVisible == true }.count
+    }
+
+    /// The screen census is written once per run, not once per window.
+    private static var loggedScreens = false
 
     private static let screenNumberKey = NSDeviceDescriptionKey("NSScreenNumber")
 
@@ -252,10 +296,15 @@ struct ComposeWindowPlacer: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        guard Self.followsMainWindowDisplay else { return }
         let coordinator = context.coordinator
         coordinator.view = nsView
         guard !coordinator.placed else { return }
+        // Off is a decision, and it is made once per window. Without the latch,
+        // ticking the box in Settings re-evaluates every open composer's body
+        // and yanks them all to the primary — including ones deliberately put
+        // somewhere, whose positions the autosave rewrite would then erase. The
+        // switch is for windows opened after it, not for windows already up.
+        guard enabled else { coordinator.placed = true; return }
         if let window = nsView.window {
             place(window, coordinator: coordinator)
         } else if !coordinator.hunting {
@@ -264,7 +313,7 @@ struct ComposeWindowPlacer: NSViewRepresentable {
             // view has a window. Same guard as `MainWindowAccessor.updateNSView`
             // — `WindowCloseGuard` below lacks it and starts a chain per pass.
             coordinator.hunting = true
-            DispatchQueue.main.async { attempt(coordinator: coordinator, attemptsLeft: 20) }
+            DispatchQueue.main.async { attempt(coordinator: coordinator, attemptsLeft: 40) }
         }
     }
 
@@ -284,7 +333,29 @@ struct ComposeWindowPlacer: NSViewRepresentable {
             place(window, coordinator: coordinator)
             if coordinator.placed { coordinator.hunting = false; return }
         }
-        guard attemptsLeft > 0 else { coordinator.hunting = false; return }
+        guard attemptsLeft > 0 else {
+            // Two seconds without an answer is an answer. `place` deliberately
+            // declines to latch while it cannot tell, and the main window has no
+            // screen while it is minimised — so without this the chain ends, the
+            // next `AppModel` publish starts another, and a composer opened over
+            // a minimised main window retries for as long as it is open. Giving
+            // up leaves the window where SwiftUI put it, which is the same
+            // outcome, said once and logged.
+            coordinator.hunting = false
+            coordinator.placed = true
+            if Self.diagnoseComposePlacement {
+                // Two different failures reach here and they are not the same
+                // news, so say which. The first is ordinary — SwiftUI builds
+                // compose scenes it never shows — and the second is not.
+                eudoraDiag(coordinator.view?.window == nil
+                    ? "[compose] gave up after ~2 s: this view never got a window, "
+                      + "so there was nothing to place"
+                    : "[compose] gave up after ~2 s: could not tell which display the "
+                      + "main window is on (minimised, or mid-reconfiguration); "
+                      + "left where SwiftUI put it")
+            }
+            return
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             attempt(coordinator: coordinator, attemptsLeft: attemptsLeft - 1)
         }
@@ -303,43 +374,109 @@ struct ComposeWindowPlacer: NSViewRepresentable {
         return (screen.deviceDescription[Self.screenNumberKey] as? NSNumber)?.uint32Value
     }
 
+    /// The display that carries the menu bar and the Dock: the one at the origin.
+    ///
+    /// Not `NSScreen.main`, which is the screen of the *key* window and so moves
+    /// about with the focus — it would name whichever display the composer had
+    /// just appeared on, which is the question, not the answer. `NSScreen.screens`
+    /// is documented to put the origin screen first; the origin test is what is
+    /// actually being asked, so it is asked, with the documented order as the
+    /// fallback.
+    private func primaryScreen() -> NSScreen? {
+        NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.screens.first
+    }
+
+    /// The display this composer should open on, or nil while that can't be
+    /// decided — which is a reason to ask again, never a reason to give up.
+    ///
+    /// `CGDisplayIsBuiltin`, not the display's name: `night-mode.lua` matches
+    /// the string "Built-in Retina Display", which is localized and has changed
+    /// across macOS releases. The two could therefore disagree one day, and it
+    /// is the Lua that would be wrong.
+    @MainActor
+    private func target() -> (screen: NSScreen, rule: String)? {
+        guard let home = MainWindowAccessor.resolved?.screen else { return nil }
+        if let id = displayID(home), CGDisplayIsBuiltin(id) != 0 {
+            return (home, "the main window is on the built-in, so the composer follows")
+        }
+        // The rule is carried out of here rather than re-derived from the answer.
+        // Asking "is the target the built-in?" afterwards gets it wrong with the
+        // laptop undocked, where the built-in *is* the primary: the placement
+        // would be right and the log would name the wrong reason, in exactly the
+        // display arrangement the log is on to observe.
+        guard let primary = primaryScreen() else { return nil }
+        return (primary, "centred on the primary")
+    }
+
+    /// Every screen, once per run: id, frame, visible frame, whether Core
+    /// Graphics calls it built-in, and its name — plus which one the main window
+    /// is on. Without it the log names a display only by its visible frame, and
+    /// "centred on the primary" has to be taken on trust — which is one
+    /// inference too many when the open question is whether `primaryScreen()`
+    /// picks the display Stephen means.
+    @MainActor
+    private func logScreens() {
+        guard Self.diagnoseComposePlacement, !Self.loggedScreens else { return }
+        Self.loggedScreens = true
+        for screen in NSScreen.screens {
+            let id = displayID(screen)
+            eudoraDiag("[compose] screen \(id.map(String.init) ?? "?") "
+                       + "\u{201C}\(screen.localizedName)\u{201D} "
+                       + "frame \(NSStringFromRect(screen.frame)) "
+                       + "visible \(NSStringFromRect(screen.visibleFrame)) "
+                       + "builtin=\(id.map { CGDisplayIsBuiltin($0) != 0 } ?? false)")
+        }
+        let primary = displayID(primaryScreen()).map(String.init) ?? "?"
+        let home = displayID(MainWindowAccessor.resolved?.screen).map(String.init) ?? "none"
+        eudoraDiag("[compose] primary is display \(primary); "
+                   + "the main window is on display \(home)")
+    }
+
     @MainActor
     private func place(_ window: NSWindow, coordinator: Coordinator) {
-        // No main window yet means "ask again", not "leave it": latching here
-        // would strand the window on the wrong display for its whole life.
-        guard let home = MainWindowAccessor.resolved?.screen, let homeID = displayID(home) else {
-            return
-        }
+        logScreens()
+        // No main window yet, or no screens, means "ask again", not "leave it":
+        // latching here would strand the window on the wrong display. `attempt`
+        // is what eventually gives up, after two seconds.
+        guard let (screen, rule) = target() else { return }
         coordinator.placed = true
 
-        // `window.screen` is nil when the window is off every display, which is
-        // a case to move rather than to skip — hence comparing ids, either of
-        // which may be nil, rather than requiring a screen.
-        if displayID(window.screen) == homeID {
-            if Self.diagnoseComposePlacement {
-                eudoraDiag("[compose] already on the main window's display; not moved")
-            }
-            return
-        }
+        // The cascade slot is taken once, before the move, so the verification
+        // below re-asserts the *same* frame rather than sliding the window along.
+        let step = CGFloat(Self.liveCount(excluding: window) % 5) * 26
+        Self.placedWindows.append(WeakWindow(window))
+        let settled = move(window, onto: screen, step: step, rule: rule)
 
-        move(window, onto: home)
-
-        // One verification a turn later, in case SwiftUI applies its restored
-        // frame *after* this runs. Once, not a loop: if it can win twice it can
-        // win forever, and a fight between two frame-setters is worse than a
-        // window in the wrong place.
+        // One verification a turn later, on the whole frame rather than just
+        // the display: the race it exists for — SwiftUI applying the restored
+        // frame after this runs — usually moves the window *within* the right
+        // display, which a display check would miss entirely.
+        //
+        // It also fires when SwiftUI merely settles the window's size a turn
+        // late, which is not that race at all; re-centring at the size it
+        // settled on is the right answer either way, so the guard is left broad
+        // and the log says only what it saw. Once, not a loop: if something can
+        // win twice it can win forever, and a fight between two frame-setters is
+        // worse than a window in the wrong place.
         DispatchQueue.main.async {
-            guard displayID(window.screen) != homeID else { return }
+            guard window.frame != settled else { return }
             if Self.diagnoseComposePlacement {
-                eudoraDiag("[compose] the restored frame came back; placing again")
+                eudoraDiag("[compose] the frame changed after placement "
+                           + "(\(NSStringFromRect(settled)) → "
+                           + "\(NSStringFromRect(window.frame))); centring again")
             }
-            move(window, onto: home)
+            _ = move(window, onto: screen, step: step, rule: rule)
         }
     }
 
     @MainActor
-    private func move(_ window: NSWindow, onto home: NSScreen) {
-        let visible = home.visibleFrame
+    /// Returns the frame the window actually ended up with, which is what the
+    /// verification in `place` compares against — `setFrame` does not always
+    /// grant what it is asked for.
+    @discardableResult
+    private func move(_ window: NSWindow, onto target: NSScreen,
+                      step: CGFloat, rule: String) -> NSRect {
+        let visible = target.visibleFrame
         let was = window.frame
         var frame = was
         frame.size.width  = min(frame.width,  visible.width)
@@ -347,8 +484,6 @@ struct ComposeWindowPlacer: NSViewRepresentable {
 
         // Centred, then stepped down and right once per window placed, so two
         // replies opened in a row don't land exactly on top of each other.
-        let step = CGFloat(Self.placements % 5) * 26
-        Self.placements += 1
         frame.origin = CGPoint(x: visible.midX - frame.width / 2 + step,
                                y: visible.midY - frame.height / 2 - step)
         frame = clamped(frame, to: visible)
@@ -368,8 +503,10 @@ struct ComposeWindowPlacer: NSViewRepresentable {
         if Self.diagnoseComposePlacement {
             eudoraDiag("[compose] moved from \(NSStringFromRect(was)) "
                        + "to \(NSStringFromRect(window.frame)) "
-                       + "on the main window's display \(NSStringFromRect(visible))")
+                       + "on \(NSStringFromRect(visible)) — \(rule)"
+                       + (step > 0 ? "; stepped \(Int(step)) pt clear of another composer" : ""))
         }
+        return window.frame
     }
 
     /// Slides `frame` until it lies inside `visible`, as far as its size allows.

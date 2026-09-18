@@ -533,6 +533,43 @@ final class AppModel: ObservableObject {
     }
     private static let showJunkKey = "showJunkMailbox"
 
+    /// Where a compose window opens, when the ordinary answer is wrong.
+    ///
+    /// Off by default, and that matters: with it off there is no placement code
+    /// at all and SwiftUI's remembered frame stands, which is stock macOS
+    /// behaviour and the right behaviour for anyone running the shared build on
+    /// one display. This whole feature is for a four-display desk with a
+    /// Hammerspoon night mode, and it would be baffling anywhere else.
+    ///
+    /// On, the rule is Stephen's, and it is not "follow the main window":
+    ///
+    /// - Main window on the **built-in** display — in practice night mode, when
+    ///   `night-mode.lua` has moved it there and blacked the externals out, but
+    ///   the test is the display and not the mode, so an undocked laptop gets
+    ///   the same answer — the composer opens there too, because that is the
+    ///   only screen he can see.
+    /// - Main window **anywhere else** — the composer opens centred on the
+    ///   **primary** display, whichever display the main window is on, because
+    ///   the primary is where he edits.
+    ///
+    /// Every *new* compose window, every time — the remembered frame is only
+    /// ever a record of where the last composer was dragged to, which is no
+    /// use to this one. A window that is already open is a different case and is
+    /// never moved, so a draft being edited somewhere deliberate stays there.
+    /// See `ComposeWindowPlacer`.
+    ///
+    /// The Settings label is deliberately broader than "compose windows": the
+    /// dialog-placement question (`PointerAlert`'s text-entry callers) is the
+    /// same problem and the obvious second member of this switch.
+    @Published var nightModeComposePlacement: Bool =
+        UserDefaults.standard.bool(forKey: AppModel.nightModePlacementKey) {
+        didSet {
+            guard nightModeComposePlacement != oldValue else { return }
+            UserDefaults.standard.set(nightModeComposePlacement, forKey: Self.nightModePlacementKey)
+        }
+    }
+    private static let nightModePlacementKey = "nightModeComposePlacement"
+
     /// Eudora 7's "Blah Blah Blah": show the message's headers as they arrived.
     ///
     /// A mode rather than a per-message state, which is what 7 did and what the
