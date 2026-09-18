@@ -164,11 +164,19 @@ enum SplashWindow {
 
     /// The window `MainWindowAccessor` settled on, once it has.
     ///
-    /// Held here rather than read from `MainWindowAccessor.resolved` at the
-    /// point of use. That type conforms to `NSViewRepresentable`, so it and its
-    /// statics are main-actor isolated, and this enum is deliberately not — see
-    /// the type's note on isolation. `mainWindowDidAppear(_:resolved:)` is told
-    /// instead, from a caller that is already on the main actor.
+    /// Held here rather than reached for in `MainWindowAccessor` at the point of
+    /// use. This enum is deliberately not `@MainActor` — see the type's note on
+    /// isolation — and its callers include a notification closure that is not
+    /// actor-isolated either, so the dependency is kept one-way: `attach`, which
+    /// is already on the main thread, *tells* this file which window is real
+    /// through `mainWindowDidAppear(_:resolved:)`.
+    ///
+    /// (Conforming to `NSViewRepresentable` would not by itself have made
+    /// `MainWindowAccessor.resolved` main-actor isolated — global-actor
+    /// inference applies per declaration, to the witnesses of the protocol's
+    /// own requirements, and a plain `static weak var` is isolated to nothing.
+    /// Every access to it happens on the main thread, which is the real
+    /// argument, and this arrangement is what keeps that true from here.)
     private static weak var realMainWindow: NSWindow?
 
     /// The main window, as reported by `MainWindowAccessor` — never guessed at.
