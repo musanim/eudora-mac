@@ -70,19 +70,35 @@ looked like something else.
 
 ## Git
 
-**Claude must not run git.** The sandbox cannot unlink files in `.git`, so every
-git command — even `git status` — strands a lock file that then blocks Stephen's
-own git. Write the commit message to a file and let him run the commit.
+**Claude runs git here, and Stephen pushes.** Changed 2026sep20, at his
+request. The old rule was the opposite — *Claude must not run git* — because the
+sandbox could not unlink files in `.git`, so every git command, `git status`
+included, stranded a lock file that then blocked Stephen's own git. What lifted
+it is that the workspace can now be granted delete permission on the project
+folder, which is also exactly what clearing a stranded lock needs.
 
-Recovery when one has already been stranded, and it is safe once no git process
-is running: `rm -f .git/index.lock` (or whichever `.lock` the error names).
+So: Claude commits, without asking, when a unit of work is finished *and*
+Stephen has built and tested it. **Claude does not push.** Stephen does that,
+and Claude tells him when there is something to push.
 
-`reference/` is gitignored, so it is the place to leave a commit message for him
-to pass to `git commit -F` without it turning up in the commit.
+Recovery when a lock has been stranded, and it is safe once no git process is
+running: `rm -f .git/index.lock` (or whichever `.lock` the error names).
+
+Two standing cautions that did not change:
+
+- **The repo is public.** Anything generated from `phaseX` is private (see "The
+  two mail trees"), and so is anything that looks like a credential. `git add -A`
+  is never the right command here; name the paths.
+- `EudoraDevelopmentNotes.txt` is gitignored. Never name it in a `git commit`
+  pathspec: the whole commit aborts with "did not match any file(s) known to
+  git".
+
+`reference/` is gitignored, so it is the place for a long commit message to be
+written to and passed to `git commit -F` without it turning up in the commit.
+Short messages go inline with `-m`.
 
 **`EudoraDevelopmentNotes.txt` is gitignored too** — a personal scratchpad, not
-tracked. Keep writing to it, but never name it in a `git commit` pathspec: the
-whole commit aborts with "did not match any file(s) known to git".
+tracked. Keep writing to it.
 
 ## Diagnosing
 
