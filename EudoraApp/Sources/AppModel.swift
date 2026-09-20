@@ -4677,10 +4677,12 @@ final class AppModel: ObservableObject {
     }
 
     /// Blacklist the selected message's sender. The caller has already confirmed
-    /// (this is the point of no return): send the notice reply, add the address to
-    /// the blacklist queue, and destroy the message outright — not to Trash, and
-    /// no copy of the reply kept anywhere. The ISP-side blacklisting Stephen does
-    /// by hand, from Tools ▸ Blacklist….
+    /// (this is the point of no return for the *reply*): send the notice reply,
+    /// add the address to the blacklist queue, and take the message out of the
+    /// mailbox outright — not to Eudora's Trash mailbox, and no copy of the
+    /// reply kept anywhere. A copy of *their* message goes to the Finder's
+    /// Trash; see `DeletedMessageArchive`. The ISP-side blacklisting Stephen
+    /// does by hand, from Tools ▸ Blacklist….
     func blacklistSelectedSender() {
         guard let part = selectedPart() else { return }
         let origFrom = part.header("From") ?? ""
@@ -4711,14 +4713,19 @@ final class AppModel: ObservableObject {
         // unwanted either way, the address is on the list either way, and the
         // error banner still says what went wrong.
         //
-        // **Destroyed, not filed in Trash.** This used to call `deleteSelected`,
-        // so a blacklisted message went to Trash like any other delete. But
-        // Trash is a place things are kept, and the whole point of blacklisting
-        // is that this correspondence is over: keeping a copy means it turns up
-        // in searches and in the "most recent" reckoning behind View Response,
-        // and Stephen empties Trash by hand from a 19,000-message backlog. The
-        // confirmation says "delete the message permanently" and now means it,
-        // wherever the message was.
+        // **Destroyed, not filed in Eudora's Trash mailbox.** This used to call
+        // `deleteSelected`, so a blacklisted message went to the Trash mailbox
+        // like any other delete. But that is a place things are kept, and the
+        // whole point of blacklisting is that this correspondence is over:
+        // keeping a copy means it turns up in searches and in the "most recent"
+        // reckoning behind View Response, and Stephen empties that mailbox by
+        // hand from a 19,000-message backlog.
+        //
+        // It does get a rescue copy in the *Finder's* Trash, which is a
+        // different thing and costs none of the above — it is outside Eudora
+        // entirely, so nothing indexes it, nothing counts it, and nothing
+        // surfaces it. See `DeletedMessageArchive`, and 2026sep19, when one was
+        // wanted back.
 
         // **Decided before the message is destroyed**, and that ordering is as
         // load-bearing as the notice's. The routing reads the message's own
@@ -4726,7 +4733,7 @@ final class AppModel: ObservableObject {
         // message left to read them from.
         let buckets = blacklistBuckets(for: part)
 
-        removeSelectedPermanently()
+        removeSelectedPermanently(reason: .blacklisted, announce: false)
 
         addToBlacklistQueue(addr, buckets: buckets)
     }
@@ -5396,7 +5403,9 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Delete = move to Trash; if already in Trash, remove permanently.
+    /// Delete = move to the Trash mailbox; if already there, take it out of the
+    /// mailbox for good — with a copy left in the Finder's Trash, so "for good"
+    /// still means "until you empty that". See `DeletedMessageArchive`.
     /// Acts on the whole selection: the batch goes to `MailboxMutator` as one
     /// set of indices against one snapshot of the mailbox — never a loop over
     /// single removes, which would corrupt the not-yet-processed indices as
@@ -5406,19 +5415,35 @@ final class AppModel: ObservableObject {
         do {
             // No completion notice on a delete: the rows sliding up to close
             // the gap is feedback enough that it worked, and a delete's
-            // destination is never in question (Trash, or gone). A *move* still
+            // destination is never in question (the Trash mailbox, or out of
+            // Eudora). A *move* still
             // gets one — see `moveSelected` — because that names a mailbox the
             // eye can't otherwise see it landed in. Failures still use the
             // banner: they're actionable and shouldn't auto-retire.
+            // The two branches that DESTROY rather than file get a rescue copy
+            // in the Finder's Trash, the same as Delete PERMANENTLY and
+            // blacklisting — deleting from the Trash mailbox is where Stephen's
+            // triage of the 19,000-message backlog happens, and it asks for no
+            // confirmation at all, which makes it the likeliest way to lose
+            // something by accident. It stays silent on success, as it always
+            // has: the rows closing is feedback enough.
             if sel.item.type == .trash {
-                try MailboxMutator.removeMany(base: sel.item.base, indices: sel.indices)
+                let removed = try MailboxMutator.removeMany(base: sel.item.base,
+                                                            indices: sel.indices)
+                let complaint = rescue(removed.map { $0.record },
+                                       reason: .deleted, near: sel.item.base).complaint
                 afterRemoval(veil: "Deleting…")
+                if let complaint { showError(complaint) }
             } else if let trash = base(ofType: .trash) {
                 try MailboxMutator.moveMany(from: sel.item.base, indices: sel.indices, to: trash)
                 afterRemoval(veil: "Deleting…")
             } else {
-                try MailboxMutator.removeMany(base: sel.item.base, indices: sel.indices)
+                let removed = try MailboxMutator.removeMany(base: sel.item.base,
+                                                            indices: sel.indices)
+                let complaint = rescue(removed.map { $0.record },
+                                       reason: .deleted, near: sel.item.base).complaint
                 afterRemoval(veil: "Deleting…")
+                if let complaint { showError(complaint) }
             }
         } catch {
             showError("Delete failed: \(error.localizedDescription)")
@@ -5451,8 +5476,17 @@ final class AppModel: ObservableObject {
         alert.messageText = n == 1
             ? "Delete this message permanently?"
             : "Delete \(n) messages permanently?"
-        alert.informativeText =
-            "They will not go to Trash, and this can't be undone."
+        // The old wording was "They will not go to Trash, and this can't be
+        // undone." The first half is still true of Eudora's Trash *mailbox* and
+        // the second half no longer is, so both halves have to say which Trash
+        // they mean — the whole point of the rescue copy is that this is now
+        // undoable, and a dialog that hides that would have people keep mail
+        // they meant to destroy.
+        alert.informativeText = n == 1
+            ? "It won't go to Eudora's Trash mailbox. A copy goes to the Finder's "
+              + "Trash, so you can still get it back until you empty that."
+            : "They won't go to Eudora's Trash mailbox. A copy of each goes to the "
+              + "Finder's Trash, so you can still get them back until you empty that."
         let yes = alert.addButton(withTitle: n == 1 ? "Delete It" : "Delete Them")
         let cancel = alert.addButton(withTitle: "Cancel")
         yes.keyEquivalent = ""
@@ -5466,8 +5500,7 @@ final class AppModel: ObservableObject {
         // A notice here where an ordinary delete has none: the rows closing is
         // feedback that *something* happened, and the thing worth confirming is
         // which of the two deletes it was.
-        removeSelectedPermanently(notice: n == 1 ? "Message deleted permanently."
-                                                 : "\(n) messages deleted permanently.")
+        removeSelectedPermanently(reason: .deleted, announce: true)
     }
 
     /// Destroy the selection outright, with no confirmation of its own.
@@ -5476,15 +5509,101 @@ final class AppModel: ObservableObject {
     /// blacklisting with the one that covers the whole action — so the asking
     /// stays where the wording can match what will actually happen, and this
     /// stays the single place that knows how to do it.
-    private func removeSelectedPermanently(notice: String? = nil) {
+    private func removeSelectedPermanently(reason: DeletedMessageArchive.Reason,
+                                           announce: Bool) {
         guard let sel = currentSelectionSet() else { return }
+        let n = sel.indices.count
         do {
-            try MailboxMutator.removeMany(base: sel.item.base, indices: sel.indices)
-            afterRemoval(veil: "Deleting…", notice: notice)
+            let removed = try MailboxMutator.removeMany(base: sel.item.base,
+                                                        indices: sel.indices)
+            let complaint = rescue(removed.map { $0.record },
+                                   reason: reason, near: sel.item.base).complaint
+            // **The capsule says only what is already true.** It used to read
+            // "deleted permanently", which the rescue copy made false; the
+            // obvious repair — "a copy is in the Finder's Trash" — would be a
+            // second promise in a second voice, and the capsule is the wrong
+            // voice for it: `afterRemoval` queues its notice until the veil
+            // drops, so on a failure it would appear *after* the contradicting
+            // banner rather than before. Where the copies go is the dialog's
+            // job, and the dialog has just said it. This is feedback that the
+            // rows closing meant a delete, and nothing more.
+            afterRemoval(veil: "Deleting…",
+                         notice: !announce ? nil
+                               : n == 1 ? "Message deleted." : "\(n) messages deleted.")
+            if let complaint { showError(complaint) }
         } catch {
             showError("Delete failed: \(error.localizedDescription)")
         }
     }
+
+    /// What became of the rescue copies for one batch.
+    private struct RescueOutcome {
+        var trashed = 0
+        /// Distinct folders that took copies the Trash wouldn't.
+        var elsewhere: [URL] = []
+        var failed = 0
+        var firstError: String?
+
+        /// The banner, which unlike the capsule doesn't retire on its own. Both
+        /// halves can be true at once, and both are needed: how many were lost,
+        /// and where to look for the ones that were not.
+        var complaint: String? {
+            var parts: [String] = []
+            if failed > 0 {
+                parts.append(failed == 1
+                    ? "One deleted message could not be copied anywhere"
+                    : "\(failed) deleted messages could not be copied anywhere")
+                parts[parts.count - 1] += ": \(firstError ?? "unknown error")."
+            }
+            if let dir = elsewhere.first {
+                parts.append("The Finder's Trash couldn't be used for "
+                             + (trashed == 0 && failed == 0 ? "them" : "some of them")
+                             + "; those copies are in \(dir.path).")
+            }
+            return parts.isEmpty ? nil : parts.joined(separator: " ")
+        }
+    }
+
+    /// Puts a copy of each destroyed message in the Finder's Trash, so that
+    /// "permanently" means "until you empty the Trash" rather than "gone".
+    ///
+    /// **After the removal, not before**, because `removeMany` is what hands
+    /// back the record bytes: reading them separately first would be a second
+    /// pass over the mailbox and a chance for the two to disagree about which
+    /// messages the indices name. The price is that a failure cannot call the
+    /// delete off, and that is exactly why it is reported out loud instead of
+    /// being swallowed — a safety net nobody is told about is worse than no
+    /// safety net, because it gets relied on.
+    ///
+    /// **Synchronous, deliberately.** It was briefly a detached task, on the
+    /// reasoning that emptying a large Trash backlog is a file write and a
+    /// `trashItem` apiece and would freeze the app for a minute. Stephen has
+    /// tools for the backlog now and judged the wait acceptable in the rare case
+    /// — and the background version cost two hazards that the synchronous one
+    /// cannot have: two overlapping batches resolving the same fallback file
+    /// name before either writes (`uniqueURL` is check-then-write), and a quit
+    /// in the seconds after a delete dropping the copies that hadn't been
+    /// written yet. A minute of honest waiting beats either.
+    private func rescue(_ records: [[UInt8]],
+                        reason: DeletedMessageArchive.Reason,
+                        near base: URL) -> RescueOutcome {
+        var outcome = RescueOutcome()
+        for result in DeletedMessageArchive.rescue(records: records,
+                                                   reason: reason, near: base) {
+            switch result {
+            case .success(.trash):
+                outcome.trashed += 1
+            case .success(.fallback(let url)):
+                let dir = url.deletingLastPathComponent()
+                if !outcome.elsewhere.contains(dir) { outcome.elsewhere.append(dir) }
+            case .failure(let error):
+                outcome.failed += 1
+                if outcome.firstError == nil { outcome.firstError = error.localizedDescription }
+            }
+        }
+        return outcome
+    }
+
 
     func moveSelected(to destID: MailboxItem.ID) {
         guard let sel = currentSelectionSet(), let dest = itemsByID[destID] else { return }

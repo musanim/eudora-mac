@@ -692,15 +692,17 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             alert.alertStyle = .critical
             alert.messageText = "Add \(address) to your blacklist?"
             // The list has to match what actually happens — a confirmation that
-            // under-reports its own consequences is worse than none. Blacklisting
-            // no longer routes through the menu's Delete, so there is no longer a
-            // Trash case to distinguish: the message is destroyed wherever it
-            // was, and no copy of the reply is kept either.
+            // under-reports its own consequences is worse than none, and one
+            // that over-reports them is how you end up keeping mail you meant to
+            // destroy. The reply cannot be unsent and the address cannot be
+            // taken off the list by undoing anything, so "can't be undone" still
+            // leads; the message itself now gets a rescue copy, and that is said
+            // last because it is the one part that *is* recoverable.
             alert.informativeText =
-                "This can't be undone. It will reply to this message telling the sender "
-                + "they've been blacklisted, add \(address) to your blacklist list "
-                + "(Tools ▸ Blacklist…), and delete the message permanently. "
-                + "No copy of the reply is kept."
+                "The reply can't be unsent. It will reply to this message telling the "
+                + "sender they've been blacklisted, add \(address) to your blacklist "
+                + "list (Tools ▸ Blacklist…), and delete the message. No copy of the "
+                + "reply is kept; a copy of their message goes to the Finder's Trash."
             let yes = alert.addButton(withTitle: "Yes, I'm totally sure")
             let cancel = alert.addButton(withTitle: "Cancel")
             yes.keyEquivalent = ""          // Return must not fire the destructive action
