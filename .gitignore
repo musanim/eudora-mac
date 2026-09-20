@@ -12,6 +12,7 @@ Package.resolved
 
 # Local secrets — never commit
 EudoraTestPassword.txt
+Eudora-Notary_PASSWORD.txt
 
 # Vendored third-party reference source (kept locally, not tracked)
 reference/
