@@ -2943,8 +2943,14 @@ final class AppModel: ObservableObject {
         isLoadingFindPreview = false
     }
 
-    /// Choose the best displayable body (prefer text/html, else text/plain),
-    /// decode it tolerantly, and collect attachment filenames.
+    /// Choose the displayable body, decode it tolerantly, and collect
+    /// attachment filenames.
+    ///
+    /// The body is every body part in reading order — see `MessageBody` — and
+    /// not the first one. Until 2026sep21 this kept the first text part and the
+    /// first HTML part and walked past the rest, so a message of text, an
+    /// attachment, and more text showed only the first line with nothing on
+    /// screen to say there was more.
     nonisolated static func render(_ part: MIMEPart,
                        sourceNote: String,
                        locator: AttachmentLocator? = nil) -> MessagePreview {
@@ -2953,26 +2959,13 @@ final class AppModel: ObservableObject {
         let to = HeaderDecoder.decode(part.header("To") ?? "")
         let date = part.header("Date") ?? ""
 
-        var htmlPart: MIMEPart?
-        var textPart: MIMEPart?
         var attachments: [MessageAttachment] = []
         var attCounter = 0
-
-        for p in part.walk() {
-            if p.isMultipart { continue }
-            if p.isAttachment {
-                attCounter += 1
-                attachments.append(attachment(from: p, index: attCounter))
-                continue
-            }
-            if p.mainType == "text" {
-                if p.subType == "html" {
-                    if htmlPart == nil { htmlPart = p }
-                } else if textPart == nil {
-                    textPart = p
-                }
-            }
+        for p in part.walk() where !p.isMultipart && p.isAttachment {
+            attCounter += 1
+            attachments.append(attachment(from: p, index: attCounter))
         }
+        let segments = MessageBody.segments(of: part, preferring: .html)
 
         // Eudora's detached attachments: recorded in the body, bytes on disk.
         let detached = locator?.locateAll(in: part) ?? []
@@ -2996,11 +2989,15 @@ final class AppModel: ObservableObject {
             return !mimeNames.contains(name.lowercased())
         }
 
-        if let h = htmlPart {
-            let dec = CharsetDecoder.smartDecode(h.decodedPayload(), declared: h.charset)
+        // HTML whenever any piece is HTML: the plain pieces go in escaped, a
+        // `<br>` per line, in the same reading font — close to the plain view,
+        // though not identical in margins — whereas the reverse, flattening the
+        // HTML, would throw its formatting away.
+        if segments.contains(where: { $0.isHTML }) {
             // Turn every <img> into a safe box and collect the embedded-image
             // bytes the view resolves on an `eudora-image:` click (no network).
-            let rendered = BodyRenderer.rewrite(html: dec.text, in: part)
+            let rendered = BodyRenderer.rewrite(html: MessageBody.combinedHTML(segments),
+                                                in: part)
             return MessagePreview(subject: subject, from: from, to: to, date: date,
                                   isHTML: true, content: rendered.html,
                                   images: rendered.images,
@@ -3009,9 +3006,7 @@ final class AppModel: ObservableObject {
                                   recorded: recorded,
                                   indexSourceNote: sourceNote)
         }
-        let text = textPart.map {
-            CharsetDecoder.smartDecode($0.decodedPayload(), declared: $0.charset).text
-        } ?? ""
+        let text = MessageBody.combinedPlain(segments)
         return MessagePreview(subject: subject, from: from, to: to, date: date,
                               isHTML: false, content: text,
                               images: [:],
@@ -4898,30 +4893,16 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Best-effort plain text of a message for quoting (prefers text/plain,
-    /// falls back to tag-stripped HTML).
+    /// Plain text of a message for quoting: every body part in reading order,
+    /// taking the plain alternative wherever there is a choice and parsing HTML
+    /// where there isn't. See `MessageBody.combinedPlain`, which also carries
+    /// the reasoning for using `RichTextHTML.parse` rather than a tag stripper.
+    ///
+    /// Until 2026sep21 this returned the first text part and stopped, so a
+    /// reply to a message of text, an attachment, and more text quoted only the
+    /// text before the attachment.
     static func plainText(of part: MIMEPart) -> String {
-        var html: String?
-        for p in part.walk() where !p.isMultipart && !p.isAttachment && p.mainType == "text" {
-            let text = CharsetDecoder.smartDecode(p.decodedPayload(), declared: p.charset).text
-            if p.subType == "html" { if html == nil { html = text } }
-            else { return text }
-        }
-        guard let h = html else { return "" }
-        // `RichTextHTML.parse`, not a tag stripper.
-        //
-        // This used to walk the HTML dropping anything between `<` and `>`,
-        // which removes the tags and leaves everything else exactly as written —
-        // so a quoted reply came out full of `that&#39;s` and `&amp;` and
-        // `&nbsp;`. Entities are not tags; nothing here was decoding them.
-        //
-        // The parser that does it properly was already in the project and
-        // already used by Forward, which is why forwarding an HTML message read
-        // correctly and replying to the same message did not. It also gets the
-        // line structure right — `<br>` and `<p>` become real breaks instead of
-        // the single space the stripper substituted for every tag, which is what
-        // made long quotes arrive as one unbroken paragraph.
-        return RichTextHTML.parse(h).plainText
+        MessageBody.combinedPlain(MessageBody.segments(of: part, preferring: .plain))
     }
 
     /// The styled body of a draft record, or nil when it carries no styling.
@@ -5018,19 +4999,16 @@ final class AppModel: ObservableObject {
     /// — and falls back to the plain text when there is no HTML part. The
     /// tolerant `RichTextHTML.parse` is exactly the same reader that reopens a
     /// draft, so it copes with arbitrary foreign markup without throwing.
+    ///
+    /// Every body part in reading order, as `plainText(of:)` and the message
+    /// view now do; it had the same first-part-only bug, and Forwarding the
+    /// message that exposed it would have forwarded its first line.
     static func styledText(of part: MIMEPart) -> RichText {
-        var htmlText: String?
-        var plain: String?
-        for p in part.walk() where !p.isMultipart && !p.isAttachment && p.mainType == "text" {
-            let text = CharsetDecoder.smartDecode(p.decodedPayload(), declared: p.charset).text
-            if p.subType == "html" {
-                if htmlText == nil { htmlText = text }
-            } else if plain == nil {
-                plain = text
-            }
+        let segments = MessageBody.segments(of: part, preferring: .html)
+        if segments.contains(where: { $0.isHTML }) {
+            return RichTextHTML.parse(MessageBody.combinedHTML(segments))
         }
-        if let htmlText { return RichTextHTML.parse(htmlText) }
-        return RichText(plain: plain ?? "")
+        return RichText(plain: MessageBody.combinedPlain(segments))
     }
 
     private func quotedReply(_ part: MIMEPart, from: String) -> String {
