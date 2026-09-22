@@ -81,8 +81,18 @@ So: Claude commits, without asking, when a unit of work is finished *and*
 Stephen has built and tested it. **Claude does not push.** Stephen does that,
 and Claude tells him when there is something to push.
 
+**Check that delete permission is actually in force before every git
+session, not once.** It is granted per session and silently lapses when the
+connection to the Mac drops and comes back — and git does not refuse to run
+without it, it runs, succeeds, and strands `HEAD.lock`, `index.lock` and a
+scatter of `tmp_obj_*` files behind it. That happened on 2026sep22, the first
+commit after a reconnection. The cheap test is to create and remove a scratch
+file in the repo; if the `rm` says "Operation not permitted", ask for delete
+permission *first*.
+
 Recovery when a lock has been stranded, and it is safe once no git process is
-running: `rm -f .git/index.lock` (or whichever `.lock` the error names).
+running: `rm -f .git/*.lock` and `find .git/objects -name 'tmp_obj_*' -delete`,
+then `git fsck --no-dangling` to confirm nothing was harmed.
 
 Two standing cautions that did not change:
 
