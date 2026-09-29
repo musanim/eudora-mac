@@ -83,8 +83,9 @@ and Claude tells him when there is something to push.
 
 **Check that delete permission is actually in force before every git
 session, not once.** It is granted per session and silently lapses when the
-connection to the Mac drops and comes back — and git does not refuse to run
-without it, it runs, succeeds, and strands `HEAD.lock`, `index.lock` and a
+connection to the Mac drops and comes back, **and again whenever folder access
+is re-granted** (asking for a folder resets deletion for it) — and git does not
+refuse to run without it, it runs, succeeds, and strands `HEAD.lock`, `index.lock` and a
 scatter of `tmp_obj_*` files behind it. That happened on 2026sep22, the first
 commit after a reconnection. The cheap test is to create and remove a scratch
 file in the repo; if the `rm` says "Operation not permitted", ask for delete
