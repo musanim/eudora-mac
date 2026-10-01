@@ -21,15 +21,18 @@ handoffs into `handoffs/archive/`.
 
 ## The two mail trees
 
-**`~/Eudora` is the live tree. `phaseX/` is a copy, and only the copy is
-mounted.** Claude can read `phaseX` and cannot see `~/Eudora` at all.
+**`~/Eudora` is the live tree. `phaseX/` is a copy inside the project.**
+Claude can read the live tree too, but only on request: ask for folder access
+to `/Users/stephenmalinowski/Eudora` with a specific reason. It is real mail
+and read-only by discipline: never write there, and delete any working copies
+taken from it.
 
 This matters more than it sounds. `phaseX` is real mail and `grep` over it is
 the cheapest design tool in the project — it has settled the TOC date formats,
 detached-attachment detection, the 6% multipart figure, and the delivery-header
 counts behind `BlacklistRouting`. But it is a *snapshot*, taken 2026apr03. For
-any question about **live state**, ask Stephen to run one line against
-`~/Eudora` rather than inferring from the copy. Believing the copy once nearly
+any question about **live state**, read `~/Eudora` (or ask Stephen to run one
+line against it) rather than inferring from the copy. Believing the copy once nearly
 produced a confident wrong diagnosis of the bold-Trash bug: `phaseX`'s Trash
 line reads `N` where the live one reads `Y`.
 
