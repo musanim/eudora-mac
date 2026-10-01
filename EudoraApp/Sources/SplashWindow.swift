@@ -400,7 +400,7 @@ struct MainWindowAccessor: NSViewRepresentable {
         // Published for anyone who needs *this* window rather than whichever one
         // AppKit currently considers main. `NSApp.mainWindow` is nil while the
         // app is inactive and during parts of launch — which is exactly when the
-        // indexing bar appears and `ContentView` needs to force a relayout.
+        // old indexing bar needed a relayout (it has since moved to the toolbar).
         Self.resolved = window
         SplashWindow.mainWindowDidAppear(window, resolved: true)
         installCloseToQuit(window, coordinator: context.coordinator)

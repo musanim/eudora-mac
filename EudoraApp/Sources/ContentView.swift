@@ -36,35 +36,15 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             MenuBarView()
-            // **The indexing bar is a safe-area inset on the split view, not a
-            // third row of this stack. Don't move it back.**
-            //
-            // As a row, its appearing and disappearing changed the height
-            // offered to the `NavigationSplitView`, and the split view kept its
-            // old frame — overlapping upward, so the menu bar was drawn only
-            // across the sidebar's width and Transfer/Special/Tools/Window
-            // vanished behind it. Every indexing run, gone when the run ended,
-            // and cured by dragging the window.
-            //
-            // Three attempts to *recover* from that failed, and are worth
-            // recording so nobody spends the afternoon again:
-            //   1. `layoutSubtreeIfNeeded()` on the content view — too weak.
-            //   2. The same, but the window came from `NSApp.mainWindow`, which
-            //      is nil during launch and while the app is inactive, which is
-            //      exactly when indexing starts. It never ran at all.
-            //   3. A genuine one-point resize of the window, which is the only
-            //      thing a *user* can do that fixes it. Two `setFrame` calls in
-            //      one runloop turn evidently coalesce to nothing.
-            //
-            // A safe-area inset changes nothing about the height the split view
-            // is offered — the inset lives inside it — so the trigger is gone
-            // rather than compensated for. Which is what should have been done
-            // first: this is the mechanism SwiftUI provides for a bar that comes
-            // and goes above content.
+            // The indexing progress lives in the toolbar's principal slot beside
+            // "Checking mail" (see `splitView`), not in a bar across the top of
+            // the content: that bar covered In and the pinned mailboxes for the
+            // length of every run. History worth keeping: as a *row* of this
+            // stack it also broke the menu bar (the split view kept its old frame
+            // when the row came and went, and Transfer/Special/Tools/Window were
+            // drawn behind it), which is why it had become a safe-area inset.
+            // The toolbar has neither problem.
             splitView
-                .safeAreaInset(edge: .top, spacing: 0) {
-                    if model.isIndexing { IndexingBar() }
-                }
         }
         // Tells SplashWindow which window is SwiftUI's, so it doesn't have to
         // guess from NSApp.windows (which raced with window placement).
@@ -143,14 +123,21 @@ struct ContentView: View {
             // during a fetch (⌘M / File ▸ Check Mail — there's no toolbar button
             // for it), then the outcome, which `showCheckMailNotice` retires
             // after a few seconds.
+            //
+            // Indexing shares the slot. It can overlap a fetch (filing mail into
+            // a mailbox can start one), so the two sit side by side rather than
+            // one hiding the other.
             ToolbarItem(placement: .principal) {
-                if model.isChecking {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text("Checking mail").foregroundStyle(.secondary)
+                HStack(spacing: 14) {
+                    if model.isChecking {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text("Checking mail").foregroundStyle(.secondary)
+                        }
+                    } else if let notice = model.checkMailNotice {
+                        Text(notice).foregroundStyle(.secondary)
                     }
-                } else if let notice = model.checkMailNotice {
-                    Text(notice).foregroundStyle(.secondary)
+                    if model.isIndexing { IndexingStatus() }
                 }
             }
             ToolbarItemGroup {
@@ -552,9 +539,8 @@ struct MailboxTree: View, Equatable {
             // it away. In/Out/Trash and Recents therefore live in their own
             // container that never scrolls, above the outline.
             //
-            // `safeAreaInset` rather than a stack for the same reason the
-            // indexing bar uses it (see the comment in `ContentView.body`): an
-            // inset lives *inside* the view it is applied to, so the height
+            // `safeAreaInset` rather than a stack because an inset lives
+            // *inside* the view it is applied to, so the height
             // offered to the outline doesn't change out from under it. Here the
             // stack version would also have been wrong for a second reason — the
             // inset keeps the outline's scroller running the full height of the
@@ -5322,32 +5308,29 @@ struct DetachedAttachmentBar: View {
     }
 }
 
-// MARK: - Indexing progress bar
+// MARK: - Indexing progress (toolbar)
 
-/// A slim bar under the menu strip shown while the search index (re)builds in
-/// the background. Determinate once the mailbox total is known.
-struct IndexingBar: View {
+/// Search-index progress, shown in the toolbar's principal slot beside
+/// "Checking mail" while the index (re)builds in the background. Determinate
+/// once the mailbox total is known.
+struct IndexingStatus: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        HStack(spacing: 10) {
-            ProgressView().controlSize(.small)
-            Text(label).font(.caption)
+        HStack(spacing: 6) {
             if model.indexProgress.total > 0 {
                 ProgressView(value: model.indexProgress.fraction)
-                    .frame(width: 140)
+                    .frame(width: 100)
+            } else {
+                ProgressView().controlSize(.small)
             }
-            Spacer()
+            Text(label).foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(Color.accentColor.opacity(0.12))
-        .overlay(alignment: .bottom) { Divider() }
     }
 
     private var label: String {
         let p = model.indexProgress
-        return p.total > 0 ? "Indexing… \(p.done) of \(p.total) mailboxes" : "Indexing…"
+        return p.total > 0 ? "Indexing \(p.done) of \(p.total)" : "Indexing…"
     }
 }
 
