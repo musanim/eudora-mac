@@ -450,12 +450,17 @@ let selectionSettleDelay: UInt64 = 150_000_000  // 150 ms
 /// `.leftMouseDown` monitor that returns nil to consume an event is the only
 /// other thing in the app that can swallow a click over the list but not over the
 /// header.
+///
+/// Written through `eudoraDiag`, so it lands in
+/// `~/Library/Logs/Eudora-diagnostics.log`. It used plain `print()` until
+/// 2026oct05, which is invisible for an app launched by LaunchServices — so for
+/// as long as this was switched on, none of it could actually be read.
 enum RemovalVeilDiagnostics {
     static let enabled = true
 
     static func note(_ message: String) {
         guard enabled else { return }
-        print("[veil] \(message)")
+        eudoraDiag("[veil] \(message)")
     }
 
     /// Which arm of `loadListing`'s scroll-restore chain ran, and so whether
@@ -475,7 +480,7 @@ enum RemovalVeilDiagnostics {
         } else {
             outcome = "NOTHING PENDING — only the backstop can lift the veil"
         }
-        print("[veil] scroll branch: \(outcome) (veilUp=\(veilUp), rowsEmpty=\(rowsEmpty))")
+        eudoraDiag("[veil] scroll branch: \(outcome) (veilUp=\(veilUp), rowsEmpty=\(rowsEmpty))")
     }
 }
 

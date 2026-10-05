@@ -2694,7 +2694,7 @@ struct TableHeaderIconStyler: NSViewRepresentable {
         if diagnoseResize {
             let whoTarget = pins.count > 1 ? (pins[1]?.target.map { Int($0) } ?? -1) : -1
             let whoActual = table.tableColumns.count > 1 ? Int(table.tableColumns[1].width) : -1
-            print("[resize] enforce tiled=\(geometryChanged) whoTarget=\(whoTarget) "
+            eudoraDiag("[resize] enforce tiled=\(geometryChanged) whoTarget=\(whoTarget) "
                 + "whoActualColumnWidth=\(whoActual)")
         }
         if geometryChanged {
@@ -2760,7 +2760,7 @@ final class MessageColumnResizeController: NSObject {
         table.window?.acceptsMouseMovedEvents = true
         installEventMonitor()
         if Self.diagnose {
-            print("[resize] controller installed; window=\(table.window != nil), "
+            eudoraDiag("[resize] controller installed; window=\(table.window != nil), "
                 + "columns=\(table.numberOfColumns)")
         }
     }
@@ -2836,7 +2836,7 @@ final class MessageColumnResizeController: NSObject {
             if Self.diagnose {
                 let m1 = 1 < table.numberOfColumns ? header.headerRect(ofColumn: 1).maxX : -1
                 let m2 = 2 < table.numberOfColumns ? header.headerRect(ofColumn: 2).maxX : -1
-                print("[resize] DOWN overHeader=\(overHeader) x=\(Int(x)) "
+                eudoraDiag("[resize] DOWN overHeader=\(overHeader) x=\(Int(x)) "
                     + "whoMaxX=\(Int(m1)) dateMaxX=\(Int(m2)) matched=\(col.map(String.init) ?? "nil")")
             }
             guard overHeader, let col else { return event }
