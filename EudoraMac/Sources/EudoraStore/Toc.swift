@@ -33,8 +33,25 @@ public enum Toc {
     static let entrySize = 218
 
     public static func read(_ url: URL) -> [TocEntry]? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        let bytes = [UInt8](data)
+        load(url)?.entries
+    }
+
+    /// The `.toc`'s raw bytes together with the entries parsed from them.
+    ///
+    /// For anything that writes the index back. Only seven of each entry's
+    /// fields are modelled; the rest — and the whole 104-byte folder header —
+    /// survive a write only if it starts from these bytes. See
+    /// `TocWriter.patched`.
+    public static func load(_ url: URL) -> (data: Data, entries: [TocEntry])? {
+        guard let data = try? Data(contentsOf: url),
+              let entries = parse([UInt8](data)) else { return nil }
+        return (data, entries)
+    }
+
+    /// Entries from a `.toc`'s bytes, or nil if there isn't even a header.
+    /// Entry `k` is the 218 bytes at `folderSize + k * entrySize`; a partial
+    /// entry at the end is ignored.
+    static func parse(_ bytes: [UInt8]) -> [TocEntry]? {
         if bytes.count < folderSize { return nil }
 
         var entries: [TocEntry] = []

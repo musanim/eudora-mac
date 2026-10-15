@@ -4,6 +4,11 @@ import Foundation
 /// mark read/unread (TOC only), remove a message, and move a message between
 /// mailboxes. `.mbx` stays the source of truth; the `.toc` is rewritten to
 /// match. Every `.mbx` change is backed up once and written atomically.
+///
+/// Every `.toc` rewrite here goes through `TocWriter.patched`, starting from
+/// the bytes on disk, so the parts of each entry this app doesn't model —
+/// Eudora 7's own record of things, kept nowhere else — survive it. Only
+/// `appendRecord` writes a fresh entry, and only for the message it adds.
 public enum MailboxMutator {
 
     public enum MutateError: Error { case notFound, outOfRange, ioError(String) }
@@ -86,18 +91,33 @@ public enum MailboxMutator {
     /// that offset is left alone, exactly as before.
     public static func setStatus(base: URL, offset: Int, status: Int) throws {
         let tocURL = base.appendingPathExtension("toc")
-        guard var entries = Toc.read(tocURL),
-              let i = entries.firstIndex(where: { $0.offset == offset }) else { return }
-        let e = entries[i]
-        entries[i] = TocEntry(offset: e.offset, length: e.length, status: status,
-                              priority: e.priority, date: e.date, to: e.to, subject: e.subject)
+        guard let loaded = Toc.load(tocURL),
+              let i = loaded.entries.firstIndex(where: { $0.offset == offset }) else { return }
+        let patched = withStatus(status, at: i, original: loaded.data, entries: loaded.entries)
         // Atomic, unlike the index form this was split out of. A `.toc` write is
         // a whole-file rebuild — ~4.9 MB for Trash's 22,515 entries — and this
         // one now runs whenever a message is clicked rather than when a menu
         // command is chosen. At that frequency, "truncate and rewrite in place"
         // is a real window in which a crash leaves a half-written index.
-        do { try MailboxIO.atomicWrite(TocWriter.data(entries: entries), to: tocURL) }
+        do { try MailboxIO.atomicWrite(patched, to: tocURL) }
         catch { throw MutateError.ioError(error.localizedDescription) }
+    }
+
+    /// The `.toc` bytes with entry `i`'s status changed and nothing else.
+    private static func withStatus(_ status: Int, at i: Int,
+                                   original: Data, entries: [TocEntry]) -> Data {
+        var list: [(source: Int?, entry: TocEntry)] = []
+        list.reserveCapacity(entries.count)
+        for (k, e) in entries.enumerated() {
+            if k == i {
+                list.append((source: k, entry: TocEntry(
+                    offset: e.offset, length: e.length, status: status,
+                    priority: e.priority, date: e.date, to: e.to, subject: e.subject)))
+            } else {
+                list.append((source: k, entry: e))
+            }
+        }
+        return TocWriter.patched(original: original, originalEntries: entries, entries: list)
     }
 
     /// Set the cached status byte for one message by its 1-based index. TOC-only;
@@ -116,12 +136,10 @@ public enum MailboxMutator {
         // Status is a .toc-only field. Update just this message's entry (found by
         // offset) and rewrite the .toc — never parse the whole mailbox. With no
         // consistent .toc there's nothing to update.
-        guard var entries = Toc.read(tocURL), tocConsistent(entries, recs: recs),
-              let i = entries.firstIndex(where: { $0.offset == targetOffset }) else { return }
-        let e = entries[i]
-        entries[i] = TocEntry(offset: e.offset, length: e.length, status: status,
-                              priority: e.priority, date: e.date, to: e.to, subject: e.subject)
-        do { try TocWriter.data(entries: entries).write(to: tocURL) }
+        guard let loaded = Toc.load(tocURL), tocConsistent(loaded.entries, recs: recs),
+              let i = loaded.entries.firstIndex(where: { $0.offset == targetOffset }) else { return }
+        let patched = withStatus(status, at: i, original: loaded.data, entries: loaded.entries)
+        do { try patched.write(to: tocURL) }
         catch { throw MutateError.ioError(error.localizedDescription) }
     }
 
@@ -198,24 +216,32 @@ public enum MailboxMutator {
             try MailboxIO.atomicWrite(newData, to: mbx)
         } catch { throw MutateError.ioError(error.localizedDescription) }
 
-        if let entries0 = Toc.read(toc), tocConsistent(entries0, recs: recs) {
-            let rewritten = entries0.map { e -> TocEntry in
+        if let loaded = Toc.load(toc), tocConsistent(loaded.entries, recs: recs) {
+            let original = loaded.data, entries0 = loaded.entries
+            var rewritten: [(source: Int?, entry: TocEntry)] = []
+            rewritten.reserveCapacity(entries0.count)
+            for (k, e) in entries0.enumerated() {
                 if e.offset == rec.offset {
                     // The replaced message: new length and new cached columns,
-                    // same offset.
-                    return TocEntry(offset: e.offset, length: record.count,
-                                    status: status, priority: e.priority,
-                                    date: Mbox.tocDateString(date),
-                                    to: who, subject: subject)
+                    // same offset. Its unmodelled bytes are kept too — they
+                    // describe the version being replaced, but this is a draft
+                    // Eudora 8 wrote, so they are almost always zero anyway.
+                    rewritten.append((source: k, entry: TocEntry(
+                        offset: e.offset, length: record.count,
+                        status: status, priority: e.priority,
+                        date: Mbox.tocDateString(date),
+                        to: who, subject: subject)))
+                    continue
                 }
                 // Everything after it slides by the size difference. Everything
                 // before is untouched — `delta` must not be applied to it.
                 let off = e.offset > rec.offset ? e.offset + delta : e.offset
-                return TocEntry(offset: off, length: e.length, status: e.status,
-                                priority: e.priority, date: e.date,
-                                to: e.to, subject: e.subject)
+                rewritten.append((source: k, entry: TocEntry(
+                    offset: off, length: e.length, status: e.status,
+                    priority: e.priority, date: e.date,
+                    to: e.to, subject: e.subject)))
             }
-            try? TocWriter.data(entries: rewritten).write(to: toc)
+            try? TocWriter.patched(original: original, originalEntries: entries0, entries: rewritten).write(to: toc)
         } else if FileManager.default.fileExists(atPath: toc.path) {
             try? FileManager.default.removeItem(at: toc)
         }
@@ -323,7 +349,8 @@ public enum MailboxMutator {
         // preserves status even for a mailbox with deleted ghosts. Only a
         // genuinely inconsistent .toc is dropped (reader rescans). Never parses
         // the whole mailbox.
-        if let entries0 = Toc.read(toc), tocConsistent(entries0, recs: recs) {
+        if let loaded = Toc.load(toc), tocConsistent(loaded.entries, recs: recs) {
+            let original = loaded.data, entries0 = loaded.entries
             let removedOffsets = Set(spans.map { $0.start })
             // Prefix sums of the cut lengths, so each kept entry's shift is a
             // binary search rather than a rescan of every span — a mailbox can
@@ -333,9 +360,9 @@ public enum MailboxMutator {
             prefix.reserveCapacity(spans.count + 1)
             for s in spans { prefix.append(prefix[prefix.count - 1] + (s.end - s.start)) }
 
-            var kept: [TocEntry] = []
+            var kept: [(source: Int?, entry: TocEntry)] = []
             kept.reserveCapacity(max(0, entries0.count - removedOffsets.count))
-            for e in entries0 where !removedOffsets.contains(e.offset) {
+            for (k, e) in entries0.enumerated() where !removedOffsets.contains(e.offset) {
                 // How many cut spans start before this offset (they are disjoint
                 // from it — the offset survived the removedOffsets test).
                 var lo = 0, hi = starts.count
@@ -343,11 +370,12 @@ public enum MailboxMutator {
                     let mid = (lo + hi) / 2
                     if starts[mid] < e.offset { lo = mid + 1 } else { hi = mid }
                 }
-                kept.append(TocEntry(offset: e.offset - prefix[lo], length: e.length,
-                                     status: e.status, priority: e.priority,
-                                     date: e.date, to: e.to, subject: e.subject))
+                kept.append((source: k, entry: TocEntry(
+                    offset: e.offset - prefix[lo], length: e.length,
+                    status: e.status, priority: e.priority,
+                    date: e.date, to: e.to, subject: e.subject)))
             }
-            try? TocWriter.data(entries: kept).write(to: toc)
+            try? TocWriter.patched(original: original, originalEntries: entries0, entries: kept).write(to: toc)
         } else if FileManager.default.fileExists(atPath: toc.path) {
             try? FileManager.default.removeItem(at: toc)
         }

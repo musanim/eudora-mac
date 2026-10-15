@@ -115,14 +115,30 @@ public enum Outbox {
         // when appending only happened on send; now that a record is written
         // every time a message is *opened*, it would have thrown away Out's
         // cached statuses on the first ⌘N.
-        if let prior = Toc.read(toc),
-           MailboxMutator.tocConsistent(prior, recs: priorRecords) {
-            try? TocWriter.data(entries: prior + [newEntry]).write(to: toc)
+        if let loaded = Toc.load(toc),
+           MailboxMutator.tocConsistent(loaded.entries, recs: priorRecords) {
+            let original = loaded.data, prior = loaded.entries
+            // Patched, not rebuilt: the prior entries keep the bytes `TocEntry`
+            // doesn't model. See `TocWriter.patched`.
+            var list: [(source: Int?, entry: TocEntry)] = []
+            list.reserveCapacity(prior.count + 1)
+            for (k, e) in prior.enumerated() { list.append((source: k, entry: e)) }
+            list.append((source: nil, entry: newEntry))
+            try? TocWriter.patched(original: original, originalEntries: prior, entries: list).write(to: toc)
         } else if priorRecords.isEmpty {
             // A mailbox with no index yet — usually a brand-new Out. Write one
             // rather than leaving none, or every message in it would be
             // status-less forever and a draft could never be marked unsent.
-            try? TocWriter.data(entries: [newEntry]).write(to: toc)
+            //
+            // An existing index with no entries — Eudora 7 leaves one for an
+            // emptied mailbox — is patched rather than replaced, so its folder
+            // header survives.
+            if let loaded = Toc.load(toc) {
+                try? TocWriter.patched(original: loaded.data, originalEntries: loaded.entries,
+                                       entries: [(source: nil, entry: newEntry)]).write(to: toc)
+            } else {
+                try? TocWriter.data(entries: [newEntry]).write(to: toc)
+            }
         } else if fm.fileExists(atPath: toc.path) {
             try? fm.removeItem(at: toc)
         }
