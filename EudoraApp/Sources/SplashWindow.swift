@@ -290,7 +290,10 @@ struct MainWindowAccessor: NSViewRepresentable {
     /// On until the behaviour has been seen working, because "the second window
     /// stopped appearing" is also what a fix that never runs looks like, and
     /// this is what tells the two apart.
-    static let diagnoseExtraWindow = true
+    ///
+    /// Off since 2026oct10: seen working, closing a second main window on
+    /// sight after `mailto:` launches.
+    static let diagnoseExtraWindow = false
 
     /// The extra windows already dismissed, so a second `attach` for one of them
     /// doesn't close it twice.

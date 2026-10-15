@@ -4789,6 +4789,19 @@ struct PreviewView: View {
     /// second path through the web view, Forward is simply not offered — the
     /// context menu's View in Mailbox takes you to the message, where every
     /// action applies to the message you are looking at.
+    /// Send Again for the body's menu, under the same rule as Forward: only
+    /// where the body's actions act on the message shown.
+    private var sendAgainAction: (() -> Void)? {
+        guard actsOnShownMessage, let id = model.selectedMessageID else { return nil }
+        return { model.sendAgain(messageIndex: id) }
+    }
+
+    /// Whether that item is live or greyed. See `AppModel.canSendAgain`.
+    private var canSendAgainShown: Bool {
+        guard let id = model.selectedMessageID else { return false }
+        return model.canSendAgain(id)
+    }
+
     private var actsOnShownMessage: Bool {
         // Single selection only. Now that a multi-selection previews its primary,
         // this pane renders where it used to show a count — and `model.forward()`
@@ -4924,6 +4937,8 @@ struct PreviewView: View {
                                     : { _ in },
                                  onOpenLink: { url in model.openLinkFromMessage(url) },
                                  onForward: actsOnShownMessage ? { model.forward() } : nil,
+                                 onSendAgain: sendAgainAction,
+                                 sendAgainEnabled: canSendAgainShown,
                                  fontName: fontSettings.bodyFontName,
                                  fontSize: fontSettings.bodyFontSize,
                                  antialias: fontSettings.bodyAntialiasing.htmlSmoothingOn)
@@ -4943,7 +4958,10 @@ struct PreviewView: View {
                                   fontName: fontSettings.bodyFontName,
                                   fontSize: fontSettings.bodyFontSize,
                                   antialiasing: fontSettings.bodyAntialiasing,
-                                  haloWhiteness: fontSettings.eudoraHaloWhiteness)
+                                  haloWhiteness: fontSettings.eudoraHaloWhiteness,
+                                  onForward: actsOnShownMessage ? { model.forward() } : nil,
+                                  onSendAgain: sendAgainAction,
+                                  sendAgainEnabled: canSendAgainShown)
                 }
                 // After the body, where Eudora put them — but *pinned* below it
                 // rather than inline, and outside the web view. Native views keep

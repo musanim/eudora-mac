@@ -328,6 +328,16 @@ struct FindView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             List {
+                // One checkbox for the whole tree, above In. On only when every
+                // mailbox is selected; clicking it from a partial selection
+                // selects everything, as a folder's checkbox does. The same
+                // thing the All/None buttons in the tab bar do, put where the
+                // eye already is.
+                Toggle(isOn: allMailboxesBinding) {
+                    Text("All mailboxes").fontWeight(.medium)
+                }
+                .toggleStyle(.checkbox)
+
                 OutlineGroup(model.visibleTree, children: \.children) { item in
                     Toggle(isOn: scopeBinding(for: item)) {
                         HStack(spacing: 6) {
@@ -340,6 +350,18 @@ struct FindView: View {
                 }
             }
         }
+    }
+
+    /// The "All mailboxes" checkbox. Reads the same set the All/None buttons
+    /// write, so the two can't disagree.
+    private var allMailboxesBinding: Binding<Bool> {
+        Binding(
+            get: {
+                let all = model.allLeafMailboxIDs
+                return !all.isEmpty && all.isSubset(of: scope)
+            },
+            set: { on in scope = on ? model.allLeafMailboxIDs : [] }
+        )
     }
 
     /// All leaf mailbox ids under an item (the item itself if it's a leaf).

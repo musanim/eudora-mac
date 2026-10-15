@@ -434,15 +434,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Off once this is settled. It answers the one thing that can't be reasoned
     /// out from the code: whether the `GURL` event is actually deliverable during
     /// the wait in `applicationWillFinishLaunching`, and how long it takes to
-    /// arrive. Left **on** for now because the behaviour has never been observed.
-    static let diagnoseMailtoForward = true
+    /// arrive.
+    ///
+    /// Off since 2026oct10, with the question still open: over two months of
+    /// daily use the log recorded no forwarded URL at all, only two
+    /// "no launch URL after 3001 ms" lines with no compose window following —
+    /// a plain second launch, not a lost link. In ordinary use every `mailto:`
+    /// goes to the registered running copy through `application(_:open:)`, so
+    /// the duplicate path this measures doesn't come up. Switch it on before
+    /// running a second copy from Xcode if the measurement is ever wanted.
+    static let diagnoseMailtoForward = false
 
     /// Says when a reopen is asked for, and with what. On while the
     /// two-main-windows fix in `applicationShouldHandleReopen` is being confirmed:
     /// without it, "the second window stopped appearing" is only the symptom
     /// going away, and this is what shows the reopen fired and was refused.
     /// Also the thing to switch on first if a second window is ever seen again.
-    static let diagnoseReopen = true
+    ///
+    /// Off since 2026oct10: the log showed reopens being asked for and refused
+    /// with a window visible, and the census showing one main window plus the
+    /// splash.
+    static let diagnoseReopen = false
 
     /// How long a duplicate waits for a launch URL before giving up.
     ///
@@ -452,13 +464,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Dock icon for the doomed process that lingers this long. A URL that does
     /// arrive ends the wait at once.
     ///
-    /// **Deliberately long while `diagnoseMailtoForward` is on.** At half a
-    /// second, "no URL arrived" and "it arrived too late" and "the pump doesn't
-    /// dispatch Apple Events at all" are one indistinguishable outcome. Three
-    /// seconds separates them: if the diagnostic still reports nothing, the wait
-    /// is not the reason. Drop this to 0.5 once the log says how long it really
-    /// takes.
-    private static let launchURLWait: TimeInterval = 3.0
+    /// Was 3.0 while `diagnoseMailtoForward` was on, so that "no URL arrived",
+    /// "it arrived too late" and "the pump doesn't dispatch Apple Events at all"
+    /// could be told apart. The log never caught a URL arriving (see that flag),
+    /// so there is no measured figure. 1.0 is a guess with margin: the launch
+    /// `GURL` is queued before the process starts, so it should land within the
+    /// first few event fetches. If a `mailto:` to a duplicate is ever seen to
+    /// do nothing, raise this back to 3.0 and switch the diagnostic on.
+    private static let launchURLWait: TimeInterval = 1.0
 
     /// The `GURL` Apple Event, spelled out rather than imported.
     ///

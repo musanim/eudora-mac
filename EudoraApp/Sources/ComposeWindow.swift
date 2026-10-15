@@ -250,7 +250,11 @@ struct ComposeWindowPlacer: NSViewRepresentable {
     /// Logs the screen census, every window it places and which of the two rules
     /// decided, and every window it gives up on. On until the behaviour has been
     /// watched across a night-mode cycle, which is the case it exists for.
-    static let diagnoseComposePlacement = true
+    ///
+    /// Off since 2026oct10: the log showed both rules deciding correctly —
+    /// composers following the main window to the built-in display at night and
+    /// centring on the primary by day.
+    static let diagnoseComposePlacement = false
 
     /// The composers this has placed, weakly, for the cascade.
     ///

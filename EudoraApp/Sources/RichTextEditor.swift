@@ -38,9 +38,40 @@ final class BodyTextView: NSTextView {
         didSet { if haloWhiteness != oldValue, renderingMode == .eudora { needsDisplay = true } }
     }
 
+    /// Message actions for the read-only reader's right-click menu, set by
+    /// `PlainMailView`. Unused while editing. Nil means not offered.
+    var readerForward: (() -> Void)?
+    var readerSendAgain: (() -> Void)?
+    var readerSendAgainEnabled = false
+
     /// Set while `cacheDisplay` re-enters `draw` for the offscreen crisp render,
     /// so that pass draws plainly instead of recursing into the halo.
     private var isCachingCrisp = false
+
+    /// ⌘B and ⌘I toggle bold and italic, exactly as the format strip's buttons
+    /// do — through the controller, so the strip's highlight follows and an
+    /// empty selection sets the typing style.
+    ///
+    /// Here rather than in `eudoraCommands`: there is no Format menu, and a menu
+    /// item would need a focused-value route to whichever composer is in front.
+    /// The key window's view hierarchy sees a key equivalent before the main menu
+    /// does, so the text view can simply claim it. Only while it is the first
+    /// responder and editable — this class is also the read-only reader, where
+    /// the keys must fall through.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            .subtracting([.capsLock, .numericPad, .function])
+        if mods == .command, isEditable, isRichText,
+           window?.firstResponder === self,
+           let controller = delegate as? RichTextEditorController {
+            switch event.charactersIgnoringModifiers?.lowercased() {
+            case "b": controller.toggleBold(); return true
+            case "i": controller.toggleItalic(); return true
+            default: break
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         if isCachingCrisp {
@@ -474,8 +505,13 @@ final class BodyTextView: NSTextView {
         }
         // This class is also the read-only plain-text *reader* (`PlainMailView`),
         // where both of these items are wrong: nothing there should be rewritten,
-        // and the quick-add has no controller to save through anyway.
-        guard isEditable, let target = correctionTarget(for: event) else { return }
+        // and the quick-add has no controller to save through anyway. The reader
+        // gets the message actions instead, matching the HTML reader's menu.
+        if !isEditable {
+            addReaderItems(to: menu)
+            return
+        }
+        guard let target = correctionTarget(for: event) else { return }
 
         var added: [NSMenuItem] = []
         // The case guesses read as ordinary suggestions, so they go first — and
@@ -509,6 +545,39 @@ final class BodyTextView: NSTextView {
             menu.insertItem(item, at: i)
         }
     }
+
+    /// Forward and Send Again at the top of the reader's menu — the same items,
+    /// in the same order, as `TrimmedMenuWebView`. Tagged, so they come off
+    /// again on close like the editor's additions. Send Again is greyed by a nil
+    /// action when the message was to Stephen.
+    private func addReaderItems(to menu: NSMenu) {
+        var ours: [NSMenuItem] = []
+        if readerForward != nil {
+            let forward = NSMenuItem(title: "Forward",
+                                     action: #selector(readerForwardMessage), keyEquivalent: "")
+            forward.target = self
+            ours.append(forward)
+        }
+        if readerSendAgain != nil {
+            let again = NSMenuItem(title: "Send Again",
+                                   action: readerSendAgainEnabled
+                                       ? #selector(readerSendAgainMessage) : nil,
+                                   keyEquivalent: "")
+            again.target = self
+            // Also set directly, for a menu that doesn't auto-enable.
+            again.isEnabled = readerSendAgainEnabled
+            ours.append(again)
+        }
+        guard !ours.isEmpty else { return }
+        ours.append(.separator())
+        for (i, item) in ours.enumerated() {
+            item.tag = Self.addedItemTag
+            menu.insertItem(item, at: i)
+        }
+    }
+
+    @objc private func readerForwardMessage() { readerForward?() }
+    @objc private func readerSendAgainMessage() { readerSendAgain?() }
 
     /// Take our items back out when the menu closes.
     ///

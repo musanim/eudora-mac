@@ -32,6 +32,12 @@ struct HTMLMailView: NSViewRepresentable {
     /// preview pane passes nil, because Forward there would act on the main
     /// window's selection rather than the result being read.
     var onForward: (() -> Void)?
+    /// Send Again for the message being shown. Nil: not offered (the Find
+    /// window, for the same reason as `onForward`). `sendAgainEnabled` false:
+    /// offered but greyed — the message was to Stephen. See
+    /// `AppModel.canSendAgain`.
+    var onSendAgain: (() -> Void)?
+    var sendAgainEnabled = false
 
     /// The default reading font — the same one the composer uses. Sets the
     /// document's base font, which the message's own styling overrides where it
@@ -50,6 +56,8 @@ struct HTMLMailView: NSViewRepresentable {
         let view = TrimmedMenuWebView(frame: .zero, configuration: config)
         view.navigationDelegate = context.coordinator
         view.onForward = onForward
+        view.onSendAgain = onSendAgain
+        view.sendAgainEnabled = sendAgainEnabled
         return view
     }
 
@@ -57,7 +65,11 @@ struct HTMLMailView: NSViewRepresentable {
         context.coordinator.images = images
         context.coordinator.onCopyLink = onCopyLink
         context.coordinator.onOpenLink = onOpenLink
-        (view as? TrimmedMenuWebView)?.onForward = onForward
+        if let trimmed = view as? TrimmedMenuWebView {
+            trimmed.onForward = onForward
+            trimmed.onSendAgain = onSendAgain
+            trimmed.sendAgainEnabled = sendAgainEnabled
+        }
         // Reload when the document *or* the reading font changes — the font is
         // baked into the wrapper's CSS, so a settings change while a message is
         // open has to re-wrap. The key folds both in.
@@ -228,6 +240,11 @@ struct PlainMailView: NSViewRepresentable {
     let fontSize: Double
     let antialiasing: BodyAntialiasing
     let haloWhiteness: Double
+    /// The same two body-menu actions `HTMLMailView` offers, with the same
+    /// meaning for nil and for `sendAgainEnabled`.
+    var onForward: (() -> Void)? = nil
+    var onSendAgain: (() -> Void)? = nil
+    var sendAgainEnabled = false
 
     func makeNSView(context: Context) -> NSScrollView {
         FontDiagnostics.logResolution(of: fontName, size: fontSize, context: "plain-text reader")
@@ -261,6 +278,9 @@ struct PlainMailView: NSViewRepresentable {
     }
 
     private func apply(to textView: BodyTextView) {
+        textView.readerForward = onForward
+        textView.readerSendAgain = onSendAgain
+        textView.readerSendAgainEnabled = sendAgainEnabled
         textView.renderingMode = antialiasing
         textView.haloWhiteness = haloWhiteness
         if textView.string != text { textView.string = text }
@@ -278,6 +298,8 @@ struct PlainMailView: NSViewRepresentable {
 /// because it yields the *true* href.
 private final class TrimmedMenuWebView: WKWebView {
     var onForward: (() -> Void)?
+    var onSendAgain: (() -> Void)?
+    var sendAgainEnabled = false
 
     private static let blocked: Set<String> = [
         "WKMenuItemIdentifierOpenLink",
@@ -316,16 +338,33 @@ private final class TrimmedMenuWebView: WKWebView {
         // window's selected message rather than the search result on screen —
         // and a menu item that silently forwards the wrong message is worse than
         // one that isn't there.
+        // Send Again under Forward, greyed rather than hidden when the message
+        // was to Stephen — his request. Greyed by leaving the action nil: the
+        // menu auto-enables, and an item with no action is disabled.
+        var ours: [NSMenuItem] = []
         if onForward != nil {
             let forward = NSMenuItem(title: "Forward",
                                      action: #selector(forwardMessage), keyEquivalent: "")
             forward.target = self
+            ours.append(forward)
+        }
+        if onSendAgain != nil {
+            let again = NSMenuItem(title: "Send Again",
+                                   action: sendAgainEnabled ? #selector(sendAgainMessage) : nil,
+                                   keyEquivalent: "")
+            again.target = self
+            // Also set directly, for a menu that doesn't auto-enable.
+            again.isEnabled = sendAgainEnabled
+            ours.append(again)
+        }
+        if !ours.isEmpty {
             if !menu.items.isEmpty { menu.insertItem(.separator(), at: 0) }
-            menu.insertItem(forward, at: 0)
+            for item in ours.reversed() { menu.insertItem(item, at: 0) }
         }
 
         super.willOpenMenu(menu, with: event)
     }
 
     @objc private func forwardMessage() { onForward?() }
+    @objc private func sendAgainMessage() { onSendAgain?() }
 }

@@ -3808,6 +3808,28 @@ final class AppModel: ObservableObject {
 
     /// Whether a listed message (by row id) was successfully sent — the gate the
     /// context menu uses to offer "Send Again".
+    /// Whether Send Again applies: a message of Stephen's that went to someone
+    /// else. Greyed (body menu) or hidden (list menu) otherwise.
+    ///
+    /// Direction first, from the identity set: `.fromMe` is exactly "not to
+    /// me", and it covers sent mail Eudora 7 filed into PEOPLE mailboxes, whose
+    /// status byte needn't be 8. `.selfToSelf` and `.toMe` are to him, so no.
+    /// The status fallback is for `.neither`, which is also every row's
+    /// direction until enrichment lands — and a sent message from an old address
+    /// the identity set has never learned.
+    ///
+    /// Never a draft: those reopen for editing instead.
+    func canSendAgain(_ id: MessageRow.ID) -> Bool {
+        guard let pos = rowPositionByID[id], pos < rows.count else { return false }
+        let row = rows[pos]
+        if row.isDraft { return false }
+        switch row.direction {
+        case .fromMe:            return true
+        case .toMe, .selfToSelf: return false
+        case .neither:           return row.isSent
+        }
+    }
+
     func isSentMessage(_ id: MessageRow.ID) -> Bool {
         guard let pos = rowPositionByID[id], pos < rows.count else { return false }
         return rows[pos].isSent

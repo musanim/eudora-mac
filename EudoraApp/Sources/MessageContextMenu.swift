@@ -532,7 +532,7 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         // fresh editable copy (see `AppModel.sendAgain`). Shown only when it
         // applies rather than greyed out, since it's meaningless on received or
         // draft mail.
-        if n == 1, let id = clickedPrimary, model.isSentMessage(id) {
+        if n == 1, let id = clickedPrimary, model.canSendAgain(id) {
             add("Send Again", #selector(sendAgain))
         }
         // "View Response" only on a message showing R, and shown rather than
