@@ -3438,14 +3438,63 @@ final class AppModel: ObservableObject {
         // in `beginCompose` — but the default is `""`, so a future one built
         // another way would otherwise silently get the unchecked behaviour this
         // method exists to prevent.
-        guard let store, !draft.messageID.isEmpty else { return nil }
-
-        if let offset = draft.outOffset,
-           let index = store.indexOfRecord(at: outbox, offset: offset),
-           MailboxMutator.messageID(base: outbox, index: index) == draft.messageID {
-            return index
+        guard let store, !draft.messageID.isEmpty else {
+            if Self.diagnoseDraftLookup {
+                eudoraDiag("[draft] lookup refused: store=\(store != nil) "
+                           + "messageID=\u{201C}\(draft.messageID)\u{201D}")
+            }
+            return nil
         }
-        return findDraft(draft, in: outbox)
+
+        var atOffset: Int? = nil
+        var idThere: String? = nil
+        if let offset = draft.outOffset,
+           let index = store.indexOfRecord(at: outbox, offset: offset) {
+            atOffset = index
+            idThere = MailboxMutator.messageID(base: outbox, index: index)
+            if idThere == draft.messageID { return index }
+        }
+        let found = findDraft(draft, in: outbox)
+        if Self.diagnoseDraftLookup {
+            diagnoseFailedLookup(draft, in: outbox, atOffset: atOffset,
+                                 idThere: idThere, found: found)
+        }
+        return found
+    }
+
+    /// Logs every draft lookup whose cheap check failed — the path that ends,
+    /// when the scan fails too, in a duplicate: a save appends a second copy, or
+    /// a send records the sent message beside its draft instead of over it.
+    ///
+    /// On since 2026oct16, when a reply sent at 12:12:54 left its draft (last
+    /// saved 12:12:19, one window, nothing done to Out in between that anyone
+    /// remembers) unsent beside the sent copy. The code reading found no way for
+    /// both checks to miss, so this records what they actually saw: the draft's
+    /// own offset and Message-ID, what sat at that offset, and every record in
+    /// Out with its Message-ID. Rare by construction — the cheap check passes on
+    /// every ordinary save — so it can stay on until the next one is caught.
+    static let diagnoseDraftLookup = true
+
+    private func diagnoseFailedLookup(_ draft: ComposeDraft, in outbox: URL,
+                                      atOffset: Int?, idThere: String?, found: Int?) {
+        eudoraDiag("[draft] cheap lookup failed for draft \(draft.id) "
+                   + "id=\(draft.messageID) offset=\(draft.outOffset.map(String.init) ?? "nil") "
+                   + "→ index at offset=\(atOffset.map(String.init) ?? "none") "
+                   + "id there=\(idThere ?? "none"); "
+                   + "scan found=\(found.map(String.init) ?? "NOTHING — will append")")
+        eudoraDiag("[draft]  open drafts: " + openDrafts.values.map {
+            "\($0.id) id=\($0.messageID) off=\($0.outOffset.map(String.init) ?? "nil")"
+        }.joined(separator: " | "))
+        guard let data = try? Data(contentsOf: outbox.appendingPathExtension("mbx")) else {
+            eudoraDiag("[draft]  Out.mbx unreadable")
+            return
+        }
+        let bytes = [UInt8](data)
+        for (i, rec) in Mbox.findRecords(bytes).enumerated() {
+            let id = MIMEParser.parse(Mbox.messageBytes(bytes, rec))
+                .header("Message-ID")?.trimmingCharacters(in: .whitespaces) ?? "none"
+            eudoraDiag("[draft]  Out #\(i + 1) off=\(rec.offset) len=\(rec.length) id=\(id)")
+        }
     }
 
     /// Find a draft's record by Message-ID when its offset has gone stale.
@@ -3461,11 +3510,21 @@ final class AppModel: ObservableObject {
     /// A linear scan, which is only defensible because it runs on a save that
     /// has already failed its cheap lookup, and because Out is small. Never let
     /// this become the primary path.
+    ///
+    /// Every record in the `.mbx`, not the listing's rows. The listing omits a
+    /// record the `.toc` doesn't name — a deleted-but-not-compacted ghost, or a
+    /// record written while the index was being dropped — so a draft sitting in
+    /// one of those was invisible here and its next save duplicated it. One
+    /// read of the file, too, where the old loop re-read it per row.
     private func findDraft(_ draft: ComposeDraft, in outbox: URL) -> Int? {
-        guard let store, let listing = store.list(at: outbox) else { return nil }
-        for row in listing.rows
-        where MailboxMutator.messageID(base: outbox, index: row.index) == draft.messageID {
-            return row.index
+        guard let data = try? Data(contentsOf: outbox.appendingPathExtension("mbx")) else {
+            return nil
+        }
+        let bytes = [UInt8](data)
+        for (i, rec) in Mbox.findRecords(bytes).enumerated() {
+            let id = MIMEParser.parse(Mbox.messageBytes(bytes, rec))
+                .header("Message-ID")?.trimmingCharacters(in: .whitespaces)
+            if id == draft.messageID { return i + 1 }
         }
         return nil
     }
