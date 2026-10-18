@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import EudoraStore
 
 /// A Windows-Eudora-style menu bar rendered *inside* the window, so the menus
 /// are next to the content instead of at the top of a large display.
@@ -126,11 +127,13 @@ struct MenuBarView: View {
             // `eudoraCommands` groups its own Message items. The grouping has no
             // effect on how the menu looks.
             Group {
-                Button("Reply") { model.reply(all: false) }
+                Button("Reply") { model.reply(.sender) }
                     .keyboardShortcut("r", modifiers: .command)
                     .disabled(!model.canActOnMessage)
-                Button("Reply to All") { model.reply(all: true) }
+                Button("Reply to All") { model.reply(.all) }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
+                    .disabled(!model.canActOnMessage)
+                Button("Reply to All as To") { model.reply(.allAsTo) }
                     .disabled(!model.canActOnMessage)
                 // No ⌘L hint — the real command in `EudoraApp` has no shortcut.
                 Button("Forward") { model.forward() }

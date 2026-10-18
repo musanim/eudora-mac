@@ -286,7 +286,7 @@ struct ComposeDraft: Identifiable {
     /// look, where a *false* R is a message that looks answered and gets
     /// skipped. Nothing here may guess.
     ///
-    /// Set only by `reply(all:)`. A forward leaves it nil — see
+    /// Set only by `reply(_:)`. A forward leaves it nil — see
     /// `MailboxMutator.statusReplied` for why forwards record nothing.
     struct ReplyOrigin: Equatable {
         /// The mailbox's tree id rather than its URL, so a rename between Reply
@@ -4146,8 +4146,11 @@ final class AppModel: ObservableObject {
         return result
     }
 
-    /// Build a reply (or reply-all) from the selected message.
-    func reply(all: Bool) {
+    /// Build a reply from the selected message: to the sender, or to everyone
+    /// with the others in Cc, or to everyone in To. Who that is — leaving you
+    /// out, without duplicates, answering your own sent mail sensibly — is
+    /// decided by `ReplyRecipients`, where it is tested.
+    func reply(_ mode: ReplyRecipients.Mode) {
         guard let selected = selectedMessage() else { return }
         let part = selected.part
         let origFrom = part.header("From") ?? ""
@@ -4166,8 +4169,12 @@ final class AppModel: ObservableObject {
         // is nothing in that name to protect — while `"Andrews, Cody" <a@b.com>`
         // keeps them, because they are all that stops the comma being read as a
         // separator.
-        var cc: [String] = []
-        if all { cc = [Self.recipientFieldText(origTo), Self.recipientFieldText(origCc)] }
+        //
+        // The entries come back raw and are joined back into one header for
+        // `recipientFieldText` — which splits before it decodes, so an encoded
+        // name's hidden comma survives the round trip.
+        let recipients = ReplyRecipients.compute(from: origFrom, to: origTo, cc: origCc,
+                                                 me: me, mode: mode)
 
         // Remembered now, acted on at send: the original is marked replied-to
         // only when a reply actually goes out, so abandoning this window leaves
@@ -4181,8 +4188,8 @@ final class AppModel: ObservableObject {
         }
 
         beginCompose(ComposeDraft(
-            to: Self.recipientFieldText(origFrom),
-            cc: cc.filter { !$0.isEmpty }.joined(separator: ", "),
+            to: Self.recipientFieldText(recipients.to.joined(separator: ", ")),
+            cc: Self.recipientFieldText(recipients.cc.joined(separator: ", ")),
             subject: subject.lowercased().hasPrefix("re:") ? subject : "Re: \(subject)",
             body: quotedReply(part, from: origFrom),
             inReplyTo: msgID,

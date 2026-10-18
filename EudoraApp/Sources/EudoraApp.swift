@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import EudoraStore
 
 /// A diagnostic line, to `~/Library/Logs/Eudora-diagnostics.log` as well as stdout.
 ///
@@ -273,10 +274,11 @@ struct EudoraApp: App {
             // divider looks no different — so adding an item here means grouping
             // something, not appending.
             Group {
-                Button("Reply") { model.reply(all: false) }
+                Button("Reply") { model.reply(.sender) }
                     .keyboardShortcut("r", modifiers: .command)
-                Button("Reply to All") { model.reply(all: true) }
+                Button("Reply to All") { model.reply(.all) }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
+                Button("Reply to All as To") { model.reply(.allAsTo) }
                 // No shortcut. Eudora's ⌘L was unmemorable; Forward is reached
                 // from this menu or the message's right-click menu.
                 Button("Forward") { model.forward() }

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import EudoraStore
 
 /// The message list's right-click menu, built in AppKit rather than SwiftUI.
 ///
@@ -523,6 +524,8 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         // silently acting on just one of it. `autoenablesItems` is false, so
         // what is set here is what shows.
         add("Reply", #selector(reply), enabled: n == 1)
+        add("Reply to All", #selector(replyAll), enabled: n == 1)
+        add("Reply to All as To", #selector(replyAllAsTo), enabled: n == 1)
         add("Forward", #selector(forward), enabled: n == 1)
         // Any number, unlike Reply and Forward above: each selected message
         // becomes its own attachment on one new mail.
@@ -652,7 +655,9 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         body()
     }
 
-    @objc private func reply() { actOnClickedRows { model.reply(all: false) } }
+    @objc private func reply() { actOnClickedRows { model.reply(.sender) } }
+    @objc private func replyAll() { actOnClickedRows { model.reply(.all) } }
+    @objc private func replyAllAsTo() { actOnClickedRows { model.reply(.allAsTo) } }
     @objc private func forward() { actOnClickedRows { model.forward() } }
     @objc private func forwardAsAttachment() {
         actOnClickedRows { model.forwardAsAttachment() }
