@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import EudoraStore
 
 /// A recipient field (To / Cc / Bcc) with recently-used auto-fill.
 ///
@@ -34,16 +35,19 @@ struct RecipientField<F: Hashable>: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSTextField {
-        let field = NSTextField()
+        let field = RecipientTextField()
         field.delegate = context.coordinator
         field.isBordered = true
         field.isBezeled = true
         field.bezelStyle = .roundedBezel
         field.drawsBackground = true
-        field.usesSingleLineMode = true
-        field.cell?.wraps = false
-        field.cell?.isScrollable = true
-        field.lineBreakMode = .byClipping
+        // Wraps rather than scrolls sideways, so a long list is all visible —
+        // and only between recipients; see `RecipientTextField`.
+        field.usesSingleLineMode = false
+        field.cell?.wraps = true
+        field.cell?.isScrollable = false
+        field.cell?.truncatesLastVisibleLine = false
+        field.lineBreakMode = .byWordWrapping
         field.stringValue = text
         context.coordinator.field = field
         return field
@@ -73,6 +77,17 @@ struct RecipientField<F: Hashable>: NSViewRepresentable {
                 field.window?.makeFirstResponder(field)
             }
         }
+    }
+
+    /// As tall as the wrapped recipients need at the offered width, and never
+    /// shorter than one line. Nil for a size query with no usable width, which
+    /// hands SwiftUI the field's intrinsic size: no preferred width, one-line
+    /// height — so the field never asks for the width of its whole text.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSTextField,
+                      context: Context) -> CGSize? {
+        guard let field = nsView as? RecipientTextField,
+              let width = proposal.width, width > 0, width.isFinite else { return nil }
+        return CGSize(width: width, height: field.fittingHeight(forWidth: width))
     }
 
     static func dismantleNSView(_ field: NSTextField, coordinator: Coordinator) {
@@ -119,6 +134,8 @@ struct RecipientField<F: Hashable>: NSViewRepresentable {
         func controlTextDidChange(_ notification: Notification) {
             guard let field else { return }
             text.wrappedValue = field.stringValue
+            // The height may have changed with a new or removed line.
+            field.invalidateIntrinsicContentSize()
             navigated = false            // typing = back to text mode
             refresh()
         }
@@ -224,6 +241,165 @@ struct RecipientField<F: Hashable>: NSViewRepresentable {
             let token = ns.substring(with: NSRange(location: start, length: caret - start))
             return (token.trimmingCharacters(in: .whitespaces), start)
         }
+    }
+}
+
+// MARK: - wrapping between recipients
+
+/// The `NSTextField` behind a recipient field: it wraps, but only at the start
+/// of a recipient, so no address is ever split across lines.
+///
+/// Two drawing paths need steering, because a text field draws its text one way
+/// at rest and another while being edited:
+///
+/// - **At rest** the cell draws with ordinary string drawing, which can only be
+///   steered through its characters. `RecipientFieldCell.drawInterior` hands
+///   that drawing `RecipientLineBreaks.displayString` instead — no-break spaces
+///   inside each recipient — through a separate plain cell, so the field's real
+///   value is never touched.
+/// - **While editing** the text is in a field editor, a real `NSTextView`, whose
+///   layout manager asks a delegate before breaking. The window's shared field
+///   editor serves every field in the window, so steering it would steer the
+///   Subject too; each recipient field supplies its own instead
+///   (`RecipientFieldCell.fieldEditor(for:)`).
+///
+/// The storage lives here, on the view, rather than on the cell: `NSCell`
+/// copies itself with a bitwise copy that doesn't retain Swift references, so a
+/// cell that owned objects would be one copy away from a double release.
+final class RecipientTextField: NSTextField {
+    override class var cellClass: AnyClass? {
+        get { RecipientFieldCell.self }
+        set {}
+    }
+
+    private let breaker = RecipientLineBreaker()
+
+    /// This field's own field editor. TextKit 1 explicitly, because the
+    /// break-steering delegate is an `NSLayoutManager` one; a default
+    /// `NSTextView()` is TextKit 2 on macOS 12 and later.
+    lazy var recipientEditor: NSTextView = {
+        let editor = NSTextView(usingTextLayoutManager: false)
+        editor.isFieldEditor = true
+        editor.isRichText = false
+        editor.allowsUndo = true
+        editor.layoutManager?.delegate = breaker
+        return editor
+    }()
+
+    /// The plain cell the at-rest text is drawn and measured through.
+    private let drawingCell = NSTextFieldCell(textCell: "")
+
+    /// `drawingCell` set up to draw `text` exactly as this field's cell would —
+    /// same bezel (which decides the text inset), font and colour — but with
+    /// breaks only between recipients.
+    func displayCell(showing text: String) -> NSTextFieldCell {
+        let d = drawingCell
+        if let cell = cell as? NSTextFieldCell {
+            d.isBezeled = cell.isBezeled
+            d.bezelStyle = cell.bezelStyle
+            d.isBordered = cell.isBordered
+            d.font = cell.font
+            d.textColor = cell.textColor
+            d.alignment = cell.alignment
+            d.controlSize = cell.controlSize
+            d.isEnabled = cell.isEnabled
+        }
+        d.wraps = true
+        d.isScrollable = false
+        d.truncatesLastVisibleLine = false
+        d.lineBreakMode = .byWordWrapping
+        d.stringValue = RecipientLineBreaks.displayString(text)
+        return d
+    }
+
+    /// The height the wrapped text needs at `width`; one line at least.
+    ///
+    /// While editing, at the width the field already has, the answer comes from
+    /// the field editor's own layout — the text the user is looking at — rather
+    /// than from the at-rest drawing, so a line the editor wraps onto is never
+    /// one the frame leaves out.
+    func fittingHeight(forWidth width: CGFloat) -> CGFloat {
+        if let editing = editorHeight(forWidth: width) {
+            return max(Self.minimumHeight, ceil(editing))
+        }
+        let bounds = NSRect(x: 0, y: 0, width: width, height: CGFloat.greatestFiniteMagnitude)
+        let needed = displayCell(showing: stringValue).cellSize(forBounds: bounds).height
+        return max(Self.minimumHeight, ceil(needed))
+    }
+
+    /// The field editor's laid-out height plus the bezel's vertical inset, or
+    /// nil when not editing or when `width` isn't the current width (the
+    /// editor is laid out for the frame it has, not the one being proposed).
+    private func editorHeight(forWidth width: CGFloat) -> CGFloat? {
+        guard let editor = currentEditor() as? NSTextView,
+              abs(width - bounds.width) < 0.5,
+              let layout = editor.layoutManager, let container = editor.textContainer,
+              let cell
+        else { return nil }
+        layout.ensureLayout(for: container)
+        let text = layout.usedRect(for: container).height + editor.textContainerInset.height * 2
+        let inset = bounds.height - cell.titleRect(forBounds: bounds).height
+        return text + max(0, inset)
+    }
+
+    /// The one-line height the field had when it was fixed.
+    static let minimumHeight: CGFloat = 22
+
+    /// No preferred width — the field takes what it is given — and the height
+    /// that width needs. Without this a wrapping field reports its whole text's
+    /// width as intrinsic, and would try to widen the window to fit it.
+    override var intrinsicContentSize: NSSize {
+        let width = bounds.width > 0 ? bounds.width : 200
+        return NSSize(width: NSView.noIntrinsicMetric, height: fittingHeight(forWidth: width))
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let widthChanged = newSize.width != frame.width
+        super.setFrameSize(newSize)
+        if widthChanged { invalidateIntrinsicContentSize() }
+    }
+}
+
+/// The cell for `RecipientTextField`. Deliberately holds no state of its own —
+/// see the note on the field.
+final class RecipientFieldCell: NSTextFieldCell {
+    override func fieldEditor(for controlView: NSView) -> NSTextView? {
+        (controlView as? RecipientTextField)?.recipientEditor
+            ?? super.fieldEditor(for: controlView)
+    }
+
+    /// At rest, draw through the field's display cell. While editing the field
+    /// editor shows the text, and the cell's own drawing is left to AppKit.
+    override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {
+        guard let field = controlView as? RecipientTextField, field.currentEditor() == nil else {
+            super.drawInterior(withFrame: cellFrame, in: controlView)
+            return
+        }
+        field.displayCell(showing: stringValue).drawInterior(withFrame: cellFrame, in: controlView)
+    }
+}
+
+/// The field editor's layout-manager delegate: a line may break only where a
+/// recipient begins.
+///
+/// If one recipient is wider than the field, there is no allowed break inside
+/// it and TextKit falls back to breaking it by character — the one case where
+/// an address does get split, because the alternative is text running out of
+/// the field.
+final class RecipientLineBreaker: NSObject, NSLayoutManagerDelegate {
+    /// The layout manager asks once per candidate break, so the starts are
+    /// worked out once per change of text, not once per question.
+    private var text = ""
+    private var starts = Set<Int>()
+
+    func layoutManager(_ layoutManager: NSLayoutManager,
+                       shouldBreakLineByWordBeforeCharacterAt charIndex: Int) -> Bool {
+        let current = layoutManager.textStorage?.string ?? ""
+        if current != text {
+            text = current
+            starts = RecipientLineBreaks.entryStarts(in: current)
+        }
+        return starts.contains(charIndex)
     }
 }
 

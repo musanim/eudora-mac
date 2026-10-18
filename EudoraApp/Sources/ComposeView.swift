@@ -335,7 +335,8 @@ struct ComposeView: View {
                            id: id,
                            completions: { model.recipientCompletions(prefix: $0) },
                            remove: { model.removeRecentRecipient($0) })
-                .frame(height: 22)
+                // No fixed height: the field grows a line at a time as its
+                // recipients wrap (`RecipientField.sizeThatFits`).
                 .focused($focus, equals: id)
                 // A red ring on the field the server refused; cleared the moment
                 // the user edits it, so it never lingers past a fix.
