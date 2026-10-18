@@ -118,6 +118,50 @@ final class RichTextAttributedTests: XCTestCase {
         }
     }
 
+    // MARK: - alignment
+
+    func testCentredRunCarriesACentredParagraphStyleAndLeftCarriesNone() {
+        let rich = RichText(runs: [
+            RichTextRun("Hi\n", style: RichTextStyle(alignment: .center)),
+            RichTextRun("there"),
+        ])
+        let attr = RichTextAttributed.attributed(rich, defaults: defaults)
+        let first = attr.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(first?.alignment, .center)
+        XCTAssertNil(attr.attribute(.paragraphStyle, at: attr.length - 1, effectiveRange: nil))
+    }
+
+    func testAlignmentRoundTripsThroughAttributed() {
+        for alignment in RichTextAlignment.allCases {
+            let rich = RichText(runs: [
+                RichTextRun("para\n", style: RichTextStyle(bold: true, alignment: alignment)),
+                RichTextRun("next"),
+            ])
+            let back = RichTextAttributed.richText(
+                RichTextAttributed.attributed(rich, defaults: defaults), defaults: defaults)
+            XCTAssertEqual(back, rich, "\(alignment) lost in the round trip")
+        }
+    }
+
+    func testCentredImageRoundTripsThroughAttributed() {
+        let image = RichTextImage(mimeType: "image/png", data: Data([1, 2, 3]))
+        let rich = RichText(runs: [RichTextRun(image: image, alignment: .center)])
+        let back = RichTextAttributed.richText(
+            RichTextAttributed.attributed(rich, defaults: defaults), defaults: defaults)
+        XCTAssertEqual(back, rich)
+        XCTAssertEqual(back.runs.first?.style.alignment, .center)
+    }
+
+    /// What an `NSTextView` uses until told otherwise must not make a message
+    /// styled.
+    func testNaturalAlignmentReadsAsLeft() {
+        let natural = NSMutableParagraphStyle()
+        natural.alignment = .natural
+        let font = NSFont(name: "Arial", size: 12)!
+        let attr = NSAttributedString(string: "x", attributes: [.font: font, .paragraphStyle: natural])
+        XCTAssertFalse(RichTextAttributed.richText(attr, defaults: defaults).isStyled)
+    }
+
     func testEmptyRichTextIsAnEmptyString() {
         XCTAssertEqual(RichTextAttributed.attributed(RichText(plain: ""), defaults: defaults).length, 0)
         XCTAssertFalse(RichTextAttributed.richText(NSAttributedString(string: ""), defaults: defaults).isStyled)

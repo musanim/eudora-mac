@@ -5081,7 +5081,8 @@ final class AppModel: ObservableObject {
     /// our own drafts, and not on there being any styling: forwarding carries a
     /// received message's formatting across whatever its source. It prefers the
     /// HTML alternative (or a flattened `<x-html>` leaf) and parses it back to
-    /// runs — recovering font, size, colour, bold and italic, dropping the rest
+    /// runs — recovering font, size, colour, bold, italic and paragraph
+    /// alignment, dropping the rest
     /// — and falls back to the plain text when there is no HTML part. The
     /// tolerant `RichTextHTML.parse` is exactly the same reader that reopens a
     /// draft, so it copes with arbitrary foreign markup without throwing.

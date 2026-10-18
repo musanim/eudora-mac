@@ -7,7 +7,8 @@ import Foundation
 /// fixed, and round-trips exactly. What it *reads* is, in the general case,
 /// arbitrary mail HTML — reopening a draft that real Eudora 7 (or anything else)
 /// wrote into Out. That half is deliberately tolerant and deliberately lossy: it
-/// recovers font, size, colour, bold and italic and throws the rest away,
+/// recovers font, size, colour, bold, italic and paragraph alignment and
+/// throws the rest away,
 /// because that is the whole of what the composer can express.
 ///
 /// This is **not** a display path. Received mail is rendered by `BodyRenderer`
@@ -16,8 +17,8 @@ import Foundation
 ///
 /// ### The dialect: legacy presentational HTML, because Eudora
 ///
-/// Generation emits `<b>`/`<i>`, `<font face size color>` and `<br>` — HTML 3.2
-/// presentational markup — **not** CSS. Eudora 7's built-in renderer ignores
+/// Generation emits `<b>`/`<i>`, `<font face size color>`, `<br>` and
+/// `<div align>` — HTML 3.2 presentational markup — **not** CSS. Eudora 7's built-in renderer ignores
 /// `<span style>` and `white-space` entirely and drops to the plain alternative
 /// when that is all a message's styling is; a first attempt using CSS arrived at
 /// Eudora unstyled for exactly that reason. This dialect is what Eudora itself
@@ -50,16 +51,59 @@ public enum RichTextHTML {
     /// in a `multipart/related` alongside this HTML. No `width`/`height` is
     /// written: the bytes carry the size the user pasted, and pinning it here
     /// would fight every reader's own scaling.
+    ///
+    /// ### Alignment
+    ///
+    /// Consecutive paragraphs sharing an alignment other than left go inside one
+    /// `<div align="…">`, with each paragraph's own `\n` — its `<br>` — *inside*
+    /// the div. That is exactly what Eudora 7 writes (found in Eudora-authored
+    /// mail in `phaseX`: `<div align="center">…<br></div>`), and it is what
+    /// renders right: a trailing `<br>` at the end of a block draws no extra
+    /// line, where one placed after the `</div>` would draw a blank one. The
+    /// parser reads it back exactly, because a block tag only breaks the line
+    /// when it isn't already broken.
+    ///
+    /// A body that is all left-aligned takes the old path untouched, so every
+    /// message that doesn't use alignment generates the same bytes as before.
     public static func html(from rich: RichText) -> String {
+        guard rich.runs.contains(where: { $0.style.alignment != .left }) else {
+            return prologue + inline(rich.runs) + epilogue
+        }
+        // `RichText` guarantees alignment is uniform within a paragraph and
+        // splits runs where it changes, so it can only change between runs —
+        // and grouping runs by alignment groups whole paragraphs.
         var body = ""
+        var group: [RichTextRun] = []
+        func close() {
+            guard let alignment = group.first?.style.alignment else { return }
+            let inner = inline(group)
+            body += alignment == .left
+                ? inner
+                : "<div align=\"" + alignment.rawValue + "\">" + inner + "</div>"
+            group = []
+        }
         for run in rich.runs {
+            if let current = group.first?.style.alignment, current != run.style.alignment {
+                close()
+            }
+            group.append(run)
+        }
+        close()
+        return prologue + body + epilogue
+    }
+
+    /// The runs as inline HTML — text in its tags, images as `<img>`. No block
+    /// structure; `html(from:)` adds that.
+    static func inline(_ runs: [RichTextRun]) -> String {
+        var body = ""
+        for run in runs {
             if let image = run.image {
                 body += "<img src=\"cid:\(attrEscape(image.id))\" alt=\"\">"
             } else {
                 body += wrap(encode(run.text), style: run.style)
             }
         }
-        return prologue + body + epilogue
+        return body
     }
 
     /// Everything before the first character of the body.
@@ -243,10 +287,18 @@ public enum RichTextHTML {
         /// A line break unless we are already at the start of one. Used for
         /// block-level elements, whose opening *and* closing tags both call it,
         /// so it has to be idempotent.
-        func ensureBreak() {
-            guard let previous = lastChar() else { return }   // nothing yet
-            if previous != "\n" { appendBreak() }
+        @discardableResult
+        func ensureBreak() -> Bool {
+            guard let previous = lastChar() else { return false }   // nothing yet
+            guard previous != "\n" else { return false }
+            appendBreak()
+            return true
         }
+
+        // Where the closing tag of an *aligned* block last added a line break,
+        // as (runs, buffer) counts at that moment. If nothing follows it, the
+        // break is dropped at the end — see below.
+        var alignedBlockBreak: (runs: Int, buffer: Int)?
 
         var i = start
         while i < end {
@@ -284,11 +336,16 @@ public enum RichTextHTML {
                 // closers (`</td>` with no `<td>`) are ignored rather than
                 // unwinding the stack, which unbalanced mail HTML would
                 // otherwise do on nearly every message.
+                var closedAlignment: RichTextAlignment?
                 if let depth = stack.lastIndex(where: { $0.name == tag.name }), depth > 0 {
                     flush()
+                    closedAlignment = stack[depth].style.alignment
                     stack.removeSubrange(depth...)
                 }
-                if Self.block.contains(tag.name) { ensureBreak() }
+                if Self.block.contains(tag.name), ensureBreak(),
+                   let closed = closedAlignment, closed != stack[stack.count - 1].style.alignment {
+                    alignedBlockBreak = (out.count, buffer.count)
+                }
                 continue
             }
 
@@ -298,7 +355,8 @@ public enum RichTextHTML {
             if tag.name == "img", let src = tag.attributes["src"],
                let resolved = resolve(src) {
                 flush()
-                out.append(RichTextRun(image: resolved))
+                out.append(RichTextRun(image: resolved,
+                                       alignment: stack[stack.count - 1].style.alignment))
                 continue
             }
 
@@ -310,6 +368,18 @@ public enum RichTextHTML {
             apply(tag, to: &style)
             if style != stack[stack.count - 1].style { flush() }
             stack.append(Frame(name: tag.name, style: style))
+        }
+
+        // **A final aligned paragraph has no terminator.** `html(from:)` writes
+        // one as `<div align="center">last line</div></body>`, and the closing
+        // tag's line break would otherwise give it a `\n` it never had — so a
+        // reopened draft would grow a blank last line, and `isDirty` would see a
+        // change nobody made. Only when the break came from closing a block that
+        // changed the alignment and nothing at all came after it; a plain
+        // `<div>a</div>` at the end still ends in a newline, as before.
+        if let mark = alignedBlockBreak, mark.runs == out.count,
+           mark.buffer == buffer.count, buffer.last == "\n" {
+            buffer.removeLast()
         }
         flush()
 
@@ -356,7 +426,17 @@ public enum RichTextHTML {
 
     /// Fold one tag's styling into the style it inherits.
     static func apply(_ tag: Tag, to style: inout RichTextStyle) {
+        // `align` means paragraph alignment only on these. On `<img>` and
+        // `<table>` it floats or positions the element rather than aligning
+        // text, and on `<td>` it would centre one cell of a layout table —
+        // reading either as "centre this paragraph" would be wrong more often
+        // than right.
+        if Self.alignable.contains(tag.name), let raw = tag.attributes["align"],
+           let alignment = Self.alignment(raw) {
+            style.alignment = alignment
+        }
         switch tag.name {
+        case "center": style.alignment = .center
         case "b", "strong": style.bold = true
         case "i", "em", "cite", "var", "address": style.italic = true
         case "font":
@@ -373,11 +453,19 @@ public enum RichTextHTML {
         }
         // An inline `style` attribute wins over the tag's own meaning — a
         // `<b style="font-weight: normal">` says what it means.
-        if let css = tag.attributes["style"] { applyCSS(css, to: &style) }
+        if let css = tag.attributes["style"] {
+            applyCSS(css, to: &style,
+                     alignable: Self.alignable.contains(tag.name) || tag.name == "center")
+        }
     }
 
     /// Apply a CSS declaration list, ignoring everything the composer can't say.
-    static func applyCSS(_ css: String, to style: inout RichTextStyle) {
+    ///
+    /// `text-align` is honoured only when `alignable` — the same tags whose
+    /// `align` attribute counts. Outlook puts `style="text-align:center"` on
+    /// layout cells constantly, and on a `<span>` browsers ignore it.
+    static func applyCSS(_ css: String, to style: inout RichTextStyle,
+                         alignable: Bool = false) {
         for declaration in css.split(separator: ";") {
             let pair = declaration.split(separator: ":", maxSplits: 1)
             guard pair.count == 2 else { continue }
@@ -399,9 +487,26 @@ public enum RichTextHTML {
                 if let family = firstFamily(value) { style.face = family }
             case "font-size":
                 if let pt = cssSize(lower) { style.size = pt }
+            case "text-align":
+                if alignable, let alignment = alignment(lower) { style.alignment = alignment }
             default:
                 break
             }
+        }
+    }
+
+    /// Elements whose `align` attribute aligns the text inside them.
+    static let alignable: Set<String> = ["div", "p", "h1", "h2", "h3", "h4", "h5", "h6"]
+
+    /// An `align` attribute or `text-align` value. `start`/`end` are read as
+    /// left/right, which is what they mean in the left-to-right mail this sees.
+    static func alignment(_ raw: String) -> RichTextAlignment? {
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "left", "start": return .left
+        case "center", "middle": return .center
+        case "right", "end": return .right
+        case "justify": return .justify
+        default: return nil
         }
     }
 

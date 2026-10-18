@@ -141,6 +141,24 @@ public struct RichTextColor: Equatable, Hashable, Sendable {
     ]
 }
 
+// MARK: - alignment
+
+/// A paragraph's horizontal alignment.
+///
+/// **Paragraph-level, but carried on every run.** The model has no paragraph
+/// objects — see the note on `RichText` — so alignment rides on `RichTextStyle`
+/// like everything else, and `RichText.normalize` enforces the one rule that
+/// makes that honest: every run in a paragraph has the paragraph's alignment,
+/// which is the alignment of its first run. That is also AppKit's rule
+/// (`fixParagraphStyleAttribute` takes a paragraph's style from its first
+/// character), so the editor and the model can't disagree about it.
+///
+/// The raw values are the HTML `align` attribute's, which is what the wire
+/// format writes.
+public enum RichTextAlignment: String, CaseIterable, Hashable, Sendable {
+    case left, center, right, justify
+}
+
 // MARK: - style
 
 /// What one run of text carries *over and above* the composer's default.
@@ -159,15 +177,20 @@ public struct RichTextStyle: Equatable, Hashable, Sendable {
     public var size: Double?
     /// Foreground colour, when the user chose one other than the default.
     public var color: RichTextColor?
+    /// The alignment of the paragraph this run is in. `.left` is the default
+    /// and keeps a run plain; see `RichTextAlignment` for why it lives here.
+    public var alignment: RichTextAlignment
 
     public init(bold: Bool = false, italic: Bool = false,
                 face: String? = nil, size: Double? = nil,
-                color: RichTextColor? = nil) {
+                color: RichTextColor? = nil,
+                alignment: RichTextAlignment = .left) {
         self.bold = bold
         self.italic = italic
         self.face = face
         self.size = size
         self.color = color
+        self.alignment = alignment
     }
 
     public static let plain = RichTextStyle()
@@ -255,9 +278,12 @@ public struct RichTextRun: Equatable, Sendable {
         self.image = nil
     }
 
-    public init(image: RichTextImage) {
+    /// An image's style is plain apart from alignment: a centred picture is
+    /// the main reason alignment exists, and it is the only style an image can
+    /// meaningfully carry.
+    public init(image: RichTextImage, alignment: RichTextAlignment = .left) {
         self.text = Self.imagePlaceholder
-        self.style = .plain
+        self.style = RichTextStyle(alignment: alignment)
         self.image = image
     }
 
@@ -267,10 +293,14 @@ public struct RichTextRun: Equatable, Sendable {
 /// A whole composed body: runs in order, no paragraph structure.
 ///
 /// Line breaks live in the run text as `\n`, exactly as they do in the plain
-/// `String` the composer used before this existed. There is no paragraph model
-/// because there is no paragraph *formatting* — the scope here is font, size,
-/// colour, bold and italic, and adding block structure that nothing can set
-/// would be inventing a format to be wrong about later.
+/// `String` the composer used before this existed. A paragraph is the text up
+/// to and including a `\n` (or the end).
+///
+/// There is still no paragraph *object*. The one paragraph format the composer
+/// has — alignment, added 2026oct — rides on each run's style, and `normalize`
+/// keeps it uniform across a paragraph. That was cheaper than a block model and
+/// changes nothing for a body that is all left-aligned, which is every body
+/// written before it existed.
 public struct RichText: Equatable, Sendable {
     public private(set) var runs: [RichTextRun]
 
@@ -325,7 +355,7 @@ public struct RichText: Equatable, Sendable {
     /// turn it into MIME.
     private mutating func normalize() {
         var merged: [RichTextRun] = []
-        for run in runs where !run.text.isEmpty {
+        for run in Self.uniformParagraphAlignment(runs) {
             // Never merge into or out of an image. Two adjacent images share the
             // plain style, so without this they would collapse into one run
             // holding two placeholders and a single `image` — silently losing a
@@ -338,5 +368,63 @@ public struct RichText: Equatable, Sendable {
             }
         }
         runs = merged
+    }
+
+    /// Give every run its paragraph's alignment — the alignment of the
+    /// paragraph's first run — splitting a run where a paragraph boundary
+    /// inside it separates two alignments. Empty runs are dropped here too.
+    ///
+    /// Why the first run decides: it is AppKit's rule, so it agrees with what
+    /// the editor shows; and it is what makes a paragraph's terminating `\n`
+    /// belong to the paragraph it ends. Foreign HTML gets that wrong all the
+    /// time — `<div align=center>x</div>` hands the parser a left-aligned `\n`
+    /// after a centred `x` — and this is where it is put right.
+    ///
+    /// A body with no alignment other than `.left` passes through unchanged,
+    /// which is what keeps every existing draft and test byte-identical.
+    static func uniformParagraphAlignment(_ runs: [RichTextRun]) -> [RichTextRun] {
+        var out: [RichTextRun] = []
+        out.reserveCapacity(runs.count)
+        // The alignment of the paragraph in progress; nil at a paragraph's start.
+        var paragraph: RichTextAlignment?
+        for run in runs where !run.text.isEmpty {
+            let own = run.style.alignment
+            let lead = paragraph ?? own
+            // An image never contains a newline, so it is always wholly inside
+            // the current paragraph.
+            guard !run.isImage, let newline = run.text.firstIndex(where: Self.endsParagraph) else {
+                var r = run
+                r.style.alignment = lead
+                out.append(r)
+                paragraph = lead
+                continue
+            }
+            if lead == own {
+                out.append(run)
+            } else {
+                // The part up to and including the first newline finishes the
+                // paragraph already in progress; everything after it begins
+                // paragraphs of this run's own.
+                var head = run
+                head.text = String(run.text[...newline])
+                head.style.alignment = lead
+                out.append(head)
+                let tail = String(run.text[run.text.index(after: newline)...])
+                if !tail.isEmpty {
+                    var rest = run
+                    rest.text = tail
+                    out.append(rest)
+                }
+            }
+            paragraph = run.text.last.map(Self.endsParagraph) == true ? nil : own
+        }
+        return out
+    }
+
+    /// A character AppKit ends a paragraph at. Not just `\n`: Swift treats
+    /// `\r\n` as one `Character`, so a search for `"\n"` would step over it,
+    /// and pasted text can carry CR line endings.
+    static func endsParagraph(_ c: Character) -> Bool {
+        c == "\n" || c == "\r\n" || c == "\r" || c == "\u{2029}"
     }
 }

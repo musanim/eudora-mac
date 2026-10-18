@@ -84,6 +84,56 @@ final class BodyTextView: NSTextView {
         case .off:    drawCrisp(dirtyRect)
         case .eudora: drawEudoraStyle(dirtyRect)
         }
+        drawSelectedAttachments(in: dirtyRect)
+    }
+
+    /// Tint each embedded image inside the selection, so a selected picture
+    /// looks selected.
+    ///
+    /// AppKit's selection highlight is drawn *behind* the glyphs, and an
+    /// attachment draws its image opaquely on top of it — so a selected image
+    /// showed no sign of being selected, and the only way to tell was to try
+    /// something and see. This paints the selection colour translucently over
+    /// the image's frame, plus a solid border so it reads on an image whose own
+    /// colours are close to the tint.
+    ///
+    /// Drawn here, after the mode switch, rather than inside the crisp pass:
+    /// in `.eudora` mode that pass is cached and haloed, and a tint drawn into
+    /// it would be haloed too. Nothing needs invalidating by hand — a selection
+    /// change already redisplays the line fragments it touches, and the image
+    /// lies within its own.
+    ///
+    /// The colour follows AppKit's rule for text: the accent colour while this
+    /// view has focus in the key window, the grey unemphasised one otherwise.
+    private func drawSelectedAttachments(in dirtyRect: NSRect) {
+        guard let layoutManager, let textContainer, let storage = textStorage,
+              storage.length > 0 else { return }
+        let ranges = selectedRanges.map(\.rangeValue).filter { $0.length > 0 }
+        guard !ranges.isEmpty else { return }
+
+        let focused = window?.isKeyWindow == true && window?.firstResponder === self
+        let color: NSColor = focused ? .selectedTextBackgroundColor
+                                     : .unemphasizedSelectedTextBackgroundColor
+        let whole = NSRange(location: 0, length: storage.length)
+        let origin = textContainerOrigin
+        for range in ranges {
+            let clipped = NSIntersectionRange(range, whole)
+            guard clipped.length > 0 else { continue }
+            storage.enumerateAttribute(.attachment, in: clipped, options: []) { value, sub, _ in
+                guard value != nil else { return }
+                let glyphs = layoutManager.glyphRange(forCharacterRange: sub,
+                                                      actualCharacterRange: nil)
+                let rect = layoutManager.boundingRect(forGlyphRange: glyphs, in: textContainer)
+                    .offsetBy(dx: origin.x, dy: origin.y)
+                guard !rect.isEmpty, rect.intersects(dirtyRect) else { return }
+                color.withAlphaComponent(0.45).setFill()
+                rect.fill(using: .sourceOver)
+                let border = NSBezierPath(rect: rect.insetBy(dx: 1, dy: 1))
+                border.lineWidth = 2
+                color.setStroke()
+                border.stroke()
+            }
+        }
     }
 
     private func drawCrisp(_ dirtyRect: NSRect) {
@@ -358,7 +408,18 @@ final class BodyTextView: NSTextView {
 
         let attachment = RichTextImageAttachment(RichTextImage(mimeType: found.type,
                                                                data: found.data))
-        let piece = NSAttributedString(attachment: attachment)
+        // Not `NSMutableAttributedString(attachment:)` — see the same line in
+        // `RichTextAttributed.attributed`.
+        let piece = NSMutableAttributedString(attributedString: NSAttributedString(attachment: attachment))
+        // Take the paragraph's alignment from the typing attributes, which AppKit
+        // keeps in step with the caret's paragraph. A bare attachment carries no
+        // paragraph style, and pasted at the start of a centred paragraph it
+        // would be that paragraph's first character — whose style AppKit then
+        // spreads over the whole paragraph, un-centring it.
+        if let paragraph = typingAttributes[.paragraphStyle] {
+            piece.addAttribute(.paragraphStyle, value: paragraph,
+                               range: NSRange(location: 0, length: piece.length))
+        }
         let range = selectedRange()
         // Whether AppKit could decode the bytes into something drawable. A nil
         // here means the run is in the storage and the cell has nothing to
@@ -834,6 +895,8 @@ final class RichTextEditorController: NSObject, ObservableObject, NSTextViewDele
     @Published private(set) var selectionFontSize: Double = 12
     /// The selection's colour, already resolved to sRGB for the colour well.
     @Published private(set) var selectionColor = Color(nsColor: .textColor)
+    /// The alignment of the paragraph the caret (or the selection's start) is in.
+    @Published private(set) var selectionAlignment: RichTextAlignment = .left
 
     private(set) var defaults = RichTextDefaults.arial12
     weak var textView: BodyTextView?
@@ -1169,6 +1232,9 @@ final class RichTextEditorController: NSObject, ObservableObject, NSTextViewDele
         let size = Double(font.pointSize)
         if selectionFontSize != size { selectionFontSize = size }
 
+        let alignment = RichTextAttributed.alignment(of: attrs)
+        if selectionAlignment != alignment { selectionAlignment = alignment }
+
         let nsColor = (attrs[.foregroundColor] as? NSColor)?.usingColorSpace(.sRGB)
         let color = Color(nsColor: nsColor ?? .textColor)
         if selectionColor != color { selectionColor = color }
@@ -1246,6 +1312,28 @@ final class RichTextEditorController: NSObject, ObservableObject, NSTextViewDele
         transformFonts { font in
             NSFontManager.shared.convert(font, toSize: CGFloat(size))
         }
+    }
+
+    /// Align the paragraphs the selection touches, or the caret's paragraph.
+    ///
+    /// AppKit's own `align…` actions rather than `mutate`, because alignment is
+    /// a paragraph attribute and they already know what that means: they widen
+    /// the selection to whole paragraphs, handle the empty last paragraph
+    /// through the typing attributes, and register the undo. `mutate` would
+    /// have to re-derive all three. The `.left` case uses `alignLeft`, not
+    /// `.natural`; both read back as left (`RichTextAttributed.alignment(of:)`).
+    func setAlignment(_ alignment: RichTextAlignment) {
+        guard let textView else { return }
+        isMutating = true
+        switch alignment {
+        case .left: textView.alignLeft(nil)
+        case .center: textView.alignCenter(nil)
+        case .right: textView.alignRight(nil)
+        case .justify: textView.alignJustified(nil)
+        }
+        isMutating = false
+        readBack()
+        refreshSelection()
     }
 
     /// Set the foreground colour, or reset to the default when `color` is nil.

@@ -3,7 +3,8 @@ import AppKit
 import EudoraStore
 
 /// The compact formatting controls above the compose body: font, size, colour,
-/// bold and italic. No Format menu — this strip is the whole of it.
+/// bold, italic and paragraph alignment. No Format menu — this strip is the
+/// whole of it.
 ///
 /// Every control still reads the current selection and writes back to it — the
 /// strip holds no state of its own and the text view remains the single source
@@ -39,6 +40,7 @@ struct FormatStrip: View, Equatable {
     let color: Color
     let bold: Bool
     let italic: Bool
+    let alignment: RichTextAlignment
 
     /// Writes back to the selection. Closures rather than a controller reference,
     /// so this view has no way to observe anything and cannot re-render on a
@@ -51,6 +53,7 @@ struct FormatStrip: View, Equatable {
     let setColor: (RichTextColor?) -> Void
     let onToggleBold: () -> Void
     let onToggleItalic: () -> Void
+    let setAlignment: (RichTextAlignment) -> Void
 
     /// **Values only — the closures are deliberately not compared**, and cannot
     /// be. They are made fresh in the caller's `body` on every pass, so including
@@ -66,6 +69,7 @@ struct FormatStrip: View, Equatable {
             && a.color == b.color
             && a.bold == b.bold
             && a.italic == b.italic
+            && a.alignment == b.alignment
     }
 
     var body: some View {
@@ -90,10 +94,58 @@ struct FormatStrip: View, Equatable {
             .toggleStyle(.button)
             .help("Italic (⌘I)")
 
+            Divider().frame(height: 16)
+
+            alignmentPicker
+
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+
+    // MARK: alignment
+
+    /// The standard four-segment control, one selected. A segmented `Picker`
+    /// rather than four toggles because exactly one is always on — the control
+    /// itself says so, and there is no state where none is lit.
+    private var alignmentPicker: some View {
+        Picker("", selection: alignmentBinding) {
+            ForEach(RichTextAlignment.allCases, id: \.self) { alignment in
+                // `.accessibilityLabel`, not `.help`: a segmented Picker keeps
+                // only each item's image and tag, so a per-segment tooltip set
+                // here would be silently dropped.
+                Image(systemName: Self.symbol(alignment))
+                    .accessibilityLabel(Self.label(alignment))
+                    .tag(alignment)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .fixedSize()
+        .help("Alignment")
+    }
+
+    private static func symbol(_ alignment: RichTextAlignment) -> String {
+        switch alignment {
+        case .left: return "text.alignleft"
+        case .center: return "text.aligncenter"
+        case .right: return "text.alignright"
+        case .justify: return "text.justify"
+        }
+    }
+
+    private static func label(_ alignment: RichTextAlignment) -> String {
+        switch alignment {
+        case .left: return "Align left"
+        case .center: return "Centre"
+        case .right: return "Align right"
+        case .justify: return "Justify"
+        }
+    }
+
+    private var alignmentBinding: Binding<RichTextAlignment> {
+        Binding(get: { alignment }, set: { setAlignment($0) })
     }
 
     // MARK: font family

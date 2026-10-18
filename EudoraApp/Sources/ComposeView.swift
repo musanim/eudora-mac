@@ -115,11 +115,13 @@ struct ComposeView: View {
                         color: editor.selectionColor,
                         bold: editor.selectionBold,
                         italic: editor.selectionItalic,
+                        alignment: editor.selectionAlignment,
                         setFamily: { editor.setFontFamily($0) },
                         setSize: { editor.setFontSize($0) },
                         setColor: { editor.setColor($0) },
                         onToggleBold: { editor.toggleBold() },
-                        onToggleItalic: { editor.toggleItalic() })
+                        onToggleItalic: { editor.toggleItalic() },
+                        setAlignment: { editor.setAlignment($0) })
                 .equatable()
             Divider()
             RichTextEditor(controller: editor,

@@ -111,7 +111,16 @@ public enum RichTextAttributed {
         let out = NSMutableAttributedString()
         for run in rich.runs {
             if let image = run.image {
-                out.append(NSAttributedString(attachment: RichTextImageAttachment(image)))
+                // Via `attributedString:` — `init(attachment:)` is imported from a
+                // class factory returning `NSAttributedString`, so it isn't
+                // reliably available on the mutable subclass.
+                let piece = NSMutableAttributedString(attributedString:
+                    NSAttributedString(attachment: RichTextImageAttachment(image)))
+                if let paragraph = paragraphStyle(for: run.style.alignment) {
+                    piece.addAttribute(.paragraphStyle, value: paragraph,
+                                       range: NSRange(location: 0, length: piece.length))
+                }
+                out.append(piece)
             } else {
                 out.append(NSAttributedString(string: run.text,
                                               attributes: attributes(for: run.style,
@@ -134,7 +143,38 @@ public enum RichTextAttributed {
         // read-back path treats obliqueness as italic so it round-trips.
         if synthesizedItalic { attrs[.obliqueness] = 0.2 }
         if let color = style.color { attrs[.foregroundColor] = nsColor(color) }
+        if let paragraph = paragraphStyle(for: style.alignment) { attrs[.paragraphStyle] = paragraph }
         return attrs
+    }
+
+    // MARK: - alignment
+
+    /// The paragraph style for an alignment, or nil for left — the default,
+    /// which a run expresses by carrying no paragraph style at all, exactly as
+    /// it carries no colour when it has none.
+    public static func paragraphStyle(for alignment: RichTextAlignment) -> NSParagraphStyle? {
+        let value: NSTextAlignment
+        switch alignment {
+        case .left: return nil
+        case .center: value = .center
+        case .right: value = .right
+        case .justify: value = .justified
+        }
+        let style = NSMutableParagraphStyle()
+        style.alignment = value
+        return style
+    }
+
+    /// The alignment a set of attributes expresses. No paragraph style, `.left`
+    /// and `.natural` are all left: `.natural` is what an `NSTextView` uses
+    /// until told otherwise, and in left-to-right text it *is* left.
+    public static func alignment(of attrs: [NSAttributedString.Key: Any]) -> RichTextAlignment {
+        switch (attrs[.paragraphStyle] as? NSParagraphStyle)?.alignment {
+        case .center?: return .center
+        case .right?: return .right
+        case .justified?: return .justify
+        default: return .left
+        }
     }
 
     /// Resolve a font, reporting whether italic had to be faked.
@@ -183,7 +223,7 @@ public enum RichTextAttributed {
             // the style pass is skipped.
             if let attachment = attrs[.attachment] as? NSTextAttachment,
                let image = embeddedImage(of: attachment) {
-                runs.append(RichTextRun(image: image))
+                runs.append(RichTextRun(image: image, alignment: alignment(of: attrs)))
                 return
             }
             runs.append(RichTextRun(text, style: style(from: attrs, defaults: defaults)))
@@ -298,6 +338,7 @@ public enum RichTextAttributed {
            let resolved = richColorIfNotDefault(color) {
             style.color = resolved
         }
+        style.alignment = alignment(of: attrs)
         return style
     }
 
