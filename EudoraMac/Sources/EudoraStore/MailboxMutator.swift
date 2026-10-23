@@ -461,8 +461,16 @@ public enum MailboxMutator {
 
     /// True if every TOC offset points at a real message in `recs` (an exact
     /// match or a deleted-ghost subset) — the same consistency the reader uses.
+    ///
+    /// **An index with no entries is consistent**, whatever the `.mbx` holds: it
+    /// lists nothing, and nothing is a subset of anything. It is what you get by
+    /// deleting every listed message from a mailbox that still carries
+    /// deleted-but-not-compacted ghosts, and it means "this mailbox shows
+    /// nothing". Treating it as inconsistent — as this once did — made the next
+    /// delivery *delete* the `.toc`, so the reader fell back to a scan and every
+    /// ghost reappeared, status-less ("?"). That is how 26 messages from July
+    /// came back into an In box emptied on 2026oct23.
     static func tocConsistent(_ toc: [TocEntry], recs: [MboxRecord]) -> Bool {
-        guard !toc.isEmpty else { return false }
         let offsets = Set(recs.map { $0.offset })
         return toc.allSatisfy { offsets.contains($0.offset) }
     }
@@ -482,7 +490,9 @@ public enum MailboxMutator {
             // Append offset = current size, bumped past a CRLF if the file
             // doesn't already end at a line boundary (the envelope separator is
             // only recognized at a line start).
-            let size = ((try? fm.attributesOfItem(atPath: mbx.path))?[.size] as? NSNumber)?.intValue ?? 0
+            let existedBefore = fm.fileExists(atPath: mbx.path)
+            let measured = ((try? fm.attributesOfItem(atPath: mbx.path))?[.size] as? NSNumber)?.intValue
+            let size = measured ?? 0
             var chunk = Data()
             var newOffset = size
             if size > 0, let last = MailboxIO.lastByte(of: mbx), last != 0x0A, last != 0x0D {
@@ -492,15 +502,25 @@ public enum MailboxMutator {
             chunk.append(contentsOf: recordBytes)
             try MailboxIO.appendData(chunk, to: mbx)
 
-            // Keep the .toc in step by appending one entry (only if a .toc
-            // exists). Its offset is valid, so the reader still trusts the .toc
-            // (an already-invalid .toc just stays that way and the reader
-            // rescans — either way we never rewrite the whole thing).
+            // Keep the .toc in step by appending one entry when a .toc exists.
+            // Its offset is valid, so the reader still trusts the .toc (an
+            // already-invalid .toc just stays that way and the reader rescans —
+            // either way we never rewrite the whole thing).
+            let e = TocEntry(offset: newOffset, length: recordBytes.count,
+                             status: entry.status, priority: entry.priority,
+                             date: entry.date, to: entry.to, subject: entry.subject)
             if fm.fileExists(atPath: toc.path) {
-                let e = TocEntry(offset: newOffset, length: recordBytes.count,
-                                 status: entry.status, priority: entry.priority,
-                                 date: entry.date, to: entry.to, subject: entry.subject)
                 try MailboxIO.appendData(TocWriter.entryBytes(e), to: toc)
+            } else if measured == 0 || (measured == nil && !existedBefore) {
+                // An empty (or brand-new) mailbox with no index: start one, as
+                // `Outbox.append` does. Without this, a mailbox that ever lost
+                // its `.toc` stays status-less ("?") for good, because nothing
+                // else recreates it — moving a message in just adds another "?".
+                //
+                // Keyed on a *measured* size: if the stat failed on an existing
+                // file, `size` fell back to 0 and the entry's offset could be
+                // wrong, so no index is started then.
+                try TocWriter.data(entries: [e]).write(to: toc)
             }
         } catch { throw MutateError.ioError(error.localizedDescription) }
     }

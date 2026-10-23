@@ -275,6 +275,16 @@ public struct MailStore: Sendable {
         // to a different .mbx) shares almost no offsets and sits near zero; a
         // real one clears this easily — the worst stale mailbox in the real tree
         // still matches ~71%.
+        // An index with no entries is a real answer, not a missing one: the
+        // mailbox shows nothing, even if its `.mbx` still holds ghosts of
+        // messages deleted without compaction. Scanning instead would put every
+        // one of those back on screen with no status. (`.toc` missing or
+        // shorter than its header is `nil` and still scans.) See
+        // `MailboxMutator.tocConsistent`, which holds the write-side half.
+        if let t = toc, t.isEmpty {
+            return Listing(name: label, source: recs.isEmpty ? .toc : .tocCompacted, rows: [])
+        }
+
         if let t = toc, !t.isEmpty {
             let matched = t.filter { indexByOffset[$0.offset] != nil }
             if matched.count * 2 > t.count {
