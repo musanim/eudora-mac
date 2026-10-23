@@ -75,7 +75,7 @@ struct MenuBarView: View {
             Button("Select All") { responder("selectAll:") }
                 .keyboardShortcut("a", modifiers: .command)
             Divider()
-            Button("Find…") { openWindow(id: "find") }
+            Button("Find…") { FindView.open(openWindow) }
                 .keyboardShortcut("f", modifiers: .command)
         }.menuBarItem()
     }
@@ -232,7 +232,7 @@ struct MenuBarView: View {
             Divider()
             Button("Address Book") {}.disabled(true)
             Button("Filters…") {}.disabled(true)
-            Button("Search…") { openWindow(id: "find") }
+            Button("Search…") { FindView.open(openWindow) }
             Button("Rebuild Search Index") { model.rebuildIndex() }
                 .disabled(model.rootURL == nil)
             Divider()

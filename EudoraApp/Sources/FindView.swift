@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import EudoraStore
 import EudoraSearch
 
@@ -33,6 +34,22 @@ struct FindView: View {
     @State private var scopeInitialized = false
     @State private var tab: FindTab = .mailboxes
     @State private var resultSelection: ResultRow.ID?
+    /// Bumped each time the window is opened or brought forward; each new value
+    /// asks `FirstFieldFocuser` to put the caret in the first field again.
+    @State private var focusRequest = 0
+
+    /// Posted by every command that opens this window. `onAppear` covers a
+    /// window that was closed; this covers ⌘F on one that is already open, where
+    /// `openWindow` only brings it forward and no view lifecycle fires.
+    static let openRequested = Notification.Name("FindView.openRequested")
+
+    /// Opens (or brings forward) the Find window with the caret in its first
+    /// field and that field's text selected. Use this rather than calling
+    /// `openWindow(id: "find")` directly, or the focus won't follow.
+    static func open(_ openWindow: OpenWindowAction) {
+        openWindow(id: "find")
+        NotificationCenter.default.post(name: openRequested, object: nil)
+    }
 
     enum FindTab: Hashable { case results, mailboxes }
 
@@ -57,7 +74,14 @@ struct FindView: View {
         // ancestors, so attaching it to the root covers the whole window
         // wherever focus happens to be.
         .onExitCommand { dismiss() }
-        .onAppear(perform: initScopeIfNeeded)
+        .onAppear {
+            initScopeIfNeeded()
+            focusRequest += 1
+        }
+        .onReceive(NotificationCenter.default.publisher(for: Self.openRequested)) { _ in
+            focusRequest += 1
+        }
+        .background(FirstFieldFocuser(request: focusRequest))
         // A rendered message can hold a few MB of embedded images. The window
         // closing is the natural point to let that go — and it means reopening
         // Find shows an empty pane rather than a message from a search two days
@@ -437,5 +461,87 @@ struct FindView: View {
         model.runSearch(SearchQuery(criteria: criteria, matchAll: matchAll,
                                     mailboxes: scopeArg, limit: 500))
         tab = .results
+    }
+}
+
+// MARK: - Initial focus
+
+/// Puts the caret in the Find window's first text field with its whole contents
+/// selected, so typing replaces the previous search instead of appending to it.
+///
+/// **Why AppKit and not `@FocusState`.** Focus written from `onAppear` lands
+/// before the window is key and is quietly dropped on macOS 13 — the composer
+/// spent builds learning that (see `RichTextEditor`'s focus notes). And when the
+/// field is *already* focused, re-assigning the same `@FocusState` value changes
+/// nothing, so it could never re-select the text. Going to the window directly
+/// does both.
+///
+/// **Which field.** The topmost editable `NSTextField` in the window — the first
+/// criterion's text box. If the first row is a Date row it has no text box, and
+/// the next row's is used; with a single Date row there is nothing to focus and
+/// this does nothing.
+///
+/// Retries briefly because on a fresh open the window becomes key a beat after
+/// the view appears. Gives up after about a second rather than ever grabbing
+/// focus back from somewhere the user has since clicked.
+private struct FirstFieldFocuser: NSViewRepresentable {
+    let request: Int
+
+    final class Coordinator {
+        /// The backing view, resolved to its window live: `nsView.window` is
+        /// usually nil on the first update (same reasoning as `BackTabCatcher`).
+        weak var view: NSView?
+        var handled = Int.min
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        let coordinator = context.coordinator
+        coordinator.view = nsView
+        guard coordinator.handled != request else { return }
+        coordinator.handled = request
+        Self.attempt(coordinator, remaining: 20)
+    }
+
+    private static func attempt(_ coordinator: Coordinator, remaining: Int) {
+        // Always deferred: never move first responder in the middle of a
+        // SwiftUI update.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak coordinator] in
+            guard let coordinator else { return }
+            guard let window = coordinator.view?.window, window.isKeyWindow,
+                  let field = firstTextField(in: window.contentView)
+            else {
+                if remaining > 0 { attempt(coordinator, remaining: remaining - 1) }
+                return
+            }
+            if field.currentEditor() == nil {
+                guard window.makeFirstResponder(field) else { return }
+            }
+            // `makeFirstResponder` on a text field normally selects all of it,
+            // but not when the field already had focus; do it explicitly.
+            field.currentEditor()?.selectAll(nil)
+        }
+    }
+
+    /// The editable, visible text field nearest the top of the window (then the
+    /// leftmost, for a tie).
+    private static func firstTextField(in root: NSView?) -> NSTextField? {
+        guard let root else { return nil }
+        var best: (field: NSTextField, top: CGFloat, left: CGFloat)?
+        func walk(_ view: NSView) {
+            if let field = view as? NSTextField, field.isEditable,
+               !field.isHiddenOrHasHiddenAncestor {
+                let frame = field.convert(field.bounds, to: nil)
+                if best == nil || frame.maxY > best!.top + 0.5
+                    || (abs(frame.maxY - best!.top) <= 0.5 && frame.minX < best!.left) {
+                    best = (field, frame.maxY, frame.minX)
+                }
+            }
+            view.subviews.forEach(walk)
+        }
+        walk(root)
+        return best?.field
     }
 }

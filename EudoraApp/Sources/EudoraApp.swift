@@ -253,7 +253,7 @@ struct EudoraApp: App {
         // through the responder chain, for free.
         CommandGroup(after: .pasteboard) {
             Divider()
-            Button("Find…") { openWindow(id: "find") }
+            Button("Find…") { FindView.open(openWindow) }
                 .keyboardShortcut("f", modifiers: .command)
         }
 
