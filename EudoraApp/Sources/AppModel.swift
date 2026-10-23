@@ -4274,7 +4274,9 @@ final class AppModel: ObservableObject {
         alert.addButton(withTitle: "Copy Link")
         switch alert.runModal() {
         case .alertSecondButtonReturn:
-            if let url = URL(string: raw) { NSWorkspace.shared.open(url) }
+            // Centred new Chrome window when Chrome is the default; otherwise
+            // the ordinary hand-off. See `BrowserOpener`.
+            if let url = URL(string: raw) { BrowserOpener.open(url) }
         case .alertThirdButtonReturn:
             copyToPasteboard(raw)
         default:

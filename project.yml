@@ -90,14 +90,17 @@ targets:
         # If the cert is ever renewed the fingerprint changes; re-run the command
         # above and paste the new hash here.
         #
-        # Hardened runtime is ON because notarization requires it. No entitlements
-        # are needed: nothing here loads third-party dylibs, and network, Keychain
-        # and unsandboxed file access are all unaffected by it.
+        # Hardened runtime is ON because notarization requires it. One entitlement
+        # is needed: apple-events, so BrowserOpener can ask Chrome to open a link
+        # in a centred window (2026oct23). Nothing else is: nothing here loads
+        # third-party dylibs, and network, Keychain and unsandboxed file access
+        # are all unaffected by the hardened runtime.
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "104FFC817F2CD3D913D2D3E2C2ABAFBBEBDBC116"
         DEVELOPMENT_TEAM: ""
         PROVISIONING_PROFILE_SPECIFIER: ""
         ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_ENTITLEMENTS: EudoraApp/Eudora.entitlements
         ENABLE_APP_SANDBOX: NO
       configs:
         # Release-only, and both are here because Apple's notary service rejected

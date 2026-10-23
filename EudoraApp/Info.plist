@@ -57,6 +57,11 @@
 			</array>
 		</dict>
 	</array>
+	<!-- The sentence in macOS's one-time "Eudora wants to control Google Chrome"
+	     prompt. Required alongside the apple-events entitlement in
+	     Eudora.entitlements; see BrowserOpener. -->
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Eudora opens links from your mail in a new Chrome window, centred on your main display.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSHighResolutionCapable</key>
