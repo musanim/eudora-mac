@@ -34,6 +34,10 @@ struct FindView: View {
     @State private var scopeInitialized = false
     @State private var tab: FindTab = .mailboxes
     @State private var resultSelection: ResultRow.ID?
+    /// Mailboxes and folders whose names matched the last search's terms. Held
+    /// here rather than in `AppModel` because they are computed synchronously
+    /// from the tree when Search is pressed, alongside the message search.
+    @State private var nameMatches: [MailboxItem] = []
     /// Bumped each time the window is opened or brought forward; each new value
     /// asks `FirstFieldFocuser` to put the caret in the first field again.
     @State private var focusRequest = 0
@@ -170,8 +174,8 @@ struct FindView: View {
 
             Spacer()
 
-            Text(model.searchStatus)
-                .copyable(model.searchStatus)
+            Text(statusText)
+                .copyable(statusText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -234,6 +238,15 @@ struct FindView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    /// The engine's status, plus the mailbox-name matches it knows nothing
+    /// about — without them "No results." would sit above rows that are there.
+    private var statusText: String {
+        let n = nameMatches.count
+        guard n > 0, !model.isSearching else { return model.searchStatus }
+        let names = "\(n) mailbox name\(n == 1 ? "" : "s")"
+        return model.searchStatus.isEmpty ? names : model.searchStatus + " Plus \(names)."
+    }
+
     // MARK: results table
 
     /// Identifiable wrapper — `SearchHit` isn't Identifiable and hits can repeat
@@ -243,9 +256,16 @@ struct FindView: View {
     /// table sorts by key paths: the mailbox's *display* name (not its raw id),
     /// a real parsed `Date` (so Date sorts chronologically, not by the string's
     /// spelling), and the subject. `dateText` is what the Date column shows.
+    ///
+    /// A row is either a message hit or a **mailbox-name match**: a mailbox or
+    /// folder whose name contains a search term (`hit` nil, `mailboxID` set).
+    /// Those carry only the name, and clicking one shows it in the sidebar —
+    /// see `AppModel.mailboxesNamed`.
     struct ResultRow: Identifiable {
         let id: String
-        let hit: SearchHit
+        let hit: SearchHit?
+        let mailboxID: MailboxItem.ID?
+        let isFolder: Bool
         let mailbox: String
         let dateSort: Date
         let dateText: String
@@ -254,9 +274,18 @@ struct FindView: View {
     }
 
     private var resultRows: [ResultRow] {
-        model.searchResults.enumerated().map { i, hit in
+        // Mailbox names first: there are few of them, and they are the thing
+        // most easily missed further down a long list.
+        let named = nameMatches.map { item in
+            ResultRow(id: "mailbox:\(item.id)", hit: nil, mailboxID: item.id,
+                      isFolder: item.isFolder, mailbox: item.display,
+                      dateSort: .distantPast, dateText: "", subject: "", snippet: "")
+        }
+        return named + model.searchResults.enumerated().map { i, hit in
             ResultRow(id: "\(i)",
                       hit: hit,
+                      mailboxID: nil,
+                      isFolder: false,
                       mailbox: model.mailboxDisplay(hit.mailbox),
                       // A hit's date is usually the message's own RFC-822
                       // `Date:` header, but for anything Eudora 7 composed the
@@ -297,7 +326,15 @@ struct FindView: View {
             // the list, some from the messages.
             VSplitView {
                 Table(sortedRows, selection: $resultSelection, sortOrder: $sortOrder) {
-                    TableColumn("Mailbox", value: \.mailbox) { Text($0.mailbox) }
+                    TableColumn("Mailbox", value: \.mailbox) { row in
+                        if row.hit == nil {
+                            // The icon is what says "this row is a mailbox, not a
+                            // message"; the other columns are blank.
+                            Label(row.mailbox, systemImage: row.isFolder ? "folder" : "tray")
+                        } else {
+                            Text(row.mailbox)
+                        }
+                    }
                         .width(min: 90, ideal: 130)
                     TableColumn("Date", value: \.dateSort) { Text($0.dateText) }
                         .width(min: 90, ideal: 130)
@@ -322,9 +359,13 @@ struct FindView: View {
                 .contextMenu(forSelectionType: ResultRow.ID.self) { ids in
                     if let id = ids.first,
                        let rr = sortedRows.first(where: { $0.id == id }) {
-                        Button("View in Mailbox") {
-                            resultSelection = id
-                            model.openHit(rr.hit)
+                        if let hit = rr.hit {
+                            Button("View in Mailbox") {
+                                resultSelection = id
+                                model.openHit(hit)
+                            }
+                        } else if let mailboxID = rr.mailboxID {
+                            Button("Show in Sidebar") { model.revealInSidebar(mailboxID) }
                         }
                     }
                 }
@@ -346,7 +387,20 @@ struct FindView: View {
                     model.clearFindPreview()
                     return
                 }
-                model.loadFindPreview(for: rr.hit)
+                guard let hit = rr.hit else {
+                    // A mailbox-name row has no message to preview. Clicking it
+                    // shows the mailbox in the sidebar instead — Stephen's
+                    // request, and unlike a message row, a jump to the main
+                    // window. The selection is then dropped, so that clicking
+                    // the same row again (after coming back to Find) is a
+                    // change and works again; a row that stayed selected would
+                    // swallow every later click.
+                    model.clearFindPreview()
+                    if let mailboxID = rr.mailboxID { model.revealInSidebar(mailboxID) }
+                    DispatchQueue.main.async { resultSelection = nil }
+                    return
+                }
+                model.loadFindPreview(for: hit)
             }
         }
     }
@@ -435,6 +489,17 @@ struct FindView: View {
         // selection appearing to move.
         resultSelection = nil
         model.clearFindPreview()
+
+        // Mailbox names, from every positive text criterion whatever its Where:
+        // a name is not a header or a body, and a forgotten mailbox is worth
+        // mentioning whichever field the term was typed into. Computed before
+        // the scope check, since an empty scope stops the message search but
+        // says nothing about names.
+        nameMatches = model.mailboxesNamed(containingAny: rows.compactMap { r in
+            guard r.field != .date,
+                  r.textOp != .doesNotContain, r.textOp != .isNot else { return nil }
+            return r.text
+        })
 
         let all = model.allLeafMailboxIDs
         guard !scope.isEmpty else {

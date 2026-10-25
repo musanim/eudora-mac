@@ -5839,6 +5839,93 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: - Mailbox names in Find
+
+    /// Mailboxes and folders whose *name* contains any of `terms` — Find's
+    /// "wart on the side" (2026oct25). The search index holds messages, so a
+    /// mailbox named for the very thing being looked for, but holding no message
+    /// that mentions it, was invisible to Find. These are listed above the
+    /// message hits as a reminder that the mailbox exists.
+    ///
+    /// Case- and diacritic-insensitive, like the snippet matcher. Searches the
+    /// whole visible tree regardless of the Find window's mailbox scope: the
+    /// scope says which messages to read, and a forgotten mailbox is exactly one
+    /// that would not have been ticked. Tree order, which is the order the
+    /// sidebar shows them in.
+    func mailboxesNamed(containingAny terms: [String]) -> [MailboxItem] {
+        let wanted = terms.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !wanted.isEmpty else { return [] }
+        var out: [MailboxItem] = []
+        func walk(_ items: [MailboxItem]) {
+            for item in items {
+                if wanted.contains(where: {
+                    item.display.range(of: $0, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+                }) {
+                    out.append(item)
+                }
+                if let children = item.children { walk(children) }
+            }
+        }
+        walk(visibleTree)
+        return out
+    }
+
+    /// A request for the sidebar to show one mailbox or folder: the folders
+    /// above it opened, and the row scrolled into view. `serial` makes a repeat
+    /// request for the same item a change, so clicking it twice works twice.
+    struct SidebarReveal: Equatable {
+        let id: MailboxItem.ID
+        let ancestors: [MailboxItem.ID]
+        let serial: Int
+    }
+
+    /// Read by `MailboxTree`, which owns the expansion; see `revealInSidebar`.
+    @Published private(set) var sidebarReveal: SidebarReveal?
+    private var sidebarRevealSerial = 0
+
+    /// Show a mailbox or folder in the main window's sidebar, and select it if
+    /// it is a mailbox — what clicking a mailbox-name row in Find does.
+    ///
+    /// A mailbox is selected the way a sidebar click selects it (the same
+    /// `beginMailboxSwitch` first), so it lists with whatever selection it last had; not `openRecent`'s newest-message
+    /// pick, which answers a different question. A folder is only revealed and
+    /// opened, since a folder has nothing to list.
+    func revealInSidebar(_ id: MailboxItem.ID) {
+        guard let item = itemsByID[id] else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        // The Find window is on top — that is where the click came from. Same
+        // reason as `openMessage`.
+        MainWindowAccessor.resolved?.makeKeyAndOrderFront(nil)
+
+        var ancestors = Self.ancestorIDs(of: id, in: visibleTree) ?? []
+        if item.isFolder { ancestors.append(id) }      // open the folder itself too
+        sidebarRevealSerial += 1
+        sidebarReveal = SidebarReveal(id: id, ancestors: ancestors, serial: sidebarRevealSerial)
+
+        if !item.isFolder, selectedMailboxID != id {
+            // What the sidebar's selection binding does on a click: clear the
+            // outgoing mailbox at once, then let onChange → loadListing() run.
+            beginMailboxSwitch()
+            selectedMailboxID = id
+        }
+    }
+
+    /// The folders enclosing `id`, outermost first, or nil if it isn't in
+    /// `items`. Walked rather than derived from the id's spelling: the ids look
+    /// path-like, but nothing promises a folder's id is a prefix of its
+    /// children's.
+    static func ancestorIDs(of id: MailboxItem.ID, in items: [MailboxItem]) -> [MailboxItem.ID]? {
+        for item in items {
+            if item.id == id { return [] }
+            if let children = item.children,
+               let below = ancestorIDs(of: id, in: children) {
+                return [item.id] + below
+            }
+        }
+        return nil
+    }
+
     /// The newest message in a listing — "the last item by date", which is what
     /// a Recents pick selects.
     ///

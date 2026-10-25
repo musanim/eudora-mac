@@ -372,7 +372,8 @@ struct SidebarView: View {
                             onMoveToGroup: { model.moveIntoGroup($0, into: $1) },
                             onSortContents: { model.sortFolderContents($0) },
                             recentFilings: { model.recentFilings() },
-                            onPickRecent: { model.openRecent($0) })
+                            onPickRecent: { model.openRecent($0) },
+                            reveal: model.sidebarReveal)
                     .equatable()
             }
         }
@@ -447,10 +448,15 @@ struct MailboxTree: View, Equatable {
     let recentFilings: () -> [(id: MailboxItem.ID, display: String)]
     /// Open a mailbox picked from Recents. See `AppModel.openRecent`.
     let onPickRecent: (MailboxItem.ID) -> Void
+    /// A request to show one row: its enclosing folders opened and the row
+    /// scrolled into view. See `AppModel.revealInSidebar`. In `==`, so a new
+    /// request reaches `body`; it changes only when one is made.
+    let reveal: AppModel.SidebarReveal?
 
     static func == (a: MailboxTree, b: MailboxTree) -> Bool {
         a.treeVersion == b.treeVersion && a.selected == b.selected
             && a.inboxHasNewMail == b.inboxHasNewMail
+            && a.reveal == b.reveal
     }
     // `treeIdentityVersion` is deliberately *not* in `==`. It only ever moves
     // when `treeVersion` does — both are published in the same synchronous
@@ -531,7 +537,16 @@ struct MailboxTree: View, Equatable {
     }
 
     var body: some View {
-        treeList
+        // The reader is for `reveal` alone. It wraps the whole view so the
+        // proxy can reach the outline; the pinned inset below still attaches to
+        // the list's own safe area, since a reader passes its safe area through.
+        ScrollViewReader { proxy in
+            treeList
+                .onChange(of: reveal) { request in
+                    guard let request else { return }
+                    applyReveal(request, proxy: proxy)
+                }
+        }
             // **The pinned set, as a safe-area inset — not a row of a `VStack`.**
             //
             // Stephen leaves only the top-left corner of the window uncovered so
@@ -550,6 +565,23 @@ struct MailboxTree: View, Equatable {
             // rows never reparent, so they have no business being thrown away
             // when the outline's identity changes.
             .safeAreaInset(edge: .top, spacing: 0) { pinnedSet }
+    }
+
+    /// Open the folders above the requested row, then scroll it to the middle.
+    ///
+    /// The expansion is written the same way a disclosure click writes it, so
+    /// it is remembered across launches like any other. The scroll waits a turn
+    /// because the row does not exist until the outline has drawn the folders
+    /// just opened; `scrollTo` on a row not yet built does nothing.
+    private func applyReveal(_ request: AppModel.SidebarReveal, proxy: ScrollViewProxy) {
+        let next = expandedIDs.union(request.ancestors)
+        if next != expandedIDs {
+            liveExpansion = next
+            onExpansionChanged(next)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            proxy.scrollTo(request.id, anchor: .center)
+        }
     }
 
     /// The scrolling part: the user's own mailboxes and folders.
