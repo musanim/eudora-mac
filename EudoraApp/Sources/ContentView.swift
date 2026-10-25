@@ -537,11 +537,21 @@ struct MailboxTree: View, Equatable {
     }
 
     var body: some View {
+        // **Read the expansion here, in `body`, not inside the reader's closure.**
+        // SwiftUI records a `@State` dependency only for reads made while `body`
+        // itself runs; a read inside `ScrollViewReader`'s content closure happens
+        // during the *reader's* evaluation and is not charged to this view. With
+        // the read in there (2026oct25, 4517c7d), a disclosure click stored the
+        // new set but invalidated nothing — the first click looked right because
+        // the outline acted on it locally, later ones did nothing until a
+        // selection change (in `==`) forced a re-render. The same symptom as the
+        // one in `setExpanded`'s comment, by a different route.
+        let expanded = renderExpandedIDs
         // The reader is for `reveal` alone. It wraps the whole view so the
         // proxy can reach the outline; the pinned inset below still attaches to
         // the list's own safe area, since a reader passes its safe area through.
         ScrollViewReader { proxy in
-            treeList
+            treeList(expanded: expanded)
                 .onChange(of: reveal) { request in
                     guard let request else { return }
                     applyReveal(request, proxy: proxy)
@@ -584,8 +594,9 @@ struct MailboxTree: View, Equatable {
         }
     }
 
-    /// The scrolling part: the user's own mailboxes and folders.
-    private var treeList: some View {
+    /// The scrolling part: the user's own mailboxes and folders. `expanded` is
+    /// read by `body` and passed in; see the note there.
+    private func treeList(expanded: Set<String>) -> some View {
         List(selection: selection) {
             // The row height, and note where this sits: **inside** the `List`,
             // wrapped around its content, not on the `List` itself.
@@ -612,7 +623,7 @@ struct MailboxTree: View, Equatable {
                 // saved across launches nor restored after the `.id()` rebuild
                 // below — see `SidebarExpansion`.
                 OutlineRows(items: otherMailboxes, owner: self,
-                            expanded: renderExpandedIDs, setExpanded: setExpanded)
+                            expanded: expanded, setExpanded: setExpanded)
             }
             .environment(\.defaultMinListRowHeight, SidebarRowMetrics.rowHeight)
         }
