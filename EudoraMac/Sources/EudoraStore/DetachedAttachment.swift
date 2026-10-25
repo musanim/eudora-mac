@@ -124,12 +124,17 @@ public enum DetachedAttachment {
     /// Marker lines in `bytes`, recognised only at the start of a line so that a
     /// message quoting the phrase mid-sentence doesn't count.
     ///
-    /// Byte-level, and the path is read as UTF-8 with replacement rather than
-    /// through `CharsetDecoder`: the marker and the path separators are ASCII in
-    /// every encoding Eudora writes (Windows ANSI code pages, all ASCII
-    /// supersets), so a non-ASCII filename can only garble the *name* reported,
-    /// never cause a marker to be missed. Nothing is allocated until a marker is
-    /// found, which is what makes this affordable per-message.
+    /// Byte-level: the marker and the path separators are ASCII in every
+    /// encoding Eudora writes (Windows ANSI code pages, all ASCII supersets), so
+    /// a non-ASCII filename cannot cause a marker to be missed. Nothing is
+    /// allocated until a marker is found, which is what makes this affordable
+    /// per-message.
+    ///
+    /// The path is decoded by `CP1252.decodeUnlabelled`, not as UTF-8 with
+    /// replacement. Eudora wrote these lines in Windows ANSI, and a name read
+    /// as `Sz\u{FFFD}m 4.mp3` is not one `AttachmentLocator` can find on disk:
+    /// in `phaseX`, 69 detached files with accented names were sitting in the
+    /// Attachments folder, unreachable under their mangled names.
     private static func scan(_ bytes: [UInt8], _ body: (String) -> Continuation) -> Continuation {
         var i = 0
         while let hit = Bytes.find(markerBytes, in: bytes, from: i) {
@@ -138,7 +143,7 @@ public enum DetachedAttachment {
             var end = i
             while end < bytes.count, bytes[end] != 0x0a { end += 1 }
             let lineEnd = (end > i && bytes[end - 1] == 0x0d) ? end - 1 : end
-            let path = String(decoding: bytes[i..<lineEnd], as: UTF8.self)
+            let path = CP1252.decodeUnlabelled(bytes[i..<lineEnd])
                 .trimmingCharacters(in: .whitespaces)
             if !path.isEmpty, body(path) == .stop { return .stop }
         }

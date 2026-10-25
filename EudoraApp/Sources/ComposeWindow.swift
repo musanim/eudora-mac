@@ -243,9 +243,23 @@ struct WindowCloseGuard: NSViewRepresentable {
 /// is why the remembered frame is of no use to a new window anyway: it is
 /// rewritten by every placement, so it only ever records where the last
 /// composer was put.
+///
+/// **Also places the Find window** (2026oct25), by the same rule: Stephen found
+/// ⌘F opening it off to the right, wherever its remembered frame had last been
+/// left. The two differences are parameters. Find is one window, so it takes no
+/// part in the cascade (`cascades: false`) — neither stepping itself nor making
+/// composers step round it. And a `Window` scene's view may outlive the window
+/// being closed, so a once-per-view latch could mean once ever; `request` lets
+/// the owner ask again each time the window is opened afresh. A Find window
+/// that is already open and merely brought forward by ⌘F is left where it is,
+/// the same promise composers get.
 struct ComposeWindowPlacer: NSViewRepresentable {
-    /// `AppModel.nightModeComposePlacement`, handed in by `ComposeWindow`.
+    /// `AppModel.nightModeComposePlacement`, handed in by the owning window.
     let enabled: Bool
+    /// Whether this window joins the compose cascade. True for composers.
+    var cascades = true
+    /// Each new value re-opens the once-only latch. Composers never change it.
+    var request = 0
 
     /// Logs the screen census, every window it places and which of the two rules
     /// decided, and every window it gives up on. On until the behaviour has been
@@ -293,6 +307,8 @@ struct ComposeWindowPlacer: NSViewRepresentable {
         var placed = false
         /// A deferred hunt for the window is already running; see `attempt`.
         var hunting = false
+        /// The `request` the latch was last opened for.
+        var request: Int?
         weak var view: NSView?
     }
 
@@ -302,6 +318,10 @@ struct ComposeWindowPlacer: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {
         let coordinator = context.coordinator
         coordinator.view = nsView
+        if coordinator.request != request {
+            coordinator.request = request
+            coordinator.placed = false
+        }
         guard !coordinator.placed else { return }
         // Off is a decision, and it is made once per window. Without the latch,
         // ticking the box in Settings re-evaluates every open composer's body
@@ -447,8 +467,13 @@ struct ComposeWindowPlacer: NSViewRepresentable {
 
         // The cascade slot is taken once, before the move, so the verification
         // below re-asserts the *same* frame rather than sliding the window along.
-        let step = CGFloat(Self.liveCount(excluding: window) % 5) * 26
-        Self.placedWindows.append(WeakWindow(window))
+        let step: CGFloat
+        if cascades {
+            step = CGFloat(Self.liveCount(excluding: window) % 5) * 26
+            Self.placedWindows.append(WeakWindow(window))
+        } else {
+            step = 0
+        }
         let settled = move(window, onto: screen, step: step, rule: rule)
 
         // One verification a turn later, on the whole frame rather than just

@@ -356,7 +356,7 @@ public enum MIMEParser {
     }
 
     static func parseHeaders(_ bytes: [UInt8]) -> [(name: String, value: String)] {
-        let text = String(decoding: bytes, as: UTF8.self)
+        let text = headerText(bytes)
         var headers: [(name: String, value: String)] = []
         for rawLine in text.components(separatedBy: "\n") {
             let line = rawLine.hasSuffix("\r") ? String(rawLine.dropLast()) : rawLine
@@ -371,6 +371,25 @@ public enum MIMEParser {
             }
         }
         return headers
+    }
+
+    /// A header block's bytes as text, tolerating CP1252 among the UTF-8.
+    ///
+    /// Headers are meant to be ASCII and in this tree a third of the non-ASCII
+    /// ones are CP1252 rather than UTF-8 (see `CP1252.decodeUnlabelled`).
+    /// Reading the whole block as UTF-8 turned `CarterCat\u{E9}naires.png` into
+    /// `CarterCat\u{FFFD}naires.png` in every consumer at once: display, search,
+    /// rescue-copy file names, attachment matching.
+    ///
+    /// The plain UTF-8 decode stays as the fast path, since this runs for every
+    /// message in a listing and nearly every block is ASCII or valid UTF-8;
+    /// only a block that produced a replacement character is decoded again
+    /// byte by byte. Both paths decode LF as LF, so the line structure the
+    /// caller splits on next is the same either way.
+    static func headerText(_ bytes: [UInt8]) -> String {
+        let whole = String(decoding: bytes, as: UTF8.self)
+        guard whole.unicodeScalars.contains("\u{FFFD}") else { return whole }
+        return CP1252.decodeUnlabelled(bytes)
     }
 
     /// Split a multipart body into raw part byte-arrays (preamble/epilogue dropped).

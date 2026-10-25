@@ -424,7 +424,7 @@ public final class SearchIndex: @unchecked Sendable {
         }
 
         let sql = """
-        SELECT mailbox, offset, date, subject, body
+        SELECT mailbox, offset, date, subject, body, headers, sender, recipients, attachments
         FROM messages
         WHERE \(whereSQL)
         ORDER BY CAST(epoch AS INTEGER) DESC, rowid ASC
@@ -442,17 +442,96 @@ public final class SearchIndex: @unchecked Sendable {
             pos += 1
         }
 
-        let term = Self.firstTextValue(query.criteria)
+        let focus = Self.firstTextCriterion(query.criteria)
         var hits: [SearchHit] = []
         while stmt.step() {
-            let body = stmt.text(4)
+            let stored = StoredText(body: stmt.text(4), headers: stmt.text(5),
+                                    sender: stmt.text(6), recipients: stmt.text(7),
+                                    attachments: stmt.text(8))
             hits.append(SearchHit(mailbox: stmt.text(0),
                                   offset: stmt.int(1),
                                   date: stmt.text(2),
                                   subject: stmt.text(3),
-                                  snippet: Self.snippet(from: body, around: term)))
+                                  snippet: Self.snippet(for: stored, focus: focus)))
         }
         return hits
+    }
+
+    /// The stored columns a snippet can be drawn from.
+    struct StoredText {
+        let body: String
+        let headers: String
+        let sender: String
+        let recipients: String
+        let attachments: String
+    }
+
+    /// The result row's preview: wherever the match actually is.
+    ///
+    /// It used to come from the body alone, so a hit in a header — or in a
+    /// sender, recipient or attachment name — showed an unrelated body preview
+    /// and nothing to say why the message was found. Now the snippet is taken
+    /// from the first column that holds the term, starting with the one the
+    /// criterion searched: a Headers hit shows its header line even when the
+    /// same word is also in the body. The subject is already its own column in
+    /// the results, so outside a Headers search it needs no snippet of its
+    /// own; a subject-only match falls through to the body preview, as before.
+    ///
+    /// Matching here is case- and diacritic-insensitive, a little looser than
+    /// the `LIKE` that found the row, so it can only find the match, never miss
+    /// one `LIKE` saw. A "does not contain" or "is not" criterion has nothing to
+    /// point at and gets the plain body preview.
+    static func snippet(for stored: StoredText, focus: (target: TextTarget, term: String)?) -> String {
+        guard let focus = focus else { return snippet(from: stored.body, around: nil) }
+        let target = focus.target, term = focus.term
+        let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+
+        func fromBody() -> String? {
+            stored.body.range(of: term, options: options) == nil
+                ? nil : snippet(from: stored.body, around: term)
+        }
+        // Outside a Headers search the Subject line is skipped: the subject has
+        // its own column in the results, and repeating it says nothing new.
+        let skipSubject = target != .headers
+        func fromHeaders() -> String? {
+            for line in stored.headers.split(separator: "\n", omittingEmptySubsequences: true)
+            where line.range(of: term, options: options) != nil {
+                if skipSubject, line.lowercased().hasPrefix("subject:") { continue }
+                return labelled(String(line), around: term)
+            }
+            return nil
+        }
+        func from(_ label: String, _ text: String) -> String? {
+            text.range(of: term, options: options) == nil
+                ? nil : label + ": " + snippet(from: text, around: term)
+        }
+        func fromNames() -> String? {
+            from("From", stored.sender) ?? from("To", stored.recipients)
+                ?? from("Attachment", stored.attachments)
+        }
+
+        let ordered: [() -> String?]
+        switch target {
+        case .headers:    ordered = [fromHeaders, fromNames, fromBody]
+        case .attachment: ordered = [{ from("Attachment", stored.attachments) }, fromBody]
+        default:          ordered = [fromBody, fromHeaders, fromNames]
+        }
+        for candidate in ordered {
+            if let s = candidate() { return s }
+        }
+        return snippet(from: stored.body, around: nil)
+    }
+
+    /// `Name: …window…` — the header's name kept even when the match is far
+    /// into a long value, so the row says which header it was.
+    private static func labelled(_ line: String, around term: String) -> String {
+        guard let colon = line.range(of: ": ") else { return snippet(from: line, around: term) }
+        let name = String(line[..<colon.lowerBound])
+        let value = String(line[colon.upperBound...])
+        guard value.range(of: term, options: [.caseInsensitive, .diacriticInsensitive]) != nil else {
+            return snippet(from: line, around: term)        // the match is in the name itself
+        }
+        return name + ": " + snippet(from: value, around: term)
     }
 
     /// Build one predicate `(...)` and its bindings for a criterion. Returns nil
@@ -502,20 +581,21 @@ public final class SearchIndex: @unchecked Sendable {
         }
     }
 
-    /// The first non-empty text value among the criteria, used to centre the
-    /// generated snippet.
-    private static func firstTextValue(_ criteria: [Criterion]) -> String? {
+    /// The first positive, non-empty text criterion, which decides where the
+    /// snippet is taken from and what it is centred on. Negative operators are
+    /// skipped: a row found by "does not contain X" has no X to show.
+    static func firstTextCriterion(_ criteria: [Criterion]) -> (target: TextTarget, term: String)? {
         for c in criteria {
-            if case .text(_, _, let v) = c {
+            if case .text(let target, let op, let v) = c, op != .doesNotContain, op != .isNot {
                 let t = v.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !t.isEmpty { return t }
+                if !t.isEmpty { return (target, t) }
             }
         }
         return nil
     }
 
     /// A ~160-char body preview, centred on the first match of `term`.
-    private static func snippet(from body: String, around term: String?) -> String {
+    static func snippet(from body: String, around term: String?) -> String {
         let flat = body
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")

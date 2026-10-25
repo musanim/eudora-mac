@@ -27,9 +27,10 @@ enum ContentExtractor {
         // The full header block, so "Headers contains X" can match any header
         // line (From/To/Cc/Subject/Date and every X-* line), not just the few
         // fields we parse out. Values are raw (not RFC-2047 decoded), matching
-        // what's literally on the wire.
+        // what's literally on the wire — except for opaque runs, see
+        // `searchableHeaderValue`.
         let headers = part.headers
-            .map { "\($0.name): \($0.value)" }
+            .map { "\($0.name): \(searchableHeaderValue(name: $0.name, value: $0.value))" }
             .joined(separator: "\n")
 
         var bodyParts: [String] = []
@@ -67,6 +68,72 @@ enum ContentExtractor {
                               headers: headers,
                               body: bodyParts.joined(separator: "\n"),
                               attachments: attachments.joined(separator: " "))
+    }
+
+    /// A header value with its machine-generated blobs replaced by `…`.
+    ///
+    /// Signature and spam-filter headers (DKIM, ARC, IronPort, Microsoft's
+    /// antispam, Gmail's X-Gm-*) carry long runs of base64. A substring search
+    /// over them finds nearly anything by chance: "zzyzx" matched a State
+    /// Department message through the `ZzYzx` inside its `IronPort-Data:` blob,
+    /// a hit nobody could see or would want. A run is opaque when it is at
+    /// least `opaqueRunLength` characters of the base64 alphabet *and* contains
+    /// a digit or a `+` — the last condition because long runs of plain letters
+    /// are sometimes words (a 58-letter Welsh place name in a Subject,
+    /// `donaudampfschifffahrts…` in a Return-Path), while 40 random base64
+    /// characters lack both a digit and a `+` about once in two thousand.
+    ///
+    /// Measured on the live tree, 2026oct25: 203K DKIM-Signature runs,
+    /// 80K X-Google-DKIM-Signature, 47K ARC-Message-Signature, 37K ARC-Seal,
+    /// 35K X-YMail-OSG and so on down; and of the five mailboxes a Headers
+    /// search for "zzyzx" hit, the only one lost was the State Department's.
+    ///
+    /// `exemptHeaders` are left whole: their values are identifiers or paths
+    /// someone might paste into Find on purpose — a Message-ID, or an
+    /// `X-Attachments` path with a digit in it.
+    static func searchableHeaderValue(name: String, value: String) -> String {
+        if exemptHeaders.contains(name.trimmingCharacters(in: .whitespaces).lowercased()) {
+            return value
+        }
+        let scalars = Array(value.unicodeScalars)
+        guard scalars.count >= opaqueRunLength else { return value }
+        var out = String.UnicodeScalarView()
+        var i = 0
+        while i < scalars.count {
+            guard isBase64(scalars[i]) else { out.append(scalars[i]); i += 1; continue }
+            var end = i
+            var telltale = false
+            while end < scalars.count, isBase64(scalars[end]) {
+                let v = scalars[end].value
+                if (0x30...0x39).contains(v) || v == 0x2B { telltale = true }
+                end += 1
+            }
+            var padded = end
+            while padded < scalars.count, scalars[padded] == "=" { padded += 1 }
+            if end - i >= opaqueRunLength, telltale {
+                out.append("\u{2026}")
+                i = padded
+            } else {
+                out.append(contentsOf: scalars[i..<end])
+                i = end
+            }
+        }
+        return String(out)
+    }
+
+    static let opaqueRunLength = 40
+
+    static let exemptHeaders: Set<String> = [
+        "message-id", "in-reply-to", "references", "x-attachments",
+    ]
+
+    /// `A–Z a–z 0–9 + /`. Not base64url's `-` and `_`: hyphenated words are
+    /// real text, and would make "a long slug like this one" a single run.
+    private static func isBase64(_ s: Unicode.Scalar) -> Bool {
+        switch s.value {
+        case 0x41...0x5A, 0x61...0x7A, 0x30...0x39, 0x2B, 0x2F: return true
+        default: return false
+        }
     }
 
     /// Crude but effective tag stripper for indexing HTML-only mail.

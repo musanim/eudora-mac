@@ -18,13 +18,13 @@ import Foundation
 ///
 /// **Everything else is preserved at the byte level.** Not "re-serialized to the
 /// same thing" — the record is spliced, so only the bytes of a replaced entry
-/// change. That matters more than it sounds: header values here are CP1252,
-/// `MIMEParser.parseHeaders` decodes them as UTF-8, and a decode/re-encode round
-/// trip would silently turn every non-ASCII byte in an untouched entry into
-/// `EF BF BD`. Separators, whitespace, folding and line endings survive for the
-/// same reason. (An *inserted* path is written as UTF-8, which is what our own
-/// reader decodes; documented rather than accidental, and it is the only new
-/// non-ASCII this writes.)
+/// change. That matters more than it sounds: header values here are mostly
+/// CP1252 but sometimes UTF-8, so a decode/re-encode would silently rewrite the
+/// non-ASCII bytes of entries nobody asked to touch. Separators, whitespace,
+/// folding and line endings survive for the same reason. (An *inserted* path is
+/// written as UTF-8, so one header line can end up holding both encodings. Our
+/// own reader copes: `CP1252.decodeUnlabelled` decides per byte sequence, not
+/// per line, for exactly this case.)
 ///
 /// **Why this is not a text edit.** `.toc` caches every message's absolute byte
 /// offset and length, so changing a header's length shifts every later record in
@@ -177,15 +177,17 @@ public enum RecordedAttachmentRelink {
 
         /// The location recorded for `name`, or nil.
         ///
-        /// The loose second pass exists because the *header* can be mangled, not
-        /// the list. `MIMEParser.parseHeaders` decodes header bytes as UTF-8
-        /// though Eudora wrote CP1252, so every non-ASCII byte in a filename
-        /// arrives as U+FFFD: `CarterCaténaires.png` reaches us as
-        /// `CarterCat<?>naires.png` and matches nothing. One CP1252 byte becomes
-        /// exactly one replacement character, so it is matched as a
-        /// single-character wildcard — and only against a non-ASCII character,
-        /// since an ASCII byte could never have produced it. (The decode is a
-        /// real bug and affects display too; see `RecordedAttachment`.)
+        /// The loose second pass exists because a *name* can arrive mangled:
+        /// read as UTF-8 though Eudora wrote CP1252, every non-ASCII byte becomes
+        /// U+FFFD, and `CarterCaténaires.png` reaches us as
+        /// `CarterCat<?>naires.png`, matching nothing. `MIMEParser.parseHeaders`
+        /// did exactly that until 2026oct23 and now falls back to CP1252 (see
+        /// `CP1252.decodeUnlabelled`), but `rewrittenRecord` still tries a plain
+        /// UTF-8 reading, and a header can genuinely carry U+FFFD if anything
+        /// ever wrote one back. One CP1252 byte becomes exactly one replacement
+        /// character, so it is matched as a single-character wildcard — and only
+        /// against a non-ASCII character, since an ASCII byte could never have
+        /// produced it.
         public func lookup(_ name: String) -> String? {
             let key = RecordedAttachmentRelink.normalize(name)
             if conflicted.contains(key) { return nil }
@@ -318,10 +320,11 @@ public enum RecordedAttachmentRelink {
             // re-encoded unless it is the one being replaced.
             //
             // CP1252 first, because that is what Eudora wrote and it loses
-            // nothing. The UTF-8 reading is tried second because it is what the
-            // *display* does, so a name recorded in the list from a screen or a
-            // previous UTF-8 pass still matches; the wildcard inside `lookup` is
-            // the last resort for the same reason.
+            // nothing. The UTF-8 reading is tried second for the entries this
+            // app wrote itself (an inserted path is UTF-8) and for a name
+            // recorded in the list from the display before 2026oct23, when the
+            // display read every header as UTF-8; the wildcard inside `lookup`
+            // is the last resort for the same reason.
             let bytes = Array(record[entry.start..<entry.end])
             let viaCP1252 = CP1252.decode(bytes)
             guard !RecordedAttachment.pathRecordsOrigin(viaCP1252) else { continue }

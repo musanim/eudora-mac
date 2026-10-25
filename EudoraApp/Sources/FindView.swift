@@ -37,6 +37,9 @@ struct FindView: View {
     /// Bumped each time the window is opened or brought forward; each new value
     /// asks `FirstFieldFocuser` to put the caret in the first field again.
     @State private var focusRequest = 0
+    /// Bumped each time the window is opened afresh (not merely brought
+    /// forward), asking `ComposeWindowPlacer` to place it again.
+    @State private var placementRequest = 0
 
     /// Posted by every command that opens this window. `onAppear` covers a
     /// window that was closed; this covers ⌘F on one that is already open, where
@@ -77,11 +80,17 @@ struct FindView: View {
         .onAppear {
             initScopeIfNeeded()
             focusRequest += 1
+            placementRequest += 1
         }
         .onReceive(NotificationCenter.default.publisher(for: Self.openRequested)) { _ in
             focusRequest += 1
         }
         .background(FirstFieldFocuser(request: focusRequest))
+        // Opens where a composer would: centred on the primary display, or on
+        // the built-in when the main window is there (night mode). Governed by
+        // the same Settings switch; see `ComposeWindowPlacer`.
+        .background(ComposeWindowPlacer(enabled: model.nightModeComposePlacement,
+                                        cascades: false, request: placementRequest))
         // A rendered message can hold a few MB of embedded images. The window
         // closing is the natural point to let that go — and it means reopening
         // Find shows an empty pane rather than a message from a search two days

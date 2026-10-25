@@ -997,9 +997,10 @@ struct SettingsView: View {
                        isOn: $model.nightModeComposePlacement)
                 Text("Off, a new message window opens wherever macOS last left one \u{2014} "
                         + "the ordinary way, and the right one on a single display. On, "
-                        + "every new message window opens centred: on the built-in display "
-                        + "when the main window is there, and on the primary display "
-                        + "otherwise. A window that is already open is never moved.")
+                        + "every new message window, and the Find window, opens centred: "
+                        + "on the built-in display when the main window is there, and on "
+                        + "the primary display otherwise. A window that is already open "
+                        + "is never moved.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

@@ -71,9 +71,9 @@ final class RecordedAttachmentRelinkTests: XCTestCase {
             record(headerValue: "\(unknown);"), using: locations))
     }
 
-    /// The header reaches us mangled, not the list. `MIMEParser.parseHeaders`
-    /// decodes header bytes as UTF-8 though Eudora wrote CP1252, so every
-    /// non-ASCII byte in a filename arrives as U+FFFD.
+    /// The header carries a name already mangled — a CP1252 byte that went
+    /// through a UTF-8 decode and came back as U+FFFD. `parseHeaders` no longer
+    /// does that itself, but the wildcard still covers names that were.
     func testMangledNameStillMatches() throws {
         let mangled = #"\\Mac\AllFiles\private\var\folders\r_\x\T\Q\CarterCat\#u{FFFD}naires.png"#
         let after = try rewrite(headerValue: "\(mangled);")

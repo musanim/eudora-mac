@@ -46,14 +46,91 @@ public enum CP1252 {
         var scalars = String.UnicodeScalarView()
         scalars.reserveCapacity(bytes.count)
         for byte in bytes {
-            if byte < 0x80 || byte >= 0xA0 {
-                scalars.append(Unicode.Scalar(byte))        // ASCII, and Latin-1 above 0x9F
-            } else if let mapped = c1[Int(byte) - 0x80],
-                      let scalar = Unicode.Scalar(mapped) {
-                scalars.append(scalar)
+            if let single = Self.scalar(forByte: byte) { scalars.append(single) }
+        }
+        return String(scalars)
+    }
+
+    /// One byte's character, or nil for the five undefined positions.
+    static func scalar(forByte byte: UInt8) -> Unicode.Scalar? {
+        if byte < 0x80 || byte >= 0xA0 {
+            return Unicode.Scalar(byte)                     // ASCII, and Latin-1 above 0x9F
+        }
+        return c1[Int(byte) - 0x80].flatMap { Unicode.Scalar($0) }
+    }
+
+    /// Text whose encoding nobody declared: each well-formed UTF-8 sequence as
+    /// UTF-8, every other byte as CP1252.
+    ///
+    /// For raw 8-bit bytes in places with no charset label — header lines, and
+    /// the `Attachment Converted:` lines Eudora writes into bodies. Both
+    /// encodings are genuinely present there, often in the same mailbox: over
+    /// `phaseX`, 5,639 non-ASCII header lines are valid UTF-8 (modern mailers)
+    /// and 3,433 are not (Eudora 7 and older senders writing Windows ANSI —
+    /// `Gra\u{E7}a`, `F\u{FC}lscher`). Decoding everything as UTF-8 turned each
+    /// of the second kind's accented letters into U+FFFD.
+    ///
+    /// **Why per sequence and not per line.** The two encodings share lines.
+    /// `RecordedAttachmentRelink` writes an inserted path as UTF-8 into an
+    /// `X-Attachments` header whose other entries keep Eudora's CP1252 bytes, so
+    /// a whole-line choice would read one of them wrong whichever it picked —
+    /// and the wrong one would be a path `RecordedAttachment` then fails to find.
+    ///
+    /// UTF-8 wins where a sequence is well-formed, because the reverse mistake is
+    /// far likelier: every UTF-8 accent read as CP1252 becomes two characters of
+    /// mojibake, while CP1252 text only forms a valid sequence when an accented
+    /// letter (0xC2–0xF4) is followed by exactly the right number of bytes from
+    /// 0x80–0xBF — C1 punctuation or a Latin-1 symbol such as NBSP, ©, ° or ».
+    /// Real text rarely does that. `CharsetDecoder.smartDecode` makes the same
+    /// choice for bodies, at whole-body grain.
+    ///
+    /// Hand-rolled rather than `String(bytes:encoding:)`, which is all-or-nothing
+    /// and whose acceptance rules are Foundation's rather than the standard's.
+    /// Well-formedness here is Unicode's Table 3-7 exactly: no overlongs, no
+    /// surrogates, nothing above U+10FFFF.
+    public static func decodeUnlabelled<C: Collection>(_ bytes: C) -> String
+        where C.Element == UInt8 {
+        let a = Array(bytes)
+        var scalars = String.UnicodeScalarView()
+        scalars.reserveCapacity(a.count)
+        var i = 0
+        while i < a.count {
+            if let hit = utf8Sequence(a, at: i) {
+                scalars.append(hit.scalar)
+                i += hit.length
+            } else {
+                if let single = Self.scalar(forByte: a[i]) { scalars.append(single) }
+                i += 1
             }
         }
         return String(scalars)
+    }
+
+    /// The well-formed multi-byte UTF-8 sequence starting at `i`, or nil. ASCII
+    /// returns nil too: it decodes the same either way and `scalar(forByte:)`
+    /// takes it.
+    static func utf8Sequence(_ a: [UInt8], at i: Int) -> (scalar: Unicode.Scalar, length: Int)? {
+        let b0 = a[i]
+        let length: Int
+        var lo: UInt8 = 0x80, hi: UInt8 = 0xBF   // allowed range for the second byte
+        switch b0 {
+        case 0xC2...0xDF: length = 2
+        case 0xE0:        length = 3; lo = 0xA0
+        case 0xE1...0xEC, 0xEE...0xEF: length = 3
+        case 0xED:        length = 3; hi = 0x9F
+        case 0xF0:        length = 4; lo = 0x90
+        case 0xF1...0xF3: length = 4
+        case 0xF4:        length = 4; hi = 0x8F
+        default:          return nil
+        }
+        guard i + length <= a.count else { return nil }
+        guard (lo...hi).contains(a[i + 1]) else { return nil }
+        for k in 2..<length where !(0x80...0xBF).contains(a[i + k]) { return nil }
+
+        var value = UInt32(b0) & (length == 2 ? 0x1F : length == 3 ? 0x0F : 0x07)
+        for k in 1..<length { value = (value << 6) | (UInt32(a[i + k]) & 0x3F) }
+        guard let decoded = Unicode.Scalar(value) else { return nil }
+        return (decoded, length)
     }
 
     /// Encode, degrading gracefully rather than reaching for `?` at the first
