@@ -4667,6 +4667,74 @@ final class AppModel: ObservableObject {
         beginCompose(draft)
     }
 
+    // MARK: report fraud
+
+    /// The kinds of fraud the message with this id is recognizably an instance
+    /// of. For the Report Fraud submenu; see `FraudRecognizer`.
+    ///
+    /// Reads at most the first 64 KB of the record: the question is answered by
+    /// headers alone, and the menu must not read a 20 MB attachment to open. A
+    /// header block longer than that simply recognizes nothing, and every kind
+    /// is still on the menu.
+    func recognizedFraud(messageID id: MessageRow.ID) -> Set<FraudKind> {
+        guard let raw = rawRecord(id, limit: 64 * 1024) else { return [] }
+        return FraudRecognizer.recognize(MIMEParser.parse([UInt8](Self.headerBlock(raw))), me: me)
+    }
+
+    /// Open a composer holding a report of this message as `kind` of fraud: the
+    /// original attached exactly as Forward as Attachment attaches it, and the
+    /// recipients, subject and body from `FraudRecognizer.report`.
+    ///
+    /// **A composer, not an automatic send**, for the first version: the report
+    /// goes to a government desk and, for some kinds, to the scammer, so Stephen
+    /// sees it before it goes. It is one click from here to sent.
+    func reportFraud(_ kind: FraudKind, messageID id: MessageRow.ID) {
+        guard let raw = rawRecord(id, limit: nil) else {
+            showError("Couldn't read that message from the mailbox.")
+            return
+        }
+        let part = MIMEParser.parse([UInt8](Self.headerBlock(raw)))
+        let subject = HeaderDecoder.decode(part.header("Subject") ?? "")
+        let report = FraudRecognizer.report(kind, for: part, me: me)
+        var draft = ComposeDraft(to: report.to.joined(separator: ", "),
+                                 subject: report.subject,
+                                 body: report.body)
+        // `application/octet-stream` with a `.eml` name, for the reasons spelled
+        // out in `forwardAsAttachment` — abuse desks parse these by script.
+        draft.attachments = [OutgoingMessage.Attachment(
+            filename: Self.emlFilename(for: subject),
+            mimeType: "application/octet-stream",
+            data: raw)]
+        beginCompose(draft)
+    }
+
+    /// The raw record of the message with this id in the current mailbox, or
+    /// its first `limit` bytes. One seek and one bounded read, as in
+    /// `forwardAsAttachment`.
+    private func rawRecord(_ id: MessageRow.ID, limit: Int?) -> Data? {
+        guard let store, let sel = currentSelectionSet(),
+              let row = rows.first(where: { $0.id == id }) else { return nil }
+        let length = limit.map { min($0, row.size) } ?? row.size
+        return store.rawMessage(at: sel.item.base, offset: row.offset, length: length)
+    }
+
+    /// The header block of a raw message, through the blank line that ends it,
+    /// so only headers are parsed. The whole of `raw` if there is no blank line.
+    private static func headerBlock(_ raw: Data) -> Data {
+        let bytes = [UInt8](raw)
+        var i = 0
+        while i + 1 < bytes.count {
+            if bytes[i] == 0x0A {
+                if bytes[i + 1] == 0x0A { return Data(bytes[...(i + 1)]) }
+                if bytes[i + 1] == 0x0D, i + 2 < bytes.count, bytes[i + 2] == 0x0A {
+                    return Data(bytes[...(i + 2)])
+                }
+            }
+            i += 1
+        }
+        return raw
+    }
+
     /// A filename not already used by another attachment on this draft.
     ///
     /// Needed because the names come from *subjects*, and the messages worth

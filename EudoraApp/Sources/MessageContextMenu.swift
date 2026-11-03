@@ -175,6 +175,9 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
     /// with nothing else holding it fills nothing.
     private var senderBuilder: SenderMailboxesBuilder?
 
+    /// Retained for the same reason again.
+    private var fraudBuilder: FraudMenuBuilder?
+
     /// Prints where the menu was asked to appear, for when it doesn't.
     ///
     /// Off, intact, in the manner of the other diagnostics here. It exists
@@ -390,6 +393,7 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         menu.removeAllItems()
         moveBuilders.removeAll()
         senderBuilder = nil
+        fraudBuilder = nil
 
         if let clicked = resolveClickedID() {
             // Inside the current multi-selection → the menu acts on all of it;
@@ -531,6 +535,31 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         // becomes its own attachment on one new mail.
         add(n == 1 ? "Forward as Attachment" : "Forward \(n) as Attachments",
             #selector(forwardAsAttachment), enabled: n >= 1)
+        // Report Fraud: a forward-as-attachment with the destination, subject
+        // and body already chosen for the kind of fraud. It opens a composer
+        // rather than sending, so it lives with Forward and not below the gap —
+        // nothing leaves until Send is clicked.
+        //
+        // A single *received* message only, for the reason "Open sender's
+        // mailbox" gives: on mail Stephen wrote, the "sender" is him.
+        //
+        // Lazy, so recognizing the fraud — a bounded read of the message's
+        // headers — happens only when the submenu opens, not on every
+        // right-click.
+        if n == 1, let id = clickedPrimary, !model.isOutgoingMessage(id) {
+            let report = NSMenuItem(title: "Report Fraud", action: nil, keyEquivalent: "")
+            let kinds = NSMenu(title: "Report Fraud")
+            kinds.autoenablesItems = false
+            let builder = FraudMenuBuilder(
+                // A pure read, like the other lazy submenus' closures.
+                recognized: { [weak self] in self?.model.recognizedFraud(messageID: id) ?? [] },
+                onPick: { [weak self] kind in self?.model.reportFraud(kind, messageID: id) })
+            kinds.delegate = builder
+            fraudBuilder = builder
+            report.submenu = kinds
+            report.isEnabled = true
+            menu.addItem(report)
+        }
         // "Send Again" only for a single, successfully-sent message: it opens a
         // fresh editable copy (see `AppModel.sendAgain`). Shown only when it
         // applies rather than greyed out, since it's meaningless on received or
@@ -781,6 +810,50 @@ final class SenderMailboxesBuilder: NSObject, NSMenuDelegate {
     @objc private func pick(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? MailboxItem.ID else { return }
         onPick(id)
+    }
+}
+
+/// Fills Report Fraud when it opens: every kind Eudora can report, the ones this
+/// message is recognizably an instance of first, marked.
+///
+/// Every kind is offered whether recognized or not — recognition is a
+/// suggestion, and naming the kind by hand is the other half of the design.
+@MainActor
+final class FraudMenuBuilder: NSObject, NSMenuDelegate {
+    private let recognized: () -> Set<FraudKind>
+    private let onPick: (FraudKind) -> Void
+
+    init(recognized: @escaping () -> Set<FraudKind>,
+         onPick: @escaping (FraudKind) -> Void) {
+        self.recognized = recognized
+        self.onPick = onPick
+        super.init()
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let found = recognized()
+        // Recognized first, then the rest, each group in declaration order.
+        let ordered = FraudKind.allCases.filter { found.contains($0) }
+            + FraudKind.allCases.filter { !found.contains($0) }
+        for kind in ordered {
+            let title = found.contains(kind) ? "\(kind.menuTitle)  (looks like this)" : kind.menuTitle
+            let entry = NSMenuItem(title: title, action: #selector(pick(_:)), keyEquivalent: "")
+            entry.target = self
+            entry.isEnabled = true
+            entry.representedObject = kind.rawValue
+            menu.addItem(entry)
+            if found.contains(kind), kind == ordered.last(where: { found.contains($0) }),
+               ordered.count > found.count {
+                menu.addItem(.separator())
+            }
+        }
+    }
+
+    @objc private func pick(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let kind = FraudKind(rawValue: raw) else { return }
+        onPick(kind)
     }
 }
 
