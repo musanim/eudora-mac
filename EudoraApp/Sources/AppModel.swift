@@ -303,6 +303,12 @@ struct ComposeDraft: Identifiable {
     }
     var replyOrigin: ReplyOrigin? = nil
 
+    /// The message a fraud report is about, so that once the report is actually
+    /// sent, it and the report are both filed in SCAMS (Stephen's, 2026nov03).
+    /// Same shape, same offset-is-a-hint rule and same in-memory-only caveat as
+    /// `replyOrigin`. Set only by `reportFraud`.
+    var fraudOrigin: ReplyOrigin? = nil
+
     /// Byte offset of this draft's record in Out.
     ///
     /// An offset rather than an index, for the reason `ViewState` gives about
@@ -3575,23 +3581,34 @@ final class AppModel: ObservableObject {
     /// Replaces rather than appends. `recordSent` used to append, which was
     /// right when a draft had no record of its own — now it would leave the
     /// unsent original sitting in Out beside its own sent copy.
-    func recordSent(_ draft: ComposeDraft, raw: Data, who: String, subject: String) throws {
-        guard let outbox = outboxBase else { return }
+    ///
+    /// - Returns: what the send's banner should say instead of "Message sent.",
+    ///   or nil for that. Returned rather than shown, because the caller shows
+    ///   its own banner straight after and would overwrite this one.
+    @discardableResult
+    func recordSent(_ draft: ComposeDraft, raw: Data, who: String, subject: String) throws -> String? {
+        guard let outbox = outboxBase else { return nil }
+        let sentOffset: Int
         if let index = locateDraft(draft, in: outbox) {
             let result = try MailboxMutator.replace(base: outbox, index: index,
                                                     messageData: raw,
                                                     status: MailboxMutator.statusSent,
                                                     who: who, subject: subject)
             shiftDraftOffsets(after: result.offset, by: result.delta, except: draft.id)
+            sentOffset = result.offset
         } else {
             // No record to update — the pre-save failed, or something outside
             // the app removed it. Appending is the honest fallback: better a
             // sent message recorded in the wrong position than one delivered
             // and never recorded at all.
-            _ = try Outbox.append(messageData: raw, to: outbox,
-                                  status: MailboxMutator.statusSent,
-                                  who: who, subject: subject)
+            sentOffset = try Outbox.append(messageData: raw, to: outbox,
+                                           status: MailboxMutator.statusSent,
+                                           who: who, subject: subject).messageOffset
         }
+        // A sent fraud report leaves Out for SCAMS before Out is re-listed, so
+        // the listing shows the result once rather than twice.
+        let reportFiled = draft.fraudOrigin != nil
+            && fileSentReport(at: sentOffset, in: outbox)
         refreshOutIfShowing()
         // After the Out record is safely written, never before: the reply going
         // out is the fact worth recording, and the mark on the original is a
@@ -3599,6 +3616,140 @@ final class AppModel: ObservableObject {
         // same reason — an error dialog immediately after a successful send
         // reads as "your message didn't go", which would be false.
         if let origin = draft.replyOrigin { markRepliedTo(origin) }
+        guard let origin = draft.fraudOrigin else { return nil }
+        let filed = fileFraudOriginal(origin, reportFiled: reportFiled)
+        refreshAfterFraudFiling(movedFrom: filed.movedFrom,
+                                scamsChanged: reportFiled || filed.movedFrom != nil)
+        return filed.notice
+    }
+
+    // MARK: filing a sent fraud report
+
+    /// The SCAMS mailbox, if this tree has one: by id first (a top-level
+    /// `SCAMS.mbx`), then by display name at the top level.
+    private func scamsMailbox() -> MailboxItem? {
+        if let item = itemsByID["SCAMS"], !item.isFolder { return item }
+        return visibleTree.first {
+            !$0.isFolder && $0.display.caseInsensitiveCompare("SCAMS") == .orderedSame
+        }
+    }
+
+    /// Move a just-sent report's record from Out to SCAMS. Returns whether it
+    /// moved.
+    ///
+    /// Addressed by the offset `recordSent` just wrote, which is exact — nothing
+    /// can have happened to Out in between — so no Message-ID check. (The sent
+    /// bytes carry a fresh Message-ID anyway; `SMTPClient.send` mints one, so
+    /// the draft's would not find it.) Removing a record from Out slides every
+    /// later one, so the open drafts are told, as `discardDraft` tells them.
+    private func fileSentReport(at offset: Int, in outbox: URL) -> Bool {
+        guard let scams = scamsMailbox(),
+              let data = try? Data(contentsOf: outbox.appendingPathExtension("mbx")) else {
+            return false
+        }
+        let recs = Mbox.findRecords([UInt8](data))
+        guard let i = recs.firstIndex(where: { $0.offset == offset }) else { return false }
+        do {
+            try MailboxMutator.move(from: outbox, index: i + 1, to: scams.base)
+            shiftDraftOffsets(after: offset, by: -recs[i].length, except: nil)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Move the message a sent fraud report was about into SCAMS.
+    ///
+    /// Confirmed by Message-ID before anything moves, exactly as
+    /// `markRepliedTo` confirms before it writes: the report may have sat in
+    /// its window long enough for the offset to name some other message.
+    ///
+    /// **Moved directly, never through `moveSelected`**, even when the message
+    /// is on screen. That path is for a person filing: it would add SCAMS to
+    /// Recents, and — since a scammer is almost always unknown to the index —
+    /// count the filing as unfamiliar and start a full search-index rebuild.
+    /// Neither fits a move nobody asked to learn from. The screen is brought up
+    /// to date afterwards by `refreshAfterFraudFiling`.
+    ///
+    /// - Returns: the banner text, and the mailbox the original left (nil if it
+    ///   didn't move). Every outcome is a banner, not an error dialog — the
+    ///   report *was* sent, and a dialog straight after Send reads as "your
+    ///   message didn't go".
+    private func fileFraudOriginal(_ origin: ComposeDraft.ReplyOrigin,
+                                   reportFiled: Bool) -> (notice: String, movedFrom: MailboxItem.ID?) {
+        let reportNote = reportFiled ? "" : " The report itself is still in Out."
+        guard let scams = scamsMailbox() else {
+            return ("Report sent. There's no SCAMS mailbox, so nothing was filed.", nil)
+        }
+        guard origin.mailboxID != scams.id else {
+            return (reportFiled ? "Report sent and filed in SCAMS; the original was already there."
+                                : "Report sent; the original was already in SCAMS." + reportNote, nil)
+        }
+        let moved = "Report sent, but the original has moved; it was left where it is." + reportNote
+        guard let store,
+              let item = itemsByID[origin.mailboxID], !item.isFolder,
+              let wanted = MessageIDIndex.normalized(origin.messageID) else {
+            return (moved, nil)
+        }
+        let offset: Int
+        if let msg = store.message(at: item.base, offset: origin.offset),
+           MessageIDIndex.normalized(msg.part.header("Message-ID") ?? "") == wanted {
+            offset = origin.offset
+        } else if let found = MessageIDIndex.offset(of: origin.messageID, in: item.base) {
+            offset = found
+        } else {
+            return (moved, nil)
+        }
+        guard let index = store.indexOfRecord(at: item.base, offset: offset) else {
+            return (moved, nil)
+        }
+        do {
+            try MailboxMutator.move(from: item.base, index: index, to: scams.base)
+        } catch {
+            return ("Report sent, but the original couldn't be moved to SCAMS: "
+                    + describe(error) + reportNote, nil)
+        }
+        return (reportFiled ? "Report sent; it and the original are filed in SCAMS."
+                            : "Report sent; the original is filed in SCAMS." + reportNote,
+                origin.mailboxID)
+    }
+
+    /// Bring the screen up to date after fraud filing changed mailboxes behind
+    /// its back.
+    ///
+    /// **The original's mailbox, if it is on screen, is re-listed outright** —
+    /// and even with a removal veil up. Its rows name messages by index, and
+    /// every index after the one removed has just shifted; a veil's in-flight
+    /// read may have started before the move and would install that stale
+    /// picture, after which a click acts on the neighbouring message. A fresh
+    /// listing is built to take over from a veil (see `loadListing`). The
+    /// selection goes with it, which is the honest cost.
+    ///
+    /// **SCAMS, if it is on screen, is refreshed in place**: an append
+    /// renumbers nothing, so the delivery path keeps the reader's place and
+    /// selection. Skipped under a veil, where the worst case is the new rows
+    /// appearing the next time it is opened.
+    ///
+    /// Out has already been handled by `refreshOutIfShowing` in `recordSent`.
+    ///
+    /// Not while SCAMS's own listing is still loading: refreshing would cancel
+    /// it and lose its pending selection and scroll restore. If that listing
+    /// read the file before the append, the new rows show next time — an append
+    /// renumbers nothing, so nothing on screen is wrong meanwhile.
+    ///
+    /// The in-place refresh walks the tree itself once its rows land, so the
+    /// tree is reloaded here only on the other paths.
+    private func refreshAfterFraudFiling(movedFrom: MailboxItem.ID?, scamsChanged: Bool) {
+        if let movedFrom, listedMailboxID == movedFrom, selectedMailboxID == movedFrom {
+            reloadTree()
+            loadListing(force: true)
+        } else if scamsChanged, let scams = scamsMailbox(),
+                  listedMailboxID == scams.id, selectedMailboxID == scams.id,
+                  removalVeil == nil, !isListing {
+            refreshInPlaceAfterDelivery()
+        } else {
+            reloadTree()
+        }
     }
 
     /// Mark the message a just-delivered reply was answering as `MS_REPLIED`, so
@@ -4688,6 +4839,10 @@ final class AppModel: ObservableObject {
     /// **A composer, not an automatic send**, for the first version: the report
     /// goes to a government desk and, for some kinds, to the scammer, so Stephen
     /// sees it before it goes. It is one click from here to sent.
+    ///
+    /// **Sending it files both in SCAMS** — the report out of Out and the
+    /// original out of wherever it is (`fileSentReport`, `fileFraudOriginal`,
+    /// called from `recordSent`). Closing the window unsent files nothing.
     func reportFraud(_ kind: FraudKind, messageID id: MessageRow.ID) {
         guard let raw = rawRecord(id, limit: nil) else {
             showError("Couldn't read that message from the mailbox.")
@@ -4699,6 +4854,16 @@ final class AppModel: ObservableObject {
         var draft = ComposeDraft(to: report.to.joined(separator: ", "),
                                  subject: report.subject,
                                  body: report.body)
+        // Remembered now, acted on at send — see `fraudOrigin`. Without a
+        // Message-ID there is no way to confirm at send time which message the
+        // offset names, so such a report is sent but files nothing.
+        if let mailboxID = listedMailboxID,
+           let row = rows.first(where: { $0.id == id }),
+           let messageID = part.header("Message-ID")?.trimmingCharacters(in: .whitespaces),
+           !messageID.isEmpty {
+            draft.fraudOrigin = .init(mailboxID: mailboxID, messageID: messageID,
+                                      offset: row.offset)
+        }
         // `application/octet-stream` with a `.eml` name, for the reasons spelled
         // out in `forwardAsAttachment` — abuse desks parse these by script.
         draft.attachments = [OutgoingMessage.Attachment(

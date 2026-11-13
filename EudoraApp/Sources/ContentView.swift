@@ -5044,9 +5044,12 @@ struct PreviewView: View {
             // Capped so a very long subject can't grow the chrome past what
             // `HeaderPaneLayout.reservedForTheRest` allows for it, which would
             // push the drag handle off the bottom of the pane.
+            //
+            // Selectable like the From/To/Date lines below, so it can be copied.
             Text(p.subject.isEmpty ? "(no subject)" : p.subject)
                 .font(.headline)
                 .lineLimit(2)
+                .textSelection(.enabled)
             if model.showAllHeaders {
                 // Branching on the toggle alone, not on the text being non-empty:
                 // if the re-read failed, the panel has to say so. Falling back to

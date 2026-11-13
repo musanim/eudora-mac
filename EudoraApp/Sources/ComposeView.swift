@@ -708,11 +708,13 @@ struct ComposeView: View {
                 // Rewrites the draft's own record as sent rather than appending
                 // a second copy — otherwise the unsent original would sit in Out
                 // next to it forever.
-                try model.recordSent(currentDraft(), raw: sent.raw,
-                                     who: toList.first ?? "", subject: subject)
+                // A fraud report says what was filed instead — see
+                // `AppModel.recordSent`.
+                let notice = try model.recordSent(currentDraft(), raw: sent.raw,
+                                                  who: toList.first ?? "", subject: subject)
                 // Feed the To addresses into the auto-fill history (To only).
                 model.recordSentRecipients(toList)
-                model.showBanner("Message sent.")
+                model.showBanner(notice ?? "Message sent.")
                 sending = false
                 // Not `requestClose()`: `wasSent` was set moments ago and the
                 // guard's closure won't have been refreshed yet, so it would
