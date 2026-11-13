@@ -3625,12 +3625,15 @@ final class AppModel: ObservableObject {
 
     // MARK: filing a sent fraud report
 
-    /// The SCAMS mailbox, if this tree has one: by id first (a top-level
-    /// `SCAMS.mbx`), then by display name at the top level.
-    private func scamsMailbox() -> MailboxItem? {
-        if let item = itemsByID["SCAMS"], !item.isFolder { return item }
+    /// The SCAMS mailbox, if this tree has one.
+    private func scamsMailbox() -> MailboxItem? { topLevelMailbox(named: "SCAMS") }
+
+    /// A top-level mailbox by name: by id first (a top-level `NAME.mbx`), then
+    /// by display name at the top level.
+    private func topLevelMailbox(named name: String) -> MailboxItem? {
+        if let item = itemsByID[name], !item.isFolder { return item }
         return visibleTree.first {
-            !$0.isFolder && $0.display.caseInsensitiveCompare("SCAMS") == .orderedSame
+            !$0.isFolder && $0.display.caseInsensitiveCompare(name) == .orderedSame
         }
     }
 
@@ -4212,7 +4215,9 @@ final class AppModel: ObservableObject {
     /// and stop it matching anything.
     private func indexCandidates(referencing messageID: String)
         -> [(mailboxID: MailboxItem.ID, offset: Int)] {
-        guard let searchIndex else { return [] }
+        // Not while a Find holds the index's one connection on another thread;
+        // see `filingCounts`. View Response then finds only replies still in Out.
+        guard !isSearching, let searchIndex else { return [] }
         // The id reduced to the words FTS5 actually stored. Anything that isn't
         // a letter or digit is a token separator to `unicode61`, so `<` and `>`
         // and the `@` and the dots all vanish and the id becomes a phrase. Quoted,
@@ -6769,6 +6774,17 @@ final class AppModel: ObservableObject {
         /// directly while it is still forwarding into musanim — and a silent
         /// guard would hide exactly the misconfiguration the user needs to see.
         var duplicates = 0
+        /// Messages delivered to HOLDING instead of In — see `holdingDecision`.
+        /// Counted apart from `received` and reported nowhere, by Stephen's
+        /// choice: they must not light the glyph, refresh In or raise a notice.
+        /// HOLDING's own count going up is the only sign.
+        var held = 0
+        /// Duplicates met on the HOLDING path. Apart from `duplicates` because
+        /// those are reported, and anything about held mail must not be.
+        var heldDuplicates = 0
+        /// In's and Out's correspondents, read once on the first watched-domain
+        /// message of this check and reused — see `LocalCorrespondents`.
+        var local = LocalCorrespondents()
         /// One entry per account that failed, as "user@host: reason". Collected
         /// rather than thrown so the accounts after it are still collected.
         var failures: [String] = []
@@ -6806,6 +6822,11 @@ final class AppModel: ObservableObject {
                 // touches no disk. The scan is cheap next to the delivery it
                 // guards — see `MessageIDIndex.init(scanning:)`.
                 var seen = fetched.isEmpty ? MessageIDIndex() : MessageIDIndex(scanning: inbox)
+                // HOLDING's own duplicate guard, built only if something is held.
+                // Separate from `seen` because `deliverIfNew` requires the index
+                // to describe the mailbox being delivered into — see its
+                // precondition.
+                var holdSeen: MessageIDIndex? = nil
                 // On the way out of this scope by *any* route, including the
                 // throw from `deliverIfNew` below. Whatever was written to
                 // disk is recorded as downloaded, so a failure partway through a
@@ -6826,13 +6847,46 @@ final class AppModel: ObservableObject {
                     // glyph wouldn't light for mail that had genuinely arrived.
                     // A duplicate counts towards `duplicates`, never `received`:
                     // nothing was written, so there is nothing to refresh to.
-                    switch try Delivery.deliverIfNew(messageData: msg.raw, to: inbox,
-                                                     seen: &seen) {
-                    case .delivered:
-                        received += 1
-                        deliveredUIDs.append(msg.uid)
-                    case .duplicate:
-                        duplicates += 1
+                    switch holdingDecision(for: msg.raw, inbox: inbox, local: &local) {
+                    case .hold(let holding):
+                        // Already in In (the same message through another
+                        // account, or a check that couldn't decide) — nothing to
+                        // write, and nothing said.
+                        if let id = MessageIDIndex.messageID(of: msg.raw), seen.contains(id) {
+                            heldDuplicates += 1
+                        } else {
+                            if holdSeen == nil { holdSeen = MessageIDIndex(scanning: holding) }
+                            switch try Delivery.deliverIfNew(messageData: msg.raw, to: holding,
+                                                             seen: &holdSeen!) {
+                            case .delivered:
+                                held += 1
+                                deliveredUIDs.append(msg.uid)
+                            case .duplicate:
+                                heldDuplicates += 1
+                            }
+                        }
+                    case .inbox(let holding):
+                        // A watched-domain message going to In after all (known
+                        // sender, or couldn't tell) must not duplicate a copy
+                        // already held. Safe to discard: the copy in HOLDING is
+                        // the message.
+                        var alreadyHeld = false
+                        if let holding, let id = MessageIDIndex.messageID(of: msg.raw) {
+                            if holdSeen == nil { holdSeen = MessageIDIndex(scanning: holding) }
+                            alreadyHeld = holdSeen!.contains(id)
+                        }
+                        if alreadyHeld {
+                            heldDuplicates += 1
+                        } else {
+                            switch try Delivery.deliverIfNew(messageData: msg.raw, to: inbox,
+                                                             seen: &seen) {
+                            case .delivered:
+                                received += 1
+                                deliveredUIDs.append(msg.uid)
+                            case .duplicate:
+                                duplicates += 1
+                            }
+                        }
                     }
                     newKnown.insert(msg.uid)
                     handled.append(msg.uid)
@@ -6871,8 +6925,19 @@ final class AppModel: ObservableObject {
         // glyph. This guard *is* the fix for "the In box repaints on every
         // check" — the reload and the re-list below used to run unconditionally,
         // so a check that found nothing still blanked the list and drew it
-        // again. A quiet automatic check must be invisible.
-        if received > 0 {
+        // again. A quiet automatic check must be invisible. (Neither branch
+        // below runs when nothing was received or held.)
+        //
+        // HOLDING on screen and something held: fold it in, whatever else
+        // arrived. Checked first because the In branch below would otherwise
+        // only walk the tree when In isn't the one showing.
+        let holdingShown = held > 0
+            && topLevelMailbox(named: "HOLDING").map {
+                selectedMailboxID == $0.id && listedMailboxID == $0.id } == true
+            && removalVeil == nil && !isListing
+        if holdingShown {
+            refreshInPlaceAfterDelivery()       // walks the tree too
+        } else if received > 0 {
             if let id = selectedMailboxID, itemsByID[id]?.type == .inbox {
                 // In is on screen: fold the new mail into the list already
                 // showing, without blanking it or moving it. (Reloads the tree
@@ -6911,7 +6976,14 @@ final class AppModel: ObservableObject {
             // value now drives both the glyph and the weight.
         }
 
-        report(received: received, duplicates: duplicates, failures: failures,
+        // Held mail only, HOLDING not on screen: bring its count up to date and
+        // nothing else.
+        if received == 0, held > 0, !holdingShown { reloadTree() }
+        if Self.diagnoseHolding, heldDuplicates > 0 {
+            eudoraDiag("[holding] \(heldDuplicates) duplicate(s) of held mail ignored")
+        }
+
+        report(received: received, duplicates: duplicates, held: held, failures: failures,
                accountCount: ready.count,
                skipped: accounts.partiallyConfigured.count, automatic: automatic)
     }
@@ -6937,7 +7009,105 @@ final class AppModel: ObservableObject {
     ///   cut-over that is a misconfiguration to be seen and fixed rather than
     ///   quietly absorbed. A silent guard would let a wrongly-sequenced
     ///   cut-over look like everything was fine.
-    private func report(received: Int, duplicates: Int, failures: [String],
+    // MARK: holding unknown senders at watched domains
+
+    /// Domains where mail from a sender Stephen has never dealt with goes to
+    /// HOLDING instead of In. See `HoldingRule`.
+    ///
+    /// A constant, like the blacklist domains: a fact about where his spam comes
+    /// from, added to case by case. libero.it (2026nov13): a run of
+    /// "Helena"/"Marvis" mail, a new libero.it address every time, from a
+    /// domain several real correspondents also use.
+    static let holdingWatchedDomains: Set<String> = ["libero.it"]
+
+    /// Where one arriving message goes. `.inbox` carries HOLDING's base when
+    /// the sender was at a watched domain, so the caller can check HOLDING for
+    /// an existing copy; nil otherwise.
+    enum HoldingDecision { case hold(URL); case inbox(URL?) }
+
+    /// In's and Out's correspondents for one check, read on first use.
+    ///
+    /// Lazily, because almost no check has a watched-domain message in it and
+    /// those must touch no extra disk. Once, because a batch can hold several
+    /// and each read covers the whole of both mailboxes. Nil inside means
+    /// "couldn't be read" — `isKnownCorrespondent` then can't tell.
+    struct LocalCorrespondents {
+        private var loaded = false
+        private var addresses: Set<String>?
+
+        mutating func get(inbox: URL, outbox: URL?) -> Set<String>? {
+            if !loaded {
+                loaded = true
+                if let outbox,
+                   let a = HoldingRule.correspondents(inMailboxAt: inbox),
+                   let b = HoldingRule.correspondents(inMailboxAt: outbox) {
+                    addresses = a.union(b)
+                }
+            }
+            return addresses
+        }
+    }
+
+    /// Where this arriving message should go. HOLDING only when all of it
+    /// holds: the tree has a top-level HOLDING mailbox, the sender is at a
+    /// watched domain, and the sender is known *not* to be someone Stephen has
+    /// dealt with. "Couldn't tell" is In.
+    private func holdingDecision(for raw: Data, inbox: URL,
+                                 local: inout LocalCorrespondents) -> HoldingDecision {
+        guard let holding = topLevelMailbox(named: "HOLDING") else { return .inbox(nil) }
+        let part = MIMEParser.parse([UInt8](Self.headerBlock(raw)))
+        guard let sender = HoldingRule.watchedSender(fromHeader: part.header("From") ?? "",
+                                                     watchedDomains: Self.holdingWatchedDomains)
+        else { return .inbox(nil) }
+        let known = isKnownCorrespondent(sender, inbox: inbox, holdingID: holding.id, local: &local)
+        if Self.diagnoseHolding {
+            eudoraDiag("[holding] \(sender): known=\(known.map { $0 ? "yes" : "no" } ?? "can't tell")")
+        }
+        return known == false ? .hold(holding.base) : .inbox(holding.base)
+    }
+
+    /// One line per watched-domain arrival in the diagnostics log, saying what
+    /// was decided. On while the rule is new, so a held real person can be
+    /// explained from the log rather than guessed at; turn off once trusted.
+    static let diagnoseHolding = true
+
+    /// Whether Stephen has dealt with this address: true, false, or nil when it
+    /// can't be told.
+    ///
+    /// Cheapest first. Someone he has written to (the auto-fill history); then
+    /// anyone named in In or Out, which the index is least likely to know about
+    /// yet; then the search index, for everywhere else, ignoring hits in SCAMS
+    /// and HOLDING (see `HoldingRule.keptAnywhere`).
+    ///
+    /// **nil when a source that should answer can't** — In or Out unreadable,
+    /// no index, a Find holding its connection, or a query error. The caller
+    /// delivers to In then: a spam message in In is the failure the user already
+    /// has, while a real person held unseen is the failure this must not add.
+    ///
+    /// **One known gap, accepted:** mail deleted unanswered from In is in Trash,
+    /// which only the index covers, and the index learns of it at the next
+    /// rebuild. A real correspondent whose only message was deleted that way,
+    /// writing again before then, is held. Scanning Trash directly would close
+    /// it, at the price of reading a mailbox that runs to hundreds of megabytes
+    /// on every such check.
+    private func isKnownCorrespondent(_ address: String, inbox: URL, holdingID: MailboxItem.ID,
+                                      local: inout LocalCorrespondents) -> Bool? {
+        if recentRecipients.entries.contains(where: { EmailAddress.bareAddress($0) == address }) {
+            return true
+        }
+        guard let nearby = local.get(inbox: inbox, outbox: outboxBase) else { return nil }
+        if nearby.contains(address) { return true }
+
+        guard !isSearching, let index = searchIndex,
+              let counts = try? index.mailboxesFiledInto(addresses: [address]) else { return nil }
+        var unwanted: Set<String> = [holdingID]
+        if let scams = scamsMailbox() { unwanted.insert(scams.id) }
+        return HoldingRule.keptAnywhere(counts.map(\.mailbox), excluding: unwanted)
+    }
+
+    /// `held` is used for one thing only: deciding whether the check *failed*.
+    /// It is never shown — held mail is silent by Stephen's choice.
+    private func report(received: Int, duplicates: Int, held: Int = 0, failures: [String],
                         accountCount: Int, skipped: Int, automatic: Bool) {
         if automatic && received == 0 && duplicates == 0 { return }
 
@@ -6961,7 +7131,7 @@ final class AppModel: ObservableObject {
         // `duplicates == 0` as well: a check that fetched mail, recognised it as
         // already held and then tripped over a failing delete pass did not fail
         // to check mail. It did its job and hit a snag afterwards.
-        let summary = received == 0 && duplicates == 0 && failures.count == accountCount
+        let summary = received == 0 && duplicates == 0 && held == 0 && failures.count == accountCount
             ? "Check mail failed"
             : "\(mail) · \(failures.count) of \(accountCount) "
               + "account\(accountCount == 1 ? "" : "s") failed"
@@ -6970,7 +7140,7 @@ final class AppModel: ObservableObject {
             // Headed to match the notice. Opening "Check mail failed:" when the
             // notice says "Received 3 messages · 1 of 2 accounts failed" is the
             // same contradiction the summary above exists to avoid.
-            let heading = received == 0 && failures.count == accountCount
+            let heading = received == 0 && held == 0 && failures.count == accountCount
                 ? "Check mail failed:"
                 : "Check mail: \(failures.count) of \(accountCount) "
                   + "account\(accountCount == 1 ? "" : "s") failed:"
