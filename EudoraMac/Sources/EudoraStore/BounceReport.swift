@@ -30,13 +30,57 @@ public enum BounceReport {
         /// Whether the failure says the address no longer works — as opposed to
         /// a full mailbox, a spam rejection or a relay refusal. See `addressIsGone`.
         public let addressIsGone: Bool
+        /// `Final-Recipient`, when the report also gives an `Original-Recipient`
+        /// that differs: the address was forwarded (an alumni forwarder, an old
+        /// ISP account) or expanded (an alias), and this is where it failed.
+        /// `address` stays the one Stephen sent to, which is what the composer
+        /// must recognise; this is shown beside it so a working alias with one
+        /// dead target can be told from a dead address.
+        public let forwardedTo: String?
 
-        public init(address: String, status: String, diagnostic: String, addressIsGone: Bool) {
+        public init(address: String, status: String, diagnostic: String, addressIsGone: Bool,
+                    forwardedTo: String? = nil) {
             self.address = address
             self.status = status
             self.diagnostic = diagnostic
             self.addressIsGone = addressIsGone
+            self.forwardedTo = forwardedTo
         }
+    }
+
+    /// What one report says.
+    public struct Report: Equatable, Sendable {
+        public let failures: [Failure]
+        /// The per-message `Arrival-Date` field, raw: when the reporting server
+        /// received the message it couldn't deliver. Nil if absent.
+        public let arrivalDate: String?
+        /// The `Message-ID` of the message that bounced, from the returned
+        /// original (`message/rfc822`, or `text/rfc822-headers`) the report
+        /// carries — what tells a bounce of Stephen's own mail from backscatter
+        /// for spam forged in his name. Nil if the report returned none.
+        public let originalMessageID: String?
+    }
+
+    /// The whole of a delivery-status report, or nil if `root` is not one.
+    /// Strict in the way `failures(in:)` describes.
+    public static func report(in root: MIMEPart) -> Report? {
+        guard root.contentType == "multipart/report" else { return nil }
+        guard let status = root.children.first(where: isStatusPart) else { return nil }
+        let text = String(decoding: status.decodedPayload(), as: UTF8.self)
+        let arrival = fieldBlocks(text).lazy.compactMap { $0["arrival-date"] }.first
+        var originalID: String?
+        for child in root.children
+        where ["message/rfc822", "text/rfc822-headers", "message/global",
+               "message/global-headers"].contains(child.contentType) {
+            let original = MIMEParser.parse([UInt8](child.decodedPayload()))
+            if let id = original.header("Message-ID")?.trimmingCharacters(in: .whitespaces),
+               !id.isEmpty {
+                originalID = id
+                break
+            }
+        }
+        return Report(failures: failures(inStatusText: text),
+                      arrivalDate: arrival, originalMessageID: originalID)
     }
 
     /// The failed recipients of a delivery-status report, or `[]` if `root` is
@@ -49,12 +93,7 @@ public enum BounceReport {
     /// never counts, and neither does the returned original that a report
     /// carries.
     public static func failures(in root: MIMEPart) -> [Failure] {
-        guard root.contentType == "multipart/report" else { return [] }
-        for child in root.children where isStatusPart(child) {
-            let text = String(decoding: child.decodedPayload(), as: UTF8.self)
-            return failures(inStatusText: text)
-        }
-        return []
+        report(in: root)?.failures ?? []
     }
 
     /// The failures in delivery-status text, wherever it came from.
@@ -69,14 +108,16 @@ public enum BounceReport {
         for block in fieldBlocks(text) {
             guard let action = block["action"],
                   action.lowercased().hasPrefix("failed") else { continue }
-            guard let address = recipient(block["original-recipient"])
-                                ?? recipient(block["final-recipient"]) else { continue }
+            let original = recipient(block["original-recipient"])
+            let finalRecipient = recipient(block["final-recipient"])
+            guard let address = original ?? finalRecipient else { continue }
             guard seen.insert(address).inserted else { continue }
             let status = statusCode(block["status"] ?? "")
             let diagnostic = stripType(block["diagnostic-code"] ?? "")
             out.append(Failure(address: address, status: status, diagnostic: diagnostic,
                                addressIsGone: addressIsGone(status: status,
-                                                            diagnostic: diagnostic)))
+                                                            diagnostic: diagnostic),
+                               forwardedTo: finalRecipient != nil && finalRecipient != address ? finalRecipient : nil))
         }
         return out
     }

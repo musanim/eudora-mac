@@ -66,6 +66,31 @@ public enum HoldingRule {
         return out
     }
 
+    /// How many messages in the mailbox at `base` are *from* each address,
+    /// lowercased — or nil if it can't be read. Same reading as
+    /// `correspondents`, From only.
+    ///
+    /// For deciding whose mailbox a mailbox is (a bounce is filed into a
+    /// person's own): the person is its most frequent sender other than
+    /// Stephen. A group or list mailbox has many senders and seldom one who
+    /// dominates. The caller bounds the size; this reads the mailbox whole.
+    public static func senderCounts(inMailboxAt base: URL) -> [String: Int]? {
+        guard let data = try? Data(contentsOf: base.appendingPathExtension("mbx"),
+                                   options: .mappedIfSafe) else { return nil }
+        let bytes = [UInt8](data)
+        var out: [String: Int] = [:]
+        for rec in Mbox.findRecords(bytes) {
+            let end = min(rec.offset + min(rec.length, headerWindow), bytes.count)
+            guard rec.offset < end else { continue }
+            let record = Array(bytes[rec.offset..<end])
+            let part = MIMEParser.parse(headerBlock(Mbox.messageBytes(fromRecord: record)))
+            if let from = part.header("From"), let address = EmailAddress.addresses(in: from).first {
+                out[address, default: 0] += 1
+            }
+        }
+        return out
+    }
+
     /// How much of each record `correspondents` parses. Generous, because what
     /// a too-long header block loses is its *tail* — and servers prepend
     /// `Received:` and signatures, so the tail is where From, To and Cc usually

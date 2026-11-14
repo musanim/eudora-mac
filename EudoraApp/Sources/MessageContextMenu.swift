@@ -177,6 +177,7 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
 
     /// Retained for the same reason again.
     private var fraudBuilder: FraudMenuBuilder?
+    private var badAddressBuilder: BadAddressMenuBuilder?
 
     /// Prints where the menu was asked to appear, for when it doesn't.
     ///
@@ -394,6 +395,7 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         moveBuilders.removeAll()
         senderBuilder = nil
         fraudBuilder = nil
+        badAddressBuilder = nil
 
         if let clicked = resolveClickedID() {
             // Inside the current multi-selection → the menu acts on all of it;
@@ -559,6 +561,27 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             report.submenu = kinds
             report.isEnabled = true
             menu.addItem(report)
+        }
+        // Record Bad Address: for a bounce the arrival hook didn't take in —
+        // one from before it existed, or one Eudora 7 flattened, whose
+        // delivery-status fields survive only as text. Offered on rows that
+        // look like bounces by sender or subject, which costs nothing to ask;
+        // the message itself is read only when the submenu opens, as Report
+        // Fraud's is.
+        if n == 1, let id = clickedPrimary, model.looksLikeBounce(id) {
+            let bad = NSMenuItem(title: "Record Bad Address", action: nil, keyEquivalent: "")
+            let addresses = NSMenu(title: "Record Bad Address")
+            addresses.autoenablesItems = false
+            let builder = BadAddressMenuBuilder(
+                // A pure read, like the other lazy submenus' closures.
+                failures: { [weak self] in self?.model.reportedFailures(messageID: id) ?? [] },
+                isRecorded: { [weak self] in self?.model.failedAddresses.entries[$0] != nil },
+                onPick: { [weak self] in self?.model.recordFailedAddress($0, messageID: id) })
+            addresses.delegate = builder
+            badAddressBuilder = builder
+            bad.submenu = addresses
+            bad.isEnabled = true
+            menu.addItem(bad)
         }
         // "Send Again" only for a single, successfully-sent message: it opens a
         // fresh editable copy (see `AppModel.sendAgain`). Shown only when it
@@ -854,6 +877,58 @@ final class FraudMenuBuilder: NSObject, NSMenuDelegate {
         guard let raw = sender.representedObject as? String,
               let kind = FraudKind(rawValue: raw) else { return }
         onPick(kind)
+    }
+}
+
+/// Fills "Record Bad Address" when it opens: one item per failed recipient
+/// the message reports, with the reason, already-recorded ones shown but
+/// disabled. Lazy for the reason `FraudMenuBuilder` is.
+@MainActor
+final class BadAddressMenuBuilder: NSObject, NSMenuDelegate {
+    private let failures: () -> [BounceReport.Failure]
+    private let isRecorded: (String) -> Bool
+    private let onPick: (BounceReport.Failure) -> Void
+    private var shown: [BounceReport.Failure] = []
+
+    init(failures: @escaping () -> [BounceReport.Failure],
+         isRecorded: @escaping (String) -> Bool,
+         onPick: @escaping (BounceReport.Failure) -> Void) {
+        self.failures = failures
+        self.isRecorded = isRecorded
+        self.onPick = onPick
+        super.init()
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        shown = failures()
+        if shown.isEmpty {
+            let none = NSMenuItem(title: "No failed address found", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            menu.addItem(none)
+            return
+        }
+        for (i, f) in shown.enumerated() {
+            let recorded = isRecorded(f.address)
+            let why = f.status.isEmpty ? "" : "  (\(f.status))"
+            // A failure that isn't "gone" (mailbox full, a spam or relay
+            // refusal) is offered too, but must not look like a dead address.
+            let note = recorded ? "  — recorded"
+                : f.addressIsGone ? "" : "  — rejected, may still work"
+            let entry = NSMenuItem(title: f.address + why + note,
+                                   action: #selector(pick(_:)), keyEquivalent: "")
+            entry.target = self
+            entry.isEnabled = !recorded
+            entry.tag = i
+            let forwarded = f.forwardedTo.map { "Forwarded to \($0). " } ?? ""
+            entry.toolTip = (forwarded + f.diagnostic).isEmpty ? nil : forwarded + f.diagnostic
+            menu.addItem(entry)
+        }
+    }
+
+    @objc private func pick(_ sender: NSMenuItem) {
+        guard shown.indices.contains(sender.tag) else { return }
+        onPick(shown[sender.tag])
     }
 }
 

@@ -89,6 +89,14 @@ final class HoldingRuleTests: XCTestCase {
                        ["me@musanim.com", "a@b.example", "friend@libero.it", "other@libero.it"])
     }
 
+    func testSenderCountsAreFromOnly() throws {
+        let base = try mailbox(["From: Anna <Anna@x.example>\r\nTo: me@musanim.com\r\n\r\nA\r\n",
+                                "From: anna@x.example\r\n\r\nB\r\n",
+                                "From: me@musanim.com\r\nTo: anna@x.example, cc@y.example\r\n\r\nC\r\n"])
+        XCTAssertEqual(HoldingRule.senderCounts(inMailboxAt: base),
+                       ["anna@x.example": 2, "me@musanim.com": 1])
+    }
+
     /// Only headers count: an address quoted in a body is not a correspondent.
     func testIgnoresAddressInBody() throws {
         let base = try mailbox(["From: other@example.com\r\n\r\nWrite to friend@libero.it\r\n"])

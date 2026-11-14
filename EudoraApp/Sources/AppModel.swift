@@ -6782,6 +6782,21 @@ final class AppModel: ObservableObject {
         /// Duplicates met on the HOLDING path. Apart from `duplicates` because
         /// those are reported, and anything about held mail must not be.
         var heldDuplicates = 0
+        /// Bounces delivered into the PEOPLE mailbox of the address that failed
+        /// rather than into In, by that mailbox's id — see `bounceDecision`.
+        /// Reported, unlike held mail: the person's mailbox lighting up with no
+        /// word said would look like mail from them.
+        var bouncesFiled: [MailboxItem.ID] = []
+        /// Message-IDs of those, so a second account's copy of the same bounce
+        /// can't reach In while the first sits in the person's mailbox.
+        var filedBounceIDs: Set<String> = []
+        /// Gone addresses from bounces actually written this check, recorded in
+        /// one go afterwards — never for a copy discarded as a duplicate, which
+        /// could otherwise re-mark an address Stephen had told to Forget.
+        var goneToRecord: [FailedAddresses.Entry] = []
+        /// Out's and the destination mailboxes' indexes, built on first use,
+        /// and the tree this check began in.
+        var bounceContext = BounceContext(root: rootURL)
         /// In's and Out's correspondents, read once on the first watched-domain
         /// message of this check and reused — see `LocalCorrespondents`.
         var local = LocalCorrespondents()
@@ -6875,14 +6890,61 @@ final class AppModel: ObservableObject {
                             if holdSeen == nil { holdSeen = MessageIDIndex(scanning: holding) }
                             alreadyHeld = holdSeen!.contains(id)
                         }
+                        let bounce = alreadyHeld ? nil
+                            : bounceDecision(for: msg.raw, context: &bounceContext)
+                        let messageID = MessageIDIndex.messageID(of: msg.raw)
+                        var toInbox = true
                         if alreadyHeld {
                             heldDuplicates += 1
-                        } else {
+                            toInbox = false
+                        } else if let messageID, filedBounceIDs.contains(messageID) {
+                            // Another account's copy of a bounce already filed
+                            // in a person's mailbox this check.
+                            duplicates += 1
+                            toInbox = false
+                        } else if let bounce, let dest = bounce.destination {
+                            // A bounce of Stephen's own mail, for someone with a
+                            // PEOPLE mailbox: filed there, beside their mail, as
+                            // a reminder. One already in In is left where it is.
+                            if let messageID, seen.contains(messageID) {
+                                duplicates += 1
+                                toInbox = false
+                            } else {
+                                // **A failure here falls back to In, never
+                                // throws.** A throw ends the account's batch,
+                                // and the same bounce would throw again on every
+                                // later check, stopping that account's mail —
+                                // silently, on an automatic check. In is where it
+                                // would have gone anyway.
+                                var destSeen = bounceContext.index(for: dest.base)
+                                do {
+                                    switch try Delivery.deliverIfNew(messageData: msg.raw,
+                                                                     to: dest.base, seen: &destSeen) {
+                                    case .delivered:
+                                        bouncesFiled.append(dest.id)
+                                        deliveredUIDs.append(msg.uid)
+                                        if let messageID { filedBounceIDs.insert(messageID) }
+                                        goneToRecord += bounce.entries
+                                    case .duplicate:
+                                        duplicates += 1
+                                    }
+                                    toInbox = false
+                                } catch {
+                                    eudoraDiag("[bounce] couldn't file in \(readablePath(of: dest.id)): "
+                                               + "\(error.localizedDescription) — delivering to In")
+                                }
+                                // Ids are added only after a successful append,
+                                // so this is right whether or not it threw.
+                                bounceContext.store(destSeen, for: dest.base)
+                            }
+                        }
+                        if toInbox {
                             switch try Delivery.deliverIfNew(messageData: msg.raw, to: inbox,
                                                              seen: &seen) {
                             case .delivered:
                                 received += 1
                                 deliveredUIDs.append(msg.uid)
+                                if let bounce { goneToRecord += bounce.entries }
                             case .duplicate:
                                 duplicates += 1
                             }
@@ -6904,6 +6966,15 @@ final class AppModel: ObservableObject {
                     }
                 }
 
+                // Recorded before the delete pass as well as after the catch:
+                // that pass is an `await`, and a quit during it would lose the
+                // record for good — the re-fetch next time is a duplicate, and
+                // duplicates are never recorded.
+                if !goneToRecord.isEmpty {
+                    changeFailedAddresses { list in for e in goneToRecord { list.record(e) } }
+                    goneToRecord = []
+                }
+
                 // Delete pass — this account's setting, this account's server,
                 // and only after every message from it is stored locally.
                 // `deliveredUIDs`, not `handled`: a duplicate was never written
@@ -6918,6 +6989,12 @@ final class AppModel: ObservableObject {
                 let reason = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
                 failures.append("\(account.username)@\(account.host): \(reason)")
+            }
+            // After each account, not once at the end — for the path that
+            // threw before reaching the delete pass above.
+            if !goneToRecord.isEmpty {
+                changeFailedAddresses { list in for e in goneToRecord { list.record(e) } }
+                goneToRecord = []
             }
         }
 
@@ -6935,7 +7012,11 @@ final class AppModel: ObservableObject {
             && topLevelMailbox(named: "HOLDING").map {
                 selectedMailboxID == $0.id && listedMailboxID == $0.id } == true
             && removalVeil == nil && !isListing
-        if holdingShown {
+        // The same for a person's mailbox a bounce was just filed into.
+        let filedShown = !bouncesFiled.isEmpty
+            && selectedMailboxID.map { bouncesFiled.contains($0) && listedMailboxID == $0 } == true
+            && removalVeil == nil && !isListing
+        if holdingShown || filedShown {
             refreshInPlaceAfterDelivery()       // walks the tree too
         } else if received > 0 {
             if let id = selectedMailboxID, itemsByID[id]?.type == .inbox {
@@ -6978,12 +7059,17 @@ final class AppModel: ObservableObject {
 
         // Held mail only, HOLDING not on screen: bring its count up to date and
         // nothing else.
-        if received == 0, held > 0, !holdingShown { reloadTree() }
+        // And the same for a bounce filed into a mailbox not on screen.
+        if received == 0, held > 0 || !bouncesFiled.isEmpty, !(holdingShown || filedShown) {
+            reloadTree()
+        }
         if Self.diagnoseHolding, heldDuplicates > 0 {
             eudoraDiag("[holding] \(heldDuplicates) duplicate(s) of held mail ignored")
         }
 
-        report(received: received, duplicates: duplicates, held: held, failures: failures,
+        report(received: received, duplicates: duplicates, held: held,
+               bouncesFiled: bouncesFiled.map { itemsByID[$0]?.display ?? $0 },
+               failures: failures,
                accountCount: ready.count,
                skipped: accounts.partiallyConfigured.count, automatic: automatic)
     }
@@ -7107,13 +7193,25 @@ final class AppModel: ObservableObject {
 
     /// `held` is used for one thing only: deciding whether the check *failed*.
     /// It is never shown — held mail is silent by Stephen's choice.
-    private func report(received: Int, duplicates: Int, held: Int = 0, failures: [String],
+    /// `bouncesFiled` names the mailbox each bounce went into instead of In; an
+    /// automatic check speaks for them, since otherwise a person's mailbox
+    /// would gain an unread message with no word said.
+    private func report(received: Int, duplicates: Int, held: Int = 0,
+                        bouncesFiled: [String] = [], failures: [String],
                         accountCount: Int, skipped: Int, automatic: Bool) {
-        if automatic && received == 0 && duplicates == 0 { return }
+        if automatic && received == 0 && duplicates == 0 && bouncesFiled.isEmpty { return }
 
-        let mail = received == 0
-            ? "No new mail"
-            : "Received \(received) message\(received == 1 ? "" : "s")"
+        let places = Set(bouncesFiled)
+        let filed = bouncesFiled.isEmpty ? ""
+            : (bouncesFiled.count == 1 ? "bounce" : "\(bouncesFiled.count) bounces")
+              + " filed in " + (places.count == 1 ? bouncesFiled[0] : "PEOPLE")
+        let mail: String
+        if received == 0 {
+            mail = filed.isEmpty ? "No new mail" : filed.prefix(1).uppercased() + filed.dropFirst()
+        } else {
+            mail = "Received \(received) message\(received == 1 ? "" : "s")"
+                + (filed.isEmpty ? "" : " · " + filed)
+        }
         let dup = duplicates == 0 ? ""
             : " · \(duplicates) duplicate\(duplicates == 1 ? "" : "s") ignored"
         let note = dup + (skipped == 0 ? ""
@@ -7131,7 +7229,8 @@ final class AppModel: ObservableObject {
         // `duplicates == 0` as well: a check that fetched mail, recognised it as
         // already held and then tripped over a failing delete pass did not fail
         // to check mail. It did its job and hit a snag afterwards.
-        let summary = received == 0 && duplicates == 0 && held == 0 && failures.count == accountCount
+        let summary = received == 0 && duplicates == 0 && held == 0 && bouncesFiled.isEmpty
+            && failures.count == accountCount
             ? "Check mail failed"
             : "\(mail) · \(failures.count) of \(accountCount) "
               + "account\(accountCount == 1 ? "" : "s") failed"
@@ -7140,12 +7239,337 @@ final class AppModel: ObservableObject {
             // Headed to match the notice. Opening "Check mail failed:" when the
             // notice says "Received 3 messages · 1 of 2 accounts failed" is the
             // same contradiction the summary above exists to avoid.
-            let heading = received == 0 && held == 0 && failures.count == accountCount
+            let heading = received == 0 && held == 0 && bouncesFiled.isEmpty
+                && failures.count == accountCount
                 ? "Check mail failed:"
                 : "Check mail: \(failures.count) of \(accountCount) "
                   + "account\(accountCount == 1 ? "" : "s") failed:"
             showError(heading + "\n" + failures.joined(separator: "\n"))
         }
+    }
+
+    // MARK: bounces, and addresses that no longer work
+
+    /// Addresses that bounced as gone — see `FailedAddresses`. Published
+    /// because open composers warn from it, and Forget in one of them must
+    /// clear the warning in all.
+    ///
+    /// Read from disk at launch and again before every change, so a hand edit
+    /// of the file while Eudora runs is merged rather than overwritten (lines
+    /// it can't read are kept as they are — see `FailedAddresses`). A composer
+    /// sees a hand edit at the next change or relaunch.
+    @Published private(set) var failedAddresses = AppModel.loadFailedAddresses()
+
+    /// `~/Library/Application Support/Eudora/FailedAddresses.txt`.
+    nonisolated private static var failedAddressesURL: URL? {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Eudora/FailedAddresses.txt")
+    }
+
+    /// The file's contents, or an empty list if there is none or it can't be
+    /// read. Nothing is lost by the latter: the file is rewritten only by
+    /// `changeFailedAddresses`, which refuses when it can't read it first.
+    nonisolated private static func loadFailedAddresses() -> FailedAddresses {
+        guard let url = failedAddressesURL,
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return FailedAddresses() }
+        return FailedAddresses(fileText: text)
+    }
+
+    /// Set once the file has been found unreadable and said so, so the banner
+    /// isn't repeated on every check.
+    private var failedAddressesUnreadableReported = false
+
+    /// Change the list: re-read, apply, write, publish.
+    ///
+    /// **Not written if the file exists and can't be read** (a hand edit saved
+    /// in an encoding that isn't UTF-8, say), because writing then would
+    /// replace whatever is in it with only this change. Said once, in a banner,
+    /// since recording has stopped until it is fixed.
+    private func changeFailedAddresses(_ change: (inout FailedAddresses) -> Void) {
+        guard let url = Self.failedAddressesURL else { return }
+        var list = FailedAddresses()
+        if FileManager.default.fileExists(atPath: url.path) {
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+                eudoraDiag("[bounce] \(url.path) exists but can't be read as UTF-8; not changed")
+                if !failedAddressesUnreadableReported {
+                    failedAddressesUnreadableReported = true
+                    showBanner("FailedAddresses.txt can't be read, so bad addresses aren't being recorded.")
+                }
+                return
+            }
+            list = FailedAddresses(fileText: text)
+        }
+        change(&list)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try list.fileText.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            eudoraDiag("[bounce] couldn't write \(url.path): \(error.localizedDescription)")
+        }
+        failedAddresses = list
+    }
+
+    /// What one arriving delivery-status report said: the gone addresses, as
+    /// entries ready to record, and the PEOPLE mailbox it belongs in, if any.
+    struct ArrivingBounce {
+        let entries: [FailedAddresses.Entry]
+        let destination: MailboxItem?
+    }
+
+    /// Per-check caches for `bounceDecision`, built only when a report
+    /// arrives: Out's Message-IDs, and for each candidate mailbox its
+    /// Message-IDs (which double as the duplicate guard `deliverIfNew` needs
+    /// there) and its senders.
+    ///
+    /// Built once and kept across accounts, although `deliverIfNew` wants an
+    /// index that describes the mailbox *now* and a check spans `await`s: a
+    /// move into or out of the mailbox meanwhile leaves it stale, and the one
+    /// id that could then be misjudged is the bounce itself — which
+    /// `filedBounceIDs` catches first.
+    struct BounceContext {
+        /// The tree the check began in. A bounce is filed only while it is
+        /// still the open one: `itemsByID` and the index describe whatever
+        /// tree is open *now*, and a check spans `await`s.
+        let root: URL?
+        private var outLoaded = false
+        private var out: MessageIDIndex?
+        private var indexes: [URL: MessageIDIndex] = [:]
+        private var senderCountSets: [URL: [String: Int]?] = [:]
+
+        init(root: URL?) { self.root = root }
+
+        mutating func outIndex(_ outbox: URL?) -> MessageIDIndex? {
+            if !outLoaded {
+                outLoaded = true
+                out = outbox.map { MessageIDIndex(scanning: $0) }
+            }
+            return out
+        }
+
+        mutating func index(for base: URL) -> MessageIDIndex {
+            if let i = indexes[base] { return i }
+            let i = MessageIDIndex(scanning: base)
+            indexes[base] = i
+            return i
+        }
+
+        mutating func store(_ index: MessageIDIndex, for base: URL) { indexes[base] = index }
+
+        mutating func senderCounts(of base: URL) -> [String: Int]? {
+            if let c = senderCountSets[base] { return c }
+            let c = HoldingRule.senderCounts(inMailboxAt: base)
+            senderCountSets[base] = c
+            return c
+        }
+    }
+
+    /// For an arriving message: if it is a delivery-status report saying one or
+    /// more addresses are gone, those addresses, and the person's own PEOPLE
+    /// mailbox if the bounce belongs there. Nil for anything else. Records
+    /// nothing itself: the caller records only what it actually writes, so a
+    /// copy discarded as a duplicate can't re-mark an address.
+    ///
+    /// Stephen's, 2026nov14. A bounce for someone with a mailbox of their own
+    /// is filed there, as a reminder if he ever writes again; one for anyone
+    /// else goes to In as before. Either way the address is recorded, so the
+    /// composer can warn.
+    ///
+    /// **Filed only on evidence, all of it** — a misfiled bounce looks like
+    /// mail from the wrong person, and nobody checks:
+    /// - the message that bounced was Stephen's: its Message-ID is in Out or in
+    ///   that mailbox. Not backscatter for spam forged in his name.
+    /// - for every gone address, `personMailbox` names the same mailbox.
+    ///
+    /// Cheap for everything that isn't a report: the header block alone
+    /// decides that. The Content-Type is read raw, not through
+    /// `MIMEPart.contentType`: a header-only parse of a multipart message has
+    /// no body to split, and `MIMEParser` then corrects the type to a text one.
+    ///
+    /// Dated by the report (`Arrival-Date`, else its `Date:`), never later than
+    /// now: re-fetching old mail must not make an old failure look new.
+    ///
+    /// One gap, accepted: a bounce from a sender at a watched domain is decided
+    /// by HOLDING first, and a held one is never looked at here.
+    private func bounceDecision(for raw: Data, context: inout BounceContext) -> ArrivingBounce? {
+        let head = MIMEParser.parse([UInt8](Self.headerBlock(raw)))
+        guard let type = head.header("Content-Type")?.lowercased()
+                .trimmingCharacters(in: .whitespaces),
+              type.hasPrefix("multipart/report"),
+              let report = BounceReport.report(in: MIMEParser.parse([UInt8](raw))) else { return nil }
+        // Never one of Stephen's own: a forwarder of his that failed once
+        // would otherwise warn every time he wrote to himself.
+        let gone = report.failures.filter { $0.addressIsGone && !me.contains(address: $0.address) }
+        guard !gone.isEmpty else { return nil }
+
+        let date = Self.bounceDate(arrival: report.arrivalDate, header: head.header("Date"))
+        let entries = gone.map { f in
+            FailedAddresses.Entry(address: f.address, date: date, status: f.status,
+                                  diagnostic: FailedAddresses.Entry.diagnostic(
+                                    f.diagnostic, forwardedTo: f.forwardedTo))
+        }
+
+        var dest: MailboxItem?
+        // Normalised as the indexes hold ids, or a folded or commented header
+        // would never match.
+        if let original = report.originalMessageID.flatMap(MessageIDIndex.normalized),
+           let candidate = personMailbox(for: gone.map(\.address), context: &context) {
+            let sentByMe = context.outIndex(outboxBase)?.contains(original) == true
+                || context.index(for: candidate.base).contains(original)
+            if sentByMe { dest = candidate }
+        }
+        eudoraDiag("[bounce] gone: \(gone.map(\.address).joined(separator: ", ")) → "
+                   + (dest.map { readablePath(of: $0.id) } ?? "In"))
+        return ArrivingBounce(entries: entries, destination: dest)
+    }
+
+    /// The date to record for a bounce: the report's own, else now; never in
+    /// the future, and never implausibly early.
+    private static func bounceDate(arrival: String?, header: String?) -> Date {
+        let now = Date()
+        for raw in [arrival, header].compactMap({ $0 }) {
+            let epoch = RFC822Date.epoch(raw)
+            // 1990: a parse that comes back near 1970 is a failed one.
+            if epoch > 631_152_000 { return min(Date(timeIntervalSince1970: TimeInterval(epoch)), now) }
+        }
+        return now
+    }
+
+    /// The PEOPLE mailbox that is the person's own for **every** one of these
+    /// addresses, or nil.
+    ///
+    /// Per address, the question is where they *write from* (`senderOnly`): a
+    /// person turns up as a recipient wherever they were CC'd, but writes from
+    /// their address into their own mailbox. The answer must be decisive: the
+    /// top mailbox overall is under PEOPLE and holds at least half that
+    /// address's mail; and, read from the mailbox itself, the address really
+    /// is its most frequent sender other than Stephen, strictly. That last
+    /// checks the index's phrase match, which has near neighbours
+    /// (`smith@aol.com` also matches `john.smith@aol.com`), and keeps a bounce
+    /// out of a group or ensemble mailbox where others post as much. One
+    /// where this person posts most of all does take it — defensible, since
+    /// that is where their mail lives.
+    ///
+    /// Nil — so the bounce goes to In, which is never wrong — when the index
+    /// can't be asked (none yet, or a Find is using it), the tree changed
+    /// since the check began, or the mailbox is missing or over
+    /// `bounceMailboxSizeLimit`.
+    private func personMailbox(for addresses: [String],
+                               context: inout BounceContext) -> MailboxItem? {
+        guard rootURL == context.root, let people = peopleFolder(), !isSearching,
+              let index = searchIndex, !addresses.isEmpty else { return nil }
+        var chosen: MailboxItem?
+        for address in addresses {
+            guard !me.contains(address: address),
+                  let counts = try? index.mailboxesFiledInto(addresses: [address], senderOnly: true),
+                  let top = counts.first,
+                  top.mailbox.hasPrefix(people.id + "/"),
+                  top.count * 2 >= counts.reduce(0, { $0 + $1.count }),
+                  let item = itemsByID[top.mailbox], !item.isFolder else { return nil }
+            if let chosen, chosen.id != item.id { return nil }
+            if chosen == nil {
+                // Through the link, as `MessageIDIndex` measures: a symlinked
+                // `.mbx` would otherwise report the link's own size.
+                let mbx = item.base.appendingPathExtension("mbx").resolvingSymlinksInPath()
+                guard let size = try? mbx.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                      size <= Self.bounceMailboxSizeLimit else { return nil }
+            }
+            guard let senders = context.senderCounts(of: item.base),
+                  let mine = senders[address], mine > 0,
+                  !senders.contains(where: { $0.key != address && !me.contains(address: $0.key)
+                                             && $0.value >= mine }) else { return nil }
+            chosen = item
+        }
+        return chosen
+    }
+
+    /// The largest person's mailbox a bounce is filed into. Deciding reads the
+    /// whole of it, twice, on the main actor, and the append reads it again —
+    /// fine for an ordinary correspondent, a stall for a decades-long one with
+    /// attachments, whose bounce goes to In instead. `MessageIDIndex`'s own
+    /// scan limit.
+    static let bounceMailboxSizeLimit = 64 * 1024 * 1024
+
+    /// The top-level PEOPLE folder, by display name.
+    private func peopleFolder() -> MailboxItem? {
+        visibleTree.first { $0.isFolder && $0.display.caseInsensitiveCompare("PEOPLE") == .orderedSame }
+    }
+
+    /// The recorded failures among the recipients in these header fields, in
+    /// the order they appear — for the composer's warning.
+    func failedAddressWarnings(in fields: [String]) -> [FailedAddresses.Entry] {
+        guard !failedAddresses.entries.isEmpty else { return [] }
+        var seen: Set<String> = []
+        var out: [FailedAddresses.Entry] = []
+        for field in fields {
+            for entry in EmailAddress.splitList(field) {
+                if let hit = failedAddresses.failure(for: entry), seen.insert(hit.address).inserted {
+                    out.append(hit)
+                }
+            }
+        }
+        return out
+    }
+
+    /// The composer's Forget: this address works after all.
+    func forgetFailedAddress(_ address: String) {
+        changeFailedAddresses { $0.remove(address) }
+    }
+
+    /// The row with this id in the current listing, through `rowPositionByID`
+    /// rather than a scan — this is asked on every right-click.
+    private func listedRow(_ id: MessageRow.ID) -> MessageRow? {
+        guard let pos = rowPositionByID[id], pos < rows.count, rows[pos].id == id else { return nil }
+        return rows[pos]
+    }
+
+    /// Whether a row looks like a bounce, from what the listing already holds —
+    /// so the context menu can offer Record Bad Address without reading the
+    /// message. Generous; the submenu says so when nothing is found.
+    func looksLikeBounce(_ id: MessageRow.ID) -> Bool {
+        guard let row = listedRow(id), !isOutgoingMessage(id) else { return false }
+        let who = row.who.lowercased(), subject = row.subject.lowercased()
+        let senders = ["mailer-daemon", "mail delivery", "postmaster", "mail administrator",
+                       "mailer daemon", "microsoft outlook", "mail system"]
+        let subjects = ["undeliver", "delivery status", "delivery failure", "failure notice",
+                        "returned mail", "not delivered", "delivery has failed",
+                        "could not be delivered", "delivery notification"]
+        return senders.contains { who.contains($0) } || subjects.contains { subject.contains($0) }
+    }
+
+    /// The failed addresses a message reports, read leniently — for the
+    /// by-hand command on a bounce the arrival hook didn't take in.
+    ///
+    /// Strict first (`BounceReport.failures(in:)`); then the fields as text
+    /// anywhere in the message, which is what a report flattened by Eudora 7
+    /// still has — with its `<br>`s taken out and `&lt;`/`&gt;`/`&amp;`
+    /// decoded, since an HTML-ized report writes fields that way. Failures
+    /// that aren't "gone" are offered too, labelled so: Stephen is choosing.
+    func reportedFailures(messageID id: MessageRow.ID) -> [BounceReport.Failure] {
+        guard let raw = rawRecord(id, limit: 512 * 1024) else { return [] }
+        let strict = BounceReport.failures(in: MIMEParser.parse([UInt8](raw)))
+        if !strict.isEmpty { return strict }
+        let text = String(decoding: raw, as: UTF8.self)
+            .replacingOccurrences(of: "<br\\s*/?>", with: "",
+                                  options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&amp;", with: "&")
+        return BounceReport.failures(inStatusText: text)
+    }
+
+    /// Record Bad Address: add one address to the list by hand, dated by the
+    /// bounce itself — it may be years old, and the composer's warning says
+    /// when the address failed. Undated (rather than 1970) if the row's date
+    /// can't be trusted.
+    func recordFailedAddress(_ failure: BounceReport.Failure, messageID id: MessageRow.ID) {
+        let when = listedRow(id)?.sortDate.flatMap { $0.timeIntervalSince1970 > 631_152_000 ? $0 : nil }
+        changeFailedAddresses { list in
+            list.record(.init(address: failure.address, date: when, status: failure.status,
+                              diagnostic: FailedAddresses.Entry.diagnostic(
+                                failure.diagnostic, forwardedTo: failure.forwardedTo)))
+        }
+        showBanner("\(failure.address) recorded as a bad address.")
     }
 
     // MARK: automatic Check Mail

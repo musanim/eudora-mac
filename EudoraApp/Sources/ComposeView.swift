@@ -210,6 +210,7 @@ struct ComposeView: View {
             }
             recipientField("Cc", $cc, .cc)
             recipientField("Bcc", $bcc, .bcc)
+            failedAddressRows
             GridRow {
                 Text("Subject").foregroundStyle(.secondary).gridColumnAlignment(.trailing)
                 TextField("", text: $subject)
@@ -222,6 +223,50 @@ struct ComposeView: View {
         }
         .padding(12)
     }
+
+    /// A warning under the recipients for each address that bounced as gone
+    /// the last time it was tried — see `FailedAddresses`. Stephen's, 2026nov14:
+    /// a warning, never a block; the address may have come back, and Forget
+    /// says so.
+    @ViewBuilder
+    private var failedAddressRows: some View {
+        let warnings = model.failedAddressWarnings(in: [to, cc, bcc])
+        // Not a `GridRow`: a plain view in a `Grid` spans every column, and a
+        // GridRow behind an `if` in a separate property is the kind of nesting
+        // whose layout is easy to get wrong unseen.
+        if !warnings.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(warnings, id: \.address) { failedAddressLine($0) }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func failedAddressLine(_ entry: FailedAddresses.Entry) -> some View {
+        // Built in steps: one long `+` chain of optionals and ternaries is the
+        // kind the type checker gives up on.
+        var text = "\(entry.address) bounced"
+        if let date = entry.date { text += " on " + Self.bounceDate.string(from: date) }
+        if !entry.status.isEmpty { text += " (\(entry.status))" }
+        if let to = entry.forwardedTo { text += " — forwarded to \(to)" }
+        return HStack(spacing: 5) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(text)
+                .help(entry.diagnostic)
+            Button("Forget") { model.forgetFailedAddress(entry.address) }
+                .buttonStyle(.link)
+                .help("This address works — stop warning about it.")
+        }
+        .font(.callout)
+    }
+
+    private static let bounceDate: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .none
+        return f
+    }()
 
     /// The Attachments line: chips for what's attached (each removable), a drop
     /// target for dragging files in, and a paperclip button to pick them.

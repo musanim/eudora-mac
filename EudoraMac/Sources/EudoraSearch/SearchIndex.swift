@@ -319,9 +319,16 @@ public final class SearchIndex: @unchecked Sendable {
     /// than updated per delivery. For filing *history* that hardly matters — the
     /// signal is decades of precedent, not this morning — but a brand-new
     /// correspondent stays unsuggested until the next rebuild.
-    public func mailboxesFiledInto(addresses: [String], limit: Int = 50) throws -> [FilingCount] {
+    ///
+    /// `senderOnly` counts only mail *from* these addresses. That is the
+    /// stronger evidence of whose mailbox a mailbox is: a person turns up as a
+    /// recipient wherever they were CC'd, but writes from their own address
+    /// into one place. Used to decide where a bounce for an address belongs.
+    public func mailboxesFiledInto(addresses: [String], limit: Int = 50,
+                                   senderOnly: Bool = false) throws -> [FilingCount] {
+        let columns = senderOnly ? "sender" : "sender recipients"
         let clauses = addresses.compactMap(Self.addressPhrase).map {
-            "({sender recipients} : \($0))"
+            "({\(columns)} : \($0))"
         }
         guard !clauses.isEmpty else { return [] }
 

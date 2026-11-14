@@ -30,6 +30,7 @@ final class BounceReportTests: XCTestCase {
         Content-Type: message/rfc822
 
         From: stephen@example.org
+        Message-ID: <orig.123@example.org>
         To: Final-Recipient <decoy@example.net>
         Subject: Music Animation Machine
 
@@ -66,6 +67,28 @@ final class BounceReportTests: XCTestCase {
         // Folded Diagnostic-Code is unfolded, and its type removed.
         XCTAssertTrue(f.first?.diagnostic.hasPrefix("550-5.1.1 The email account") ?? false)
         XCTAssertTrue(f.first?.diagnostic.contains("reach does not exist") ?? false)
+    }
+
+    func testReportCarriesArrivalDateAndOriginalID() {
+        let r = BounceReport.report(in: report(gmailStyle))
+        XCTAssertEqual(r?.arrivalDate, "Sat, 14 Nov 2026 12:00:00 -0800")
+        XCTAssertEqual(r?.originalMessageID, "<orig.123@example.org>")
+        XCTAssertNil(BounceReport.report(in: report(gmailStyle, type: "multipart/mixed")))
+    }
+
+    func testForwardedAddressIsNoted() {
+        let f = BounceReport.failures(inStatusText: """
+            Original-Recipient: rfc822; alumni@example.edu
+            Final-Recipient: rfc822; someone@example.com
+            Action: failed
+            Status: 5.1.1
+
+            Final-Recipient: rfc822; plain@example.com
+            Action: failed
+            Status: 5.1.1
+
+            """)
+        XCTAssertEqual(f.map(\.forwardedTo), ["someone@example.com", nil])
     }
 
     /// The returned original carries delivery-status-looking text; only the
@@ -287,7 +310,7 @@ final class BounceReportTests: XCTestCase {
         XCTAssertEqual(f.first?.diagnostic, "550 No such user")
     }
 
-    func testBadLinesAreSkipped() {
+    func testBadLinesAreKeptNotRead() {
         let list = FailedAddresses(fileText: """
             # comment
             not an address\t2026-11-14 00:00:00
@@ -296,5 +319,52 @@ final class BounceReportTests: XCTestCase {
 
             """)
         XCTAssertEqual(Array(list.entries.keys), ["b@example.com"])
+        XCTAssertEqual(list.otherLines, ["# comment", "not an address\t2026-11-14 00:00:00",
+                                         "a@example.com\tyesterday"])
+    }
+
+    /// A rewrite keeps what Stephen typed, and doesn't pile up its own header.
+    func testHandEditsSurviveARewrite() {
+        var list = FailedAddresses(fileText: """
+            # people I know are gone
+            typed@example.com
+            day@example.com\t2019-03-04
+            something odd
+
+            """)
+        XCTAssertNotNil(list.entries["typed@example.com"])
+        XCTAssertNil(list.entries["typed@example.com"]?.date)
+        XCTAssertEqual(list.entries["day@example.com"]?.date,
+                       FailedAddresses.dayFormat.date(from: "2019-03-04"))
+        list.record(.init(address: "new@example.com", date: date("2026-11-14 00:00:00"),
+                          status: "5.1.1", diagnostic: ""))
+        let twice = FailedAddresses(fileText: FailedAddresses(fileText: list.fileText).fileText)
+        XCTAssertEqual(twice, list)
+        XCTAssertEqual(twice.otherLines, ["# people I know are gone", "something odd"])
+        XCTAssertEqual(list.fileText.components(separatedBy: "Written by Eudora").count, 2)
+    }
+
+    func testANoteContainingAnAddressIsNotAnEntry() {
+        let list = FailedAddresses(fileText: "note: <bob@x.com> works again\nBob Smith <gone@x.com>\n")
+        XCTAssertNil(list.entries["bob@x.com"])
+        XCTAssertNotNil(list.entries["gone@x.com"])
+        XCTAssertEqual(list.otherLines, ["note: <bob@x.com> works again"])
+    }
+
+    func testForwardingNoteRoundTrips() {
+        let d = FailedAddresses.Entry.diagnostic("550 no such user", forwardedTo: "x@isp.example")
+        let e = FailedAddresses.Entry(address: "a@alumni.example", date: nil, status: "5.1.1", diagnostic: d)
+        XCTAssertEqual(e.forwardedTo, "x@isp.example")
+        XCTAssertNil(FailedAddresses.Entry(address: "a@b.example", date: nil, status: "",
+                                           diagnostic: "550 no such user").forwardedTo)
+        XCTAssertEqual(FailedAddresses.Entry.diagnostic("t", forwardedTo: nil), "t")
+    }
+
+    func testDatedFailureBeatsUndated() {
+        var list = FailedAddresses()
+        list.record(.init(address: "a@example.com", date: date("2026-11-14 00:00:00"),
+                          status: "5.1.1", diagnostic: "dated"))
+        list.record(.init(address: "a@example.com", date: nil, status: "", diagnostic: "hand"))
+        XCTAssertEqual(list.entries["a@example.com"]?.diagnostic, "dated")
     }
 }

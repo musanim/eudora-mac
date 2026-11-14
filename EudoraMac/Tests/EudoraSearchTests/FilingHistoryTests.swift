@@ -114,6 +114,19 @@ final class FilingHistoryTests: XCTestCase {
         XCTAssertEqual(counts.first?.count, 2)
     }
 
+    /// `senderOnly`: where a person *writes from*, not everywhere they were
+    /// CC'd — the question a bounce asks.
+    func testSenderOnlyIgnoresMailWhereTheyWereARecipient() throws {
+        let index = try SearchIndex(path: ":memory:")
+        try index.add(mailbox: "PEOPLE.fol/A.FOL/Anna.mbx",
+                      sender: "me@musanim.com", recipients: "anna@x.com, cc@y.com")
+        try index.add(mailbox: "MISCINQ.mbx", sender: "cc@y.com", recipients: "me@musanim.com")
+        let both = try index.mailboxesFiledInto(addresses: ["cc@y.com"])
+        XCTAssertEqual(both.count, 2)
+        let sent = try index.mailboxesFiledInto(addresses: ["cc@y.com"], senderOnly: true)
+        XCTAssertEqual(sent.map(\.mailbox), ["MISCINQ.mbx"])
+    }
+
     func testAnUnknownCorrespondentSuggestsNothing() throws {
         let index = try SearchIndex(path: ":memory:")
         try index.add(mailbox: "A.mbx", sender: "x@y.com", recipients: "me@musanim.com")
