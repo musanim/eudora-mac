@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "EudoraRichText", targets: ["EudoraRichText"]),
         .executable(name: "eudora-spike", targets: ["eudora-spike"]),
         .executable(name: "eudora-relink", targets: ["eudora-relink"]),
+        .executable(name: "eudora-drafts", targets: ["eudora-drafts"]),
     ],
     targets: [
         // The reusable interop layer — the real Phase 1 seed.
@@ -41,6 +42,10 @@ let package = Package(
         // one-off migration in principle, but kept because it is re-runnable
         // and idempotent, and the list of locations will grow.
         .executableTarget(name: "eudora-relink", dependencies: ["EudoraStore"]),
+
+        // Appends a batch of prepared replies to Out as unsent drafts, built
+        // by the same calls the composer uses to save one.
+        .executableTarget(name: "eudora-drafts", dependencies: ["EudoraStore"]),
 
         // Tests (each builds its own temp fixture).
         .testTarget(name: "EudoraStoreTests", dependencies: ["EudoraStore"]),
