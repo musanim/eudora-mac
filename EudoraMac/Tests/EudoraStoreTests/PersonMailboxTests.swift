@@ -246,7 +246,7 @@ final class PersonMailboxTests: XCTestCase {
             message(from: "jane@x.com", to: "me@y.com", subject: "S3"),
         ])
         // One extra entry pointing at nothing: still trusted by the listing
-        // (a majority matches), but not consistent.
+        // (a majority matches).
         let toc = base.appendingPathExtension("toc")
         let loaded = try XCTUnwrap(Toc.load(toc))
         var entries = loaded.entries.enumerated().map { (source: Optional($0.offset), entry: $0.element) }

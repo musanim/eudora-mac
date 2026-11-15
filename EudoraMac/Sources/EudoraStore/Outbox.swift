@@ -104,27 +104,28 @@ public enum Outbox {
                                 date: Mbox.tocDateString(date),
                                 to: who, subject: subject)
 
-        // Update the TOC if the existing one is valid (append, preserving prior
-        // cached status); otherwise drop it so the reader scans cleanly.
+        // Update the TOC whenever the listing trusts it (append, preserving
+        // prior cached status); otherwise drop it so the reader scans cleanly.
         //
-        // The test is `tocConsistent` — the same subset rule `remove` and
-        // `replace` use — and *not* the exact one-entry-per-record equality this
-        // used to demand. That stricter rule failed on any mailbox with deleted
-        // -but-not-compacted ghosts, which is the ordinary state of real Eudora
-        // mail, and the failure branch deletes the `.toc`. That was tolerable
-        // when appending only happened on send; now that a record is written
-        // every time a message is *opened*, it would have thrown away Out's
-        // cached statuses on the first ⌘N.
+        // The test is `MailboxMutator.trustedEntries` — the rule `MailStore.list`
+        // reads by, and the one `removeMany` and `replace` write by. Entries
+        // that name no record are dropped as the new one is added, rather than
+        // treated as a reason to delete the whole index: deleting it threw
+        // away Out's cached statuses (so drafts could no longer be told from
+        // sent mail) and brought back every deleted-but-uncompacted ghost.
+        // Dropping them also means none can sit at the offset just written.
         if let loaded = Toc.load(toc),
-           MailboxMutator.tocConsistent(loaded.entries, recs: priorRecords) {
+           let live = MailboxMutator.trustedEntries(loaded.entries, recs: priorRecords) {
             let original = loaded.data, prior = loaded.entries
             // Patched, not rebuilt: the prior entries keep the bytes `TocEntry`
             // doesn't model. See `TocWriter.patched`.
             var list: [(source: Int?, entry: TocEntry)] = []
-            list.reserveCapacity(prior.count + 1)
-            for (k, e) in prior.enumerated() { list.append((source: k, entry: e)) }
+            list.reserveCapacity(live.count + 1)
+            for k in live { list.append((source: k, entry: prior[k])) }
             list.append((source: nil, entry: newEntry))
-            try? TocWriter.patched(original: original, originalEntries: prior, entries: list).write(to: toc)
+            // Atomic, for the reason given in `MailboxMutator.replace`.
+            try? MailboxIO.atomicWrite(TocWriter.patched(original: original, originalEntries: prior,
+                                                         entries: list), to: toc)
         } else if priorRecords.isEmpty {
             // A mailbox with no index yet — usually a brand-new Out. Write one
             // rather than leaving none, or every message in it would be
@@ -134,10 +135,10 @@ public enum Outbox {
             // emptied mailbox — is patched rather than replaced, so its folder
             // header survives.
             if let loaded = Toc.load(toc) {
-                try? TocWriter.patched(original: loaded.data, originalEntries: loaded.entries,
-                                       entries: [(source: nil, entry: newEntry)]).write(to: toc)
+                try? MailboxIO.atomicWrite(TocWriter.patched(original: loaded.data, originalEntries: loaded.entries,
+                                                             entries: [(source: nil, entry: newEntry)]), to: toc)
             } else {
-                try? TocWriter.data(entries: [newEntry]).write(to: toc)
+                try? MailboxIO.atomicWrite(TocWriter.data(entries: [newEntry]), to: toc)
             }
         } else if fm.fileExists(atPath: toc.path) {
             try? fm.removeItem(at: toc)

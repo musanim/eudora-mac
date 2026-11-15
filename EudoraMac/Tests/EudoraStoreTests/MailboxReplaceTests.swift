@@ -81,6 +81,54 @@ final class MailboxReplaceTests: XCTestCase {
         XCTAssertEqual(entries.map(\.length), recs.map(\.length))
     }
 
+    /// An Out whose index carries a dead entry and hides a ghost (S2). Saving a
+    /// draft used to delete such an index — every status lost, so drafts read
+    /// as sent mail, and the ghost back on screen. Now the dead entry is
+    /// dropped and the rest kept.
+    func testReplaceKeepsAStaleButTrustedTocAndDropsItsDeadEntries() throws {
+        try buildOut(bodies: ["first", "second", "third"])
+        try makeStale(ghost: 1, deadAt: 999_999)
+
+        try MailboxMutator.replace(base: base, index: 1,
+                                   messageData: message(subject: "One", body: String(repeating: "z", count: 300)),
+                                   status: MailboxMutator.statusUnsent,
+                                   who: "you@example.com", subject: "One")
+
+        let entries = try XCTUnwrap(Toc.read(base.appendingPathExtension("toc")),
+                                    "a trusted index must not be deleted")
+        let recs = Mbox.findRecords([UInt8](try Data(contentsOf: base.appendingPathExtension("mbx"))))
+        XCTAssertEqual(recs.count, 3)
+        XCTAssertEqual(entries.map(\.subject), ["One", "S3"], "dead entry dropped, ghost still unnamed")
+        XCTAssertEqual(entries.map(\.offset), [recs[0].offset, recs[2].offset])
+        XCTAssertEqual(entries.map(\.status), [MailboxMutator.statusUnsent, MailboxMutator.statusSent])
+        XCTAssertEqual(MailStore(root: root).list(at: base, name: "Out")!.rows.map(\.subject), ["One", "S3"])
+    }
+
+    /// The same for `Outbox.append` — run on every send and every new draft.
+    /// The dead entry is put exactly where the new record lands, the one place
+    /// it could be mistaken for it.
+    func testAppendKeepsAStaleButTrustedTocAndDropsItsDeadEntries() throws {
+        try buildOut(bodies: ["first", "second", "third"])
+        let size = try XCTUnwrap((try FileManager.default.attributesOfItem(
+            atPath: base.appendingPathExtension("mbx").path))[.size] as? NSNumber).intValue
+        try makeStale(ghost: 1, deadAt: size)
+
+        let result = try Outbox.append(messageData: message(subject: "S4", body: "fourth"),
+                                       to: base, status: MailboxMutator.statusUnsent,
+                                       who: "you@example.com", subject: "S4")
+        XCTAssertEqual(result.messageOffset, size, "fixture: the dead entry sits at the new record")
+
+        let entries = try XCTUnwrap(Toc.read(base.appendingPathExtension("toc")),
+                                    "a trusted index must not be deleted")
+        let recs = Mbox.findRecords([UInt8](try Data(contentsOf: base.appendingPathExtension("mbx"))))
+        XCTAssertEqual(recs.count, 4)
+        XCTAssertEqual(entries.map(\.subject), ["S1", "S3", "S4"], "one entry for S4, none for the dead one")
+        XCTAssertEqual(entries.map(\.offset), [recs[0].offset, recs[2].offset, recs[3].offset])
+        XCTAssertEqual(entries.last?.status, MailboxMutator.statusUnsent)
+        XCTAssertEqual(MailStore(root: root).list(at: base, name: "Out")!.rows.map(\.subject),
+                       ["S1", "S3", "S4"])
+    }
+
     // MARK: status and cached columns
 
     func testStatusAndSubjectAreUpdated() throws {
@@ -218,6 +266,25 @@ final class MailboxReplaceTests: XCTestCase {
                                   who: "you@example.com",
                                   subject: "S\(i + 1)")
         }
+    }
+
+    /// Rewrite the index so record `ghost` (0-based) has no entry — a
+    /// deleted-but-uncompacted message — and one dead entry sits at `deadAt`.
+    /// Still trusted by the listing: a majority of entries name a record.
+    private func makeStale(ghost: Int, deadAt: Int) throws {
+        let toc = base.appendingPathExtension("toc")
+        let loaded = try XCTUnwrap(Toc.load(toc))
+        var entries = loaded.entries.enumerated()
+            .filter { $0.offset != ghost }
+            .map { (source: Optional($0.offset), entry: $0.element) }
+        entries.append((source: nil, entry: TocEntry(offset: deadAt, length: 10, status: 1, priority: 4,
+                                                     date: "", to: "", subject: "dead")))
+        try TocWriter.patched(original: loaded.data, originalEntries: loaded.entries,
+                              entries: entries).write(to: toc)
+        XCTAssertNotNil(MailboxMutator.trustedEntries(
+            try XCTUnwrap(Toc.read(toc)),
+            recs: Mbox.findRecords([UInt8](try Data(contentsOf: base.appendingPathExtension("mbx"))))),
+            "fixture: the index must still be trusted")
     }
 
     private func message(subject: String, body: String) -> Data {

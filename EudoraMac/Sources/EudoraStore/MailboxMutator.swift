@@ -135,11 +135,12 @@ public enum MailboxMutator {
 
         // Status is a .toc-only field. Update just this message's entry (found by
         // offset) and rewrite the .toc — never parse the whole mailbox. With no
-        // consistent .toc there's nothing to update.
-        guard let loaded = Toc.load(tocURL), tocConsistent(loaded.entries, recs: recs),
+        // trusted .toc there's nothing to update. Dead entries are left as they
+        // are: this changes one status byte and nothing else.
+        guard let loaded = Toc.load(tocURL), trustedEntries(loaded.entries, recs: recs) != nil,
               let i = loaded.entries.firstIndex(where: { $0.offset == targetOffset }) else { return }
         let patched = withStatus(status, at: i, original: loaded.data, entries: loaded.entries)
-        do { try patched.write(to: tocURL) }
+        do { try MailboxIO.atomicWrite(patched, to: tocURL) }
         catch { throw MutateError.ioError(error.localizedDescription) }
     }
 
@@ -154,8 +155,9 @@ public enum MailboxMutator {
     /// later message's offset shifts. That is the whole difficulty, and it is
     /// handled exactly as `remove` handles it: rewrite the `.mbx` around the
     /// replaced span, then walk the `.toc` adjusting each later entry by the
-    /// difference. A `.toc` that doesn't match the mailbox is deleted rather than
-    /// patched, so the reader rescans instead of trusting a bad index.
+    /// difference. Entries naming no record are dropped; a `.toc` the listing
+    /// doesn't trust at all is deleted rather than patched, so the reader
+    /// rescans instead of trusting a bad index. See `trustedEntries`.
     ///
     /// `messageData` is the assembled RFC-822 body *without* a `From ` envelope
     /// line; this writes one, the same way `Outbox.append` does, so the caller
@@ -216,11 +218,12 @@ public enum MailboxMutator {
             try MailboxIO.atomicWrite(newData, to: mbx)
         } catch { throw MutateError.ioError(error.localizedDescription) }
 
-        if let loaded = Toc.load(toc), tocConsistent(loaded.entries, recs: recs) {
+        if let loaded = Toc.load(toc), let live = trustedEntries(loaded.entries, recs: recs) {
             let original = loaded.data, entries0 = loaded.entries
             var rewritten: [(source: Int?, entry: TocEntry)] = []
-            rewritten.reserveCapacity(entries0.count)
-            for (k, e) in entries0.enumerated() {
+            rewritten.reserveCapacity(live.count)
+            for k in live {
+                let e = entries0[k]
                 if e.offset == rec.offset {
                     // The replaced message: new length and new cached columns,
                     // same offset. Its unmodelled bytes are kept too — they
@@ -241,7 +244,11 @@ public enum MailboxMutator {
                     priority: e.priority, date: e.date,
                     to: e.to, subject: e.subject)))
             }
-            try? TocWriter.patched(original: original, originalEntries: entries0, entries: rewritten).write(to: toc)
+            // Atomic: a half-written index is a shifted one, and a shifted
+            // index the listing still trusts hides every record after the
+            // edit. See `trustedEntries`.
+            try? MailboxIO.atomicWrite(TocWriter.patched(original: original, originalEntries: entries0,
+                                                         entries: rewritten), to: toc)
         } else if FileManager.default.fileExists(atPath: toc.path) {
             try? FileManager.default.removeItem(at: toc)
         }
@@ -382,7 +389,9 @@ public enum MailboxMutator {
                     status: e.status, priority: e.priority,
                     date: e.date, to: e.to, subject: e.subject)))
             }
-            try? TocWriter.patched(original: original, originalEntries: entries0, entries: kept).write(to: toc)
+            // Atomic, for the reason given in `replace`.
+            try? MailboxIO.atomicWrite(TocWriter.patched(original: original, originalEntries: entries0,
+                                                         entries: kept), to: toc)
         } else if FileManager.default.fileExists(atPath: toc.path) {
             try? FileManager.default.removeItem(at: toc)
         }
@@ -466,22 +475,6 @@ public enum MailboxMutator {
                         subject: HeaderDecoder.decode(part.header("Subject") ?? ""))
     }
 
-    /// True if every TOC offset points at a real message in `recs` (an exact
-    /// match or a deleted-ghost subset) — the same consistency the reader uses.
-    ///
-    /// **An index with no entries is consistent**, whatever the `.mbx` holds: it
-    /// lists nothing, and nothing is a subset of anything. It is what you get by
-    /// deleting every listed message from a mailbox that still carries
-    /// deleted-but-not-compacted ghosts, and it means "this mailbox shows
-    /// nothing". Treating it as inconsistent — as this once did — made the next
-    /// delivery *delete* the `.toc`, so the reader fell back to a scan and every
-    /// ghost reappeared, status-less ("?"). That is how 26 messages from July
-    /// came back into an In box emptied on 2026oct23.
-    static func tocConsistent(_ toc: [TocEntry], recs: [MboxRecord]) -> Bool {
-        let offsets = Set(recs.map { $0.offset })
-        return toc.allSatisfy { offsets.contains($0.offset) }
-    }
-
     /// The positions in `toc` of the entries a listing shows — every entry
     /// naming a real record, in `.toc` order — or nil when the index isn't
     /// trusted at all.
@@ -493,8 +486,19 @@ public enum MailboxMutator {
     /// trusted index — offsets into compaction padding — are left out; records
     /// it doesn't name stay hidden, as deleted-but-uncompacted ghosts.
     ///
-    /// Looser than `tocConsistent`, which accepts only an index with no dead
-    /// entries at all. The two agree on every index this app writes itself.
+    /// **An index with no entries is trusted**, whatever the `.mbx` holds: it
+    /// lists nothing. It is what you get by deleting every listed message from
+    /// a mailbox that still carries deleted-but-not-compacted ghosts, and it
+    /// means "this mailbox shows nothing". Treating it as untrusted — as an
+    /// earlier rule did — made the next delivery *delete* the `.toc`, so the
+    /// reader fell back to a scan and every ghost reappeared, status-less
+    /// ("?"). That is how 26 messages from July came back into an In box
+    /// emptied on 2026oct23.
+    ///
+    /// Every writer of an existing `.toc` here goes by this — `removeMany`,
+    /// `replace`, `setStatus(base:index:)` and `Outbox.append` — replacing an
+    /// earlier all-entries-must-match rule that deleted the index over a single
+    /// dead entry.
     static func trustedEntries(_ toc: [TocEntry], recs: [MboxRecord]) -> [Int]? {
         let offsets = Set(recs.map { $0.offset })
         let live = toc.indices.filter { offsets.contains(toc[$0].offset) }

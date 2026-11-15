@@ -280,7 +280,7 @@ public struct MailStore: Sendable {
         // messages deleted without compaction. Scanning instead would put every
         // one of those back on screen with no status. (`.toc` missing or
         // shorter than its header is `nil` and still scans.) See
-        // `MailboxMutator.tocConsistent` for the write-side half of that.
+        // `MailboxMutator.trustedEntries`, which writers go by too.
         if let t = toc, t.isEmpty {
             return Listing(name: label, source: recs.isEmpty ? .toc : .tocCompacted, rows: [])
         }
