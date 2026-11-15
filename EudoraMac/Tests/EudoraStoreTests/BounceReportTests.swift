@@ -222,6 +222,18 @@ final class BounceReportTests: XCTestCase {
         BounceReport.addressIsGone(status: status, diagnostic: diagnostic)
     }
 
+    /// EarthLink says only "Recipient rejected"; the code carries the meaning.
+    /// The diagnostic is the real one from Gordon Green's bounce, 2026nov14.
+    func testEarthLinkNoMailboxCodes() {
+        XCTAssertTrue(gone("5.5.1", "smtp; 550 5.5.1 Recipient rejected - ELNK001_403 -\n"
+            + "    https://postmaster-earthlink.vadesecure.com/inbound_error_codes/#_403"))
+        XCTAssertTrue(gone("5.5.1", "550 5.5.1 Recipient rejected - ELNK002_402 - https://x/#_402"))
+        // The temporary _402 and EarthLink's policy codes are not gone.
+        XCTAssertFalse(gone("4.2.0", "450 4.2.0 Recipient temporarily unavailable - ELNK001_402"))
+        XCTAssertFalse(gone("5.7.1", "550 5.7.1 Sender rejected - ELNK001_304"))
+        XCTAssertFalse(gone("5.5.1", "550 5.5.1 Recipient rejected - ELNK001_4031"))
+    }
+
     func testAddressCodesCountOnTheirOwn() {
         for code in ["5.1.1", "5.1.2", "5.1.3", "5.1.10", "5.2.1", "5.4.4"] {
             XCTAssertTrue(gone(code), code)

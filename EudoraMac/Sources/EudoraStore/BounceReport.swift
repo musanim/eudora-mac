@@ -145,6 +145,7 @@ public enum BounceReport {
         let d = diagnostic.lowercased()
         if notAboutTheAddress.contains(where: { d.contains($0) }) { return false }
         return addressGonePhrases.contains(where: { d.contains($0) })
+            || providerSaysNoMailbox(d)
             || embeddedCodes(d).contains(where: { addressStatusCodes.contains($0) })
     }
 
@@ -167,6 +168,17 @@ public enum BounceReport {
             i = j
         }
         return out
+    }
+
+    /// A provider's own code for "no such mailbox", where the words around it
+    /// say only "Recipient rejected". EarthLink (Vade Secure) answers a dead
+    /// address with `550 5.5.1 Recipient rejected - ELNK001_403 - <url>`; its
+    /// postmaster page gives `_403` as "Mailbox does not exist on this
+    /// platform" and the 5.x `_402` as "a non-existent customer/user"
+    /// (2026nov14, Gordon Green). The 4.x `_402` is temporary and never gets
+    /// here — `addressIsGone` stops at anything but 5.x.x first.
+    static func providerSaysNoMailbox(_ diagnostic: String) -> Bool {
+        diagnostic.range(of: #"elnk[0-9]*_40[23]\b"#, options: .regularExpression) != nil
     }
 
     /// Codes that name the recipient's address as the problem, taken without
