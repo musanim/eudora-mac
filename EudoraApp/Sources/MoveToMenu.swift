@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import EudoraStore
 
 /// The mailbox tree as a menu, for the three places that offer "move this
 /// message somewhere": the toolbar Move button, the message-list context menu,
@@ -465,4 +466,182 @@ struct MoveToMenuButton<Label: View>: View {
             )
         }
     }
+}
+
+// MARK: - Make Person Mailbox…
+
+/// The sheet behind Make Person Mailbox…: the name (prefilled, editable), where
+/// it will be made, and a tick per mailbox holding mail with the address.
+///
+/// **A sheet on the main window, not `runModal`.** It opens at the end of an
+/// asynchronous read, from inside a main-actor task, and a nested modal loop
+/// there would hold every other main-actor job — mail checks, listings —
+/// behind it for as long as the sheet stays up. `runModal` is fine for the
+/// other dialogs in this file because they run straight from a menu action.
+@MainActor
+enum PersonMailboxDialog {
+    struct Entry {
+        let id: String
+        let title: String
+        let count: Int
+        let ticked: Bool
+        /// The mailbox holding the right-clicked message, which moves whether
+        /// or not this is ticked.
+        let holdsClicked: Bool
+        /// Shown, but can't be ticked: its index is out of date, and moving out
+        /// of it would bring its deleted messages back (`Scan.indexIsStale`).
+        let blocked: Bool
+    }
+
+    struct Response {
+        let name: String
+        let ticked: [String]
+    }
+
+    /// `destination` turns a name into the readable place it will be made, or
+    /// nil when no group fits; Create & Move is disabled while it is nil.
+    /// `completion` gets nil on Cancel.
+    static func begin(in window: NSWindow,
+                      address: String, name: String, entries: [Entry], notes: [String],
+                      destination: @escaping (String) -> String?,
+                      completion: @escaping @MainActor (Response?) -> Void) {
+        let controller = PersonMailboxDialogController(address: address, name: name,
+                                                       entries: entries, notes: notes,
+                                                       destination: destination)
+        controller.begin(in: window, completion: completion)
+    }
+}
+
+/// Owns the sheet's controls for as long as it is up, and is the name field's
+/// delegate so the destination line follows the typing.
+@MainActor
+final class PersonMailboxDialogController: NSObject, NSTextFieldDelegate {
+    private let alert = NSAlert()
+    private let field = NSTextField(frame: .zero)
+    private let destinationLabel = NSTextField(labelWithString: "")
+    private var boxes: [(id: String, button: NSButton)] = []
+    private let destination: (String) -> String?
+    /// Keeps the controller alive until the sheet ends; AppKit holds the
+    /// completion block, and the block holds this.
+    private var retainedSelf: PersonMailboxDialogController?
+
+    init(address: String, name: String, entries: [PersonMailboxDialog.Entry], notes: [String],
+         destination: @escaping (String) -> String?) {
+        self.destination = destination
+        super.init()
+
+        alert.messageText = "Make Person Mailbox"
+        alert.informativeText = "A mailbox for \(address), with their mail moved into it."
+        alert.addButton(withTitle: "Create & Move")
+        alert.addButton(withTitle: "Cancel")
+
+        let width: CGFloat = 440
+        let rowHeight: CGFloat = 22
+        let container = PersonMailboxFlippedView(frame: .zero)
+        var y: CGFloat = 0
+
+        let nameLabel = NSTextField(labelWithString: "Name:")
+        nameLabel.frame = NSRect(x: 0, y: y + 3, width: 48, height: 18)
+        container.addSubview(nameLabel)
+        field.frame = NSRect(x: 52, y: y, width: width - 52, height: 24)
+        field.stringValue = name
+        field.delegate = self
+        container.addSubview(field)
+        y += 30
+
+        destinationLabel.frame = NSRect(x: 52, y: y, width: width - 52, height: 18)
+        destinationLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        destinationLabel.textColor = .secondaryLabelColor
+        destinationLabel.lineBreakMode = .byTruncatingMiddle
+        container.addSubview(destinationLabel)
+        y += 28
+
+        let listLabel = NSTextField(labelWithString: entries.isEmpty
+            ? "No other mail with this address was found."
+            : "Move their mail from:")
+        listLabel.frame = NSRect(x: 0, y: y, width: width, height: 18)
+        container.addSubview(listLabel)
+        y += 22
+
+        if !entries.isEmpty {
+            let document = PersonMailboxFlippedView(
+                frame: NSRect(x: 0, y: 0, width: width - 20, height: CGFloat(entries.count) * rowHeight))
+            for (i, entry) in entries.enumerated() {
+                var title = "\(entry.title)  (\(entry.count))"
+                if entry.holdsClicked { title += " \u{2014} the message you clicked moves either way" }
+                if entry.blocked { title += " \u{2014} can't move: its index is out of date" }
+                let box = NSButton(checkboxWithTitle: title, target: nil, action: nil)
+                box.state = entry.ticked && !entry.blocked ? .on : .off
+                box.isEnabled = !entry.blocked
+                box.lineBreakMode = .byTruncatingMiddle
+                box.frame = NSRect(x: 4, y: CGFloat(i) * rowHeight + 2, width: width - 28, height: 18)
+                document.addSubview(box)
+                boxes.append((entry.id, box))
+            }
+            let visible = min(CGFloat(entries.count), 10) * rowHeight + 4
+            let scroll = NSScrollView(frame: NSRect(x: 0, y: y, width: width, height: visible))
+            scroll.hasVerticalScroller = entries.count > 10
+            scroll.borderType = .bezelBorder
+            scroll.documentView = document
+            container.addSubview(scroll)
+            y += visible + 8
+        }
+
+        for note in notes {
+            let label = NSTextField(wrappingLabelWithString: note)
+            label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            label.textColor = .secondaryLabelColor
+            label.preferredMaxLayoutWidth = width
+            let height = max(16, label.fittingSize.height)
+            label.frame = NSRect(x: 0, y: y, width: width, height: height)
+            container.addSubview(label)
+            y += height + 4
+        }
+
+        container.frame = NSRect(x: 0, y: 0, width: width, height: y)
+        alert.accessoryView = container
+        alert.window.initialFirstResponder = field
+        updateDestination()
+    }
+
+    func begin(in window: NSWindow,
+               completion: @escaping @MainActor (PersonMailboxDialog.Response?) -> Void) {
+        retainedSelf = self
+        alert.beginSheetModal(for: window) { [self] response in
+            // Hopped onto the main actor explicitly rather than trusting the
+            // SDK's annotation of this handler.
+            Task { @MainActor in
+                self.retainedSelf = nil
+                guard response == .alertFirstButtonReturn else { completion(nil); return }
+                completion(PersonMailboxDialog.Response(
+                    name: self.field.stringValue,
+                    ticked: self.boxes.filter { $0.button.state == .on }.map(\.id)))
+            }
+        }
+        field.selectText(nil)
+    }
+
+    func controlTextDidChange(_ obj: Notification) { updateDestination() }
+
+    private func updateDestination() {
+        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+        // Checked here, not left to `createMailbox`, whose refusal would come
+        // only after the second read of every ticked mailbox.
+        guard PersonMailbox.isStorableName(name) else {
+            destinationLabel.stringValue = name.isEmpty
+                ? "Type a name."
+                : "Eudora can't store this name (no / \\ : * ? \" < > | , and only Latin-1 letters)."
+            alert.buttons.first?.isEnabled = false
+            return
+        }
+        let place = destination(name)
+        destinationLabel.stringValue = place.map { "Will be made in \($0)" }
+            ?? "No group in PEOPLE fits this name."
+        alert.buttons.first?.isEnabled = place != nil
+    }
+}
+
+/// Top-down layout for the sheet's accessory and its list.
+final class PersonMailboxFlippedView: NSView {
+    override var isFlipped: Bool { true }
 }

@@ -27,7 +27,22 @@ public enum HeaderDecoder {
             if !isFoldArtefact { result += gap }
             let afterStart = remaining[start.upperBound...]
 
-            guard let end = afterStart.range(of: "?=") else {
+            // The closing `?=` is searched for only after `charset?enc?`.
+            // Searching from the charset found the `?=` in `Q?=C3…` — any
+            // Q-encoded text starting with an encoded byte, which is every
+            // accented first letter — and left the word undecoded (2026nov14).
+            // The bare search stays as a fallback for malformed words.
+            var structuredEnd: Range<Substring.Index>?
+            if let q1 = afterStart.firstIndex(of: "?") {
+                let afterCharset = afterStart[afterStart.index(after: q1)...]
+                // Only when the encoding really is one letter: otherwise a
+                // malformed word lets the search run on into the next word.
+                if let q2 = afterCharset.firstIndex(of: "?"),
+                   afterCharset.distance(from: afterCharset.startIndex, to: q2) == 1 {
+                    structuredEnd = afterStart[afterStart.index(after: q2)...].range(of: "?=")
+                }
+            }
+            guard let end = structuredEnd ?? afterStart.range(of: "?=") else {
                 result += remaining[start.lowerBound...]
                 remaining = Substring("")
                 break

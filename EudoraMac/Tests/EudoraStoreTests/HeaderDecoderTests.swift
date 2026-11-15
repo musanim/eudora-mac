@@ -53,4 +53,17 @@ final class HeaderDecoderTests: XCTestCase {
     func testUnterminatedWordIsLeftAlone() {
         XCTAssertEqual(HeaderDecoder.decode("Subject =?UTF-8?Q?oops"), "Subject =?UTF-8?Q?oops")
     }
+
+    /// Q text that starts with an encoded byte puts `?=` right after the
+    /// encoding letter (`Q?=C3`), which the closing search used to stop at.
+    func testQWordStartingWithAnEncodedByte() {
+        XCTAssertEqual(HeaderDecoder.decode("=?UTF-8?Q?=C3=89lodie_Martin?="), "Élodie Martin")
+        XCTAssertEqual(HeaderDecoder.decode("Re: =?utf-8?q?=E2=80=9Cquoted=E2=80=9D?= x"),
+                       "Re: \u{201C}quoted\u{201D} x")
+    }
+
+    /// A malformed word must not swallow the well-formed one after it.
+    func testMalformedWordDoesNotSwallowTheNext() {
+        XCTAssertEqual(HeaderDecoder.decode("=?x?= =?UTF-8?Q?caf=C3=A9?="), "=?x?= café")
+    }
 }

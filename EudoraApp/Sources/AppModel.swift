@@ -5917,7 +5917,9 @@ final class AppModel: ObservableObject {
     }
 
 
-    func moveSelected(to destID: MailboxItem.ID) {
+    /// `notice` replaces the usual "Moved to X." — for a caller that moved
+    /// more than the selection, such as Make Person Mailbox….
+    func moveSelected(to destID: MailboxItem.ID, notice override: String? = nil) {
         guard let sel = currentSelectionSet(), let dest = itemsByID[destID] else { return }
         // The menu lists every mailbox, including this one — see MoveToMenu.swift
         // for why it can't depend on the selection. Moving a message to where it
@@ -5932,8 +5934,8 @@ final class AppModel: ObservableObject {
             try MailboxMutator.moveMany(from: sel.item.base, indices: sel.indices, to: dest.base)
             recordRecentFiling(from: sel.item, to: destID)
             afterRemoval(veil: "Moving…",
-                         notice: n == 1 ? "Moved to \(dest.display)."
-                                        : "\(n) messages moved to \(dest.display).")
+                         notice: override ?? (n == 1 ? "Moved to \(dest.display)."
+                                                     : "\(n) messages moved to \(dest.display)."))
             if unfamiliar { relearnPending = true }
         } catch {
             showError("Move failed: \(error.localizedDescription)")
@@ -6729,6 +6731,435 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: mailbox management (Make Person Mailbox…)
+
+    /// Right-click ▸ Make Person Mailbox…: give the sender of one received
+    /// message a PEOPLE mailbox of their own and gather their mail into it.
+    ///
+    /// For a reply from someone whose earlier mail sits in MISCINQ or another
+    /// group mailbox. Stephen's design (2026nov14): a command, never automatic;
+    /// the name prefilled from From and editable; the mailbox made in
+    /// `PEOPLE ▸ <letter>`, or the two-letter subgroup when one fits; and a
+    /// sheet of every mailbox holding mail with that address, each with a count
+    /// and a tick, In/Out/Trash/SCAMS/HOLDING and other people's mailboxes
+    /// unticked (`PersonMailbox.tickedByDefault`). **The clicked message moves
+    /// whatever is ticked** — making the mailbox is usually about filing it.
+    ///
+    /// **The index proposes, the mailbox decides.** The search index says which
+    /// mailboxes may hold this person's mail; each of those, plus In, Out and the
+    /// one on screen (which the index is always behind on), is then read and
+    /// matched exactly (`PersonMailbox.scan`). Index offsets go stale after any
+    /// move, and its address match takes `j.a@b.com` for `a@b.com` — fine for a
+    /// ranking, not for deciding what moves. Mail filed since the last rebuild
+    /// into a mailbox the index knows nothing of is missed; accepted.
+    ///
+    /// Read twice: once off the main thread to fill the sheet, and again after
+    /// Create & Move, because the sheet can sit open for any length of time
+    /// while mail arrives and messages move. Each mailbox's fingerprint is
+    /// checked once more just before it is written, and one that changed is left
+    /// alone and named rather than moved by stale numbers.
+    ///
+    /// The index rebuild comes free: the move into a mailbox the index has never
+    /// seen is an unfamiliar filing (`filingIsUnfamiliar` → `relearnPending`).
+    ///
+    /// `window` is the one the right-click happened in, which the sheet hangs
+    /// from: by the time the read finishes the user may be in another app, or a
+    /// composer may be the main window.
+    func makePersonMailbox(for clicked: MessageRow.ID, in window: NSWindow?) {
+        guard !personMailboxInFlight else {
+            showBanner("Make Person Mailbox\u{2026} is already under way.")
+            return
+        }
+        // By the mailbox and the row's own offset, not `rawRecord`, which
+        // depends on the clicked row having become the selection.
+        guard let sourceID = listedMailboxID, sourceID == selectedMailboxID,
+              let source = itemsByID[sourceID], let row = listedRow(clicked), let store,
+              let raw = store.rawMessage(at: source.base, offset: row.offset,
+                                         length: min(row.size, 64 * 1024)) else {
+            showError("Couldn't read that message from the mailbox.")
+            return
+        }
+        let header = MIMEParser.parse([UInt8](Self.headerBlock(raw)))
+        let fromValue = header.header("From") ?? ""
+        let clickedMessageID = header.header("Message-ID")
+        guard let address = EmailAddress.addresses(in: fromValue).first else {
+            showError("That message has no sender address to make a mailbox for.")
+            return
+        }
+        guard !me.matches(headerValue: address) else {
+            showError("That message is from you — there's no one to make a mailbox for.")
+            return
+        }
+        guard peopleFolder() != nil else {
+            showError("There's no PEOPLE group in this mailbox tree.")
+            return
+        }
+
+        var ids: [MailboxItem.ID] = []
+        var seen: Set<MailboxItem.ID> = []
+        func consider(_ id: MailboxItem.ID?) {
+            guard let id, let item = itemsByID[id], !item.isFolder,
+                  seen.insert(id).inserted else { return }
+            ids.append(id)
+        }
+        consider(sourceID)
+        consider(item(ofType: .inbox)?.id)
+        consider(item(ofType: .outbox)?.id)
+        // Trash and Junk are never read: both start unticked, moving mail out
+        // of either into a person's mailbox is not what this is for, and Trash
+        // alone is 600 MB — more than a second's reading for a box nobody ticks.
+        let skipped: Set<MailboxItem.ID> = Set([item(ofType: .trash)?.id,
+                                                item(ofType: .junk)?.id].compactMap { $0 })
+        seen.formUnion(skipped.subtracting([sourceID]))
+        // Not during a Find, for `filingCounts`' reason: one SQLite connection,
+        // never used from two threads at once. The sheet then says the list may
+        // be incomplete rather than pretending it isn't.
+        var indexAsked = false
+        if !isSearching, let index = searchIndex,
+           let hits = try? index.mailboxesFiledInto(addresses: [address], limit: 1000) {
+            indexAsked = true
+            hits.forEach { consider($0.mailbox) }
+        }
+        let targets = ids.compactMap { id in
+            itemsByID[id].map { PersonMailboxTarget(id: id, base: $0.base) }
+        }
+        let suggested = PersonMailbox.suggestedName(fromHeader: fromValue)
+        let clickedOffset = row.offset
+
+        let clickedRef = PersonMailboxClicked(offset: clickedOffset, messageID: clickedMessageID)
+        let asked = indexAsked
+        personMailboxInFlight = true
+        personMailboxRoot = rootURL
+        showPersonMailboxProgress("Looking for mail with \(address)\u{2026}")
+        Task { [weak self, weak window] in
+            let scans = await AppModel.scanForPerson(targets, address: address,
+                                                     sourceID: sourceID, clicked: clickedRef)
+            guard let self else { return }
+            self.presentPersonMailboxSheet(address: address, suggestedName: suggested,
+                                           sourceID: sourceID, clicked: clickedRef,
+                                           scans: scans, indexAsked: asked, window: window)
+        }
+    }
+
+    /// One Make Person Mailbox… at a time, from the first click until its moves
+    /// are done or it is given up. A second one, started while the first's
+    /// sheet or reads are under way, would plan against mailboxes the first is
+    /// about to change.
+    private var personMailboxInFlight = false
+
+    /// The tree the command started in. Opening another Eudora folder while
+    /// the sheet is up must not move mail from one tree's paths into the other.
+    private var personMailboxRoot: URL?
+
+    /// The banner this command put up, so taking it down never takes down
+    /// someone else's — an error from Check Mail, say, which must stay.
+    private var personMailboxProgress: String?
+
+    private func showPersonMailboxProgress(_ text: String) {
+        personMailboxProgress = text
+        showBanner(text)
+    }
+
+    private func clearPersonMailboxProgress() {
+        if let text = personMailboxProgress, banner == text { dismissBanner() }
+        personMailboxProgress = nil
+    }
+
+    /// A mailbox nothing may be moved out of directly: its index is stale
+    /// (`Scan.indexIsStale`), or it is Out read without an index, where a
+    /// draft can't be told from a sent copy (`Scan.statusesUnknown`). The
+    /// clicked message's own mailbox is exempt from the first — moving that
+    /// message is an ordinary Move — but not from the second.
+    private func personMoveBlocked(_ scan: PersonMailbox.Scan, id: MailboxItem.ID,
+                                   sourceID: MailboxItem.ID) -> Bool {
+        (scan.indexIsStale && id != sourceID)
+            || (scan.statusesUnknown && itemsByID[id]?.type == .outbox)
+    }
+
+    /// Read every target off the main thread. The one the clicked message is in
+    /// is also asked for the record at its offset.
+    private static func scanForPerson(_ targets: [PersonMailboxTarget], address: String,
+                                      sourceID: MailboxItem.ID,
+                                      clicked: PersonMailboxClicked) async -> [PersonMailboxScanResult] {
+        await Task.detached(priority: .userInitiated) {
+            targets.map { (t: PersonMailboxTarget) -> PersonMailboxScanResult in
+                let isSource = t.id == sourceID
+                return PersonMailboxScanResult(
+                    id: t.id, base: t.base,
+                    scan: PersonMailbox.scan(base: t.base, address: address,
+                                             offset: isSource ? clicked.offset : nil,
+                                             messageID: isSource ? clicked.messageID : nil))
+            }
+        }.value
+    }
+
+    /// PEOPLE's letter groups and their subgroups, as the destination rule
+    /// takes them.
+    private func peopleGroups() -> (people: MailboxItem, groups: [PersonMailbox.Group])? {
+        guard let people = peopleFolder() else { return nil }
+        let groups = (people.children ?? []).filter(\.isFolder).map { letter in
+            PersonMailbox.Group(id: letter.id, display: letter.display,
+                                subgroups: (letter.children ?? []).filter(\.isFolder).map {
+                                    PersonMailbox.Group(id: $0.id, display: $0.display)
+                                })
+        }
+        return (people, groups)
+    }
+
+    private func presentPersonMailboxSheet(address: String, suggestedName: String,
+                                           sourceID: MailboxItem.ID, clicked: PersonMailboxClicked,
+                                           scans: [PersonMailboxScanResult], indexAsked: Bool,
+                                           window: NSWindow?) {
+        clearPersonMailboxProgress()
+        // Every early return below ends the command.
+        var handedOff = false
+        defer { if !handedOff { personMailboxInFlight = false } }
+        guard let pg = peopleGroups() else {
+            showError("There's no PEOPLE group in this mailbox tree.")
+            return
+        }
+        let people = pg.people, groups = pg.groups
+        // The clicked message has to be found again by its offset, in a
+        // mailbox read just now. If it can't be, nothing is offered: the one
+        // message the command is about would otherwise be quietly left behind.
+        guard let source = scans.first(where: { $0.id == sourceID })?.scan,
+              let clickedIndex = source.indexAtOffset, source.matches.contains(clickedIndex) else {
+            showError("That mailbox changed while it was being read. Try again.")
+            return
+        }
+
+        var entries: [PersonMailboxDialog.Entry] = []
+        var unreadable: [String] = []
+        for result in scans {
+            guard let item = itemsByID[result.id], !item.isFolder else { continue }
+            guard let scan = result.scan else {
+                unreadable.append(readablePath(of: result.id))
+                continue
+            }
+            guard !scan.matches.isEmpty else { continue }
+            // See `Scan.indexIsStale`. The clicked message's own mailbox is the
+            // exception: moving that message is an ordinary Move, which already
+            // behaves this way, and the command exists to file it.
+            let blocked = personMoveBlocked(scan, id: result.id, sourceID: sourceID)
+            let ticked = !blocked && PersonMailbox.tickedByDefault(
+                type: item.type, isTopLevel: !result.id.contains("/"),
+                display: item.display, isUnderPeople: result.id.hasPrefix(people.id + "/"))
+            entries.append(.init(id: result.id, title: readablePath(of: result.id),
+                                 count: scan.matches.count, ticked: ticked,
+                                 holdsClicked: result.id == sourceID, blocked: blocked))
+        }
+        // Most mail first; the clicked message's own mailbox is near the top
+        // either way, since it is usually In.
+        entries.sort { ($0.count, $1.title) > ($1.count, $0.title) }
+
+        var notes: [String] = []
+        if !indexAsked {
+            notes.append("The search index wasn't available, so only In, Out and this mailbox were searched.")
+        }
+        if !unreadable.isEmpty {
+            notes.append("Couldn't read: \(unreadable.joined(separator: ", ")).")
+        }
+        let peopleName = people.display
+        guard let sheetWindow = (window?.isVisible == true ? window : nil)
+                ?? NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain }) else {
+            showError("Couldn't show the Make Person Mailbox sheet \u{2014} no Eudora window is open.")
+            return
+        }
+        handedOff = true
+        PersonMailboxDialog.begin(
+            in: sheetWindow,
+            address: address, name: suggestedName, entries: entries, notes: notes,
+            destination: { name in
+                PersonMailbox.destination(forName: name, in: groups).map {
+                    ([peopleName] + $0.map(\.display)).joined(separator: " \u{25B8} ")
+                }
+            },
+            completion: { [weak self] response in
+                guard let self else { return }
+                guard let response else { self.personMailboxInFlight = false; return }
+                self.createAndMovePerson(response, address: address, sourceID: sourceID,
+                                         clicked: clicked, scans: scans)
+            })
+    }
+
+    /// Create & Move was clicked: read the chosen mailboxes again, then act.
+    private func createAndMovePerson(_ response: PersonMailboxDialog.Response, address: String,
+                                     sourceID: MailboxItem.ID, clicked: PersonMailboxClicked,
+                                     scans: [PersonMailboxScanResult]) {
+        // The tree may have changed while the sheet was up, so the group is
+        // resolved now, from the name as finally typed.
+        let name = response.name.trimmingCharacters(in: .whitespaces)
+        guard rootURL == personMailboxRoot else {
+            showError("Another Eudora folder was opened \u{2014} nothing was created or moved.")
+            personMailboxInFlight = false
+            return
+        }
+        guard let pg = peopleGroups(),
+              let path = PersonMailbox.destination(forName: name, in: pg.groups),
+              let groupID = path.last?.id, let group = itemsByID[groupID], group.isFolder else {
+            showError("No group in PEOPLE fits \u{201C}\(name)\u{201D} \u{2014} nothing was created.")
+            personMailboxInFlight = false
+            return
+        }
+        let chosen = Set(response.ticked).union([sourceID])
+        let targets = scans.filter { chosen.contains($0.id) }
+            .map { PersonMailboxTarget(id: $0.id, base: $0.base) }
+
+        showPersonMailboxProgress("Gathering mail for \u{201C}\(name)\u{201D}\u{2026}")
+        Task { [weak self] in
+            let fresh = await AppModel.scanForPerson(targets, address: address,
+                                                     sourceID: sourceID, clicked: clicked)
+            guard let self else { return }
+            self.clearPersonMailboxProgress()
+            self.finishPersonMailbox(name: name, groupID: group.id, sourceID: sourceID,
+                                     ticked: Set(response.ticked), scans: fresh)
+            self.personMailboxInFlight = false
+        }
+    }
+
+    private func finishPersonMailbox(name: String, groupID: MailboxItem.ID,
+                                     sourceID: MailboxItem.ID, ticked: Set<MailboxItem.ID>,
+                                     scans: [PersonMailboxScanResult]) {
+        guard rootURL == personMailboxRoot else {
+            showError("Another Eudora folder was opened \u{2014} nothing was created or moved.")
+            return
+        }
+        // Everything is decided before the mailbox is made, so a run where
+        // nothing turns out movable creates nothing.
+        //
+        // What leaves each mailbox: everything matched where ticked, and in the
+        // clicked message's own mailbox at least that message.
+        var direct: [(result: PersonMailboxScanResult, scan: PersonMailbox.Scan, indices: [Int])] = []
+        var onScreen: (id: MailboxItem.ID, indices: [Int])?
+        var leftAlone: [String] = []
+        var clickedLeft = false
+        for result in scans {
+            let id = result.id
+            let path = readablePath(of: id)
+            func leave() {
+                leftAlone.append(path)
+                if id == sourceID { clickedLeft = true }
+            }
+            guard let scan = result.scan else { leave(); continue }
+            var indices = ticked.contains(id) ? scan.matches : []
+            if id == sourceID {
+                if let i = scan.indexAtOffset, scan.matches.contains(i) {
+                    if !indices.contains(i) { indices.append(i) }
+                } else {
+                    clickedLeft = true
+                }
+            }
+            guard !indices.isEmpty else { continue }
+            indices.sort()
+
+            // A mailbox on screen goes through the selection, so the list gets
+            // the ordinary move's veil, re-list and Recents entry. It has to be
+            // the listing the scan read — same records at the same positions —
+            // or the selection would name other messages.
+            if id == selectedMailboxID || id == listedMailboxID {
+                let rowsAgree = indices.allSatisfy { i in
+                    guard let pos = rowPositionByID[i], pos < rows.count else { return false }
+                    return rows[pos].id == i && rows[pos].offset == scan.offsets[i]
+                }
+                if id == selectedMailboxID, id == listedMailboxID, removalVeil == nil, !isListing,
+                   !personMoveBlocked(scan, id: id, sourceID: sourceID), rowsAgree, PersonMailbox.Fingerprint.of(base: result.base) == scan.fingerprint {
+                    onScreen = (id, indices)
+                } else {
+                    leave()
+                }
+                continue
+            }
+            // See `Scan.indexIsStale`; the sheet already disabled such boxes,
+            // but the second read is the one that counts.
+            guard !personMoveBlocked(scan, id: id, sourceID: sourceID),
+                  PersonMailbox.Fingerprint.of(base: result.base) == scan.fingerprint else {
+                leave()
+                continue
+            }
+            direct.append((result, scan, indices))
+        }
+        guard !direct.isEmpty || onScreen != nil else {
+            showError("Nothing could be moved \u{2014} the mailboxes changed while they were being read. "
+                      + "No mailbox was created.")
+            return
+        }
+        guard let group = itemsByID[groupID], group.isFolder else {
+            showError("The group for \u{201C}\(name)\u{201D} is gone \u{2014} the mailbox list just changed. "
+                      + "Nothing was created.")
+            return
+        }
+        guard let created = createMailbox(named: name, inDirectory: group.base,
+                                          idPrefix: group.id, asFolder: false) else { return }
+
+        var moved = 0
+        var mailboxes = 0
+        var failures: [String] = []
+        for step in direct {
+            do {
+                try MailboxMutator.moveMany(from: step.result.base, indices: step.indices,
+                                            to: created.base)
+                moved += step.indices.count
+                mailboxes += 1
+            } catch {
+                failures.append("\(readablePath(of: step.result.id)): \(error.localizedDescription)")
+            }
+        }
+        if let onScreen {
+            moved += onScreen.indices.count
+            mailboxes += 1
+        } else if moved == 0 {
+            // Every move failed: don't leave an empty mailbox behind as if the
+            // command had half worked. It was made a moment ago and holds
+            // nothing, so the empty-mailbox delete applies.
+            // A move that failed partway may have left copies in it (append
+            // first, remove after), in which case the delete refuses and the
+            // mailbox stays, said so.
+            do {
+                try MailboxTreeMutator.deleteEmptyMailbox(directory: group.base,
+                                                          filename: descmapFilename(of: created.id))
+                itemsByID[created.id] = nil
+                reloadTree()
+                showError("Couldn't move any mail, so no mailbox was made. "
+                          + failures.joined(separator: "; "))
+            } catch {
+                reloadTree()
+                showError("Moving failed, and \u{201C}\(created.display)\u{201D} may hold copies of "
+                          + "messages still in their old mailboxes. " + failures.joined(separator: "; "))
+            }
+            return
+        }
+
+        var notice = "Created \u{201C}\(created.display)\u{201D} in \(readablePath(of: groupID)); "
+            + (moved == 1 ? "1 message moved" : "\(moved) messages moved")
+            + (mailboxes > 1 ? " from \(mailboxes) mailboxes." : ".")
+        if !leftAlone.isEmpty {
+            notice += " Changed meanwhile, left alone: \(leftAlone.joined(separator: ", "))."
+        }
+        if clickedLeft { notice += " The message you clicked was not moved." }
+        if !failures.isEmpty { notice += " Failed: " + failures.joined(separator: "; ") }
+        let clean = leftAlone.isEmpty && !clickedLeft && failures.isEmpty
+
+        // Owed whatever path the moves took: the new mailbox is unknown to the
+        // index by definition, and `moveSelected` only decides so itself when
+        // the index can be asked (not during a Find). Spent when the veil
+        // drops, or now if there is none.
+        if moved > 0 { relearnPending = true }
+
+        if let onScreen {
+            // A clean run's notice rides the veil like any move's. Anything
+            // left alone or failed goes on the error banner, which stays up —
+            // the veil's notice clears itself in seconds.
+            if !clean { showError(notice) }
+            applyMessageSelection(Set(onScreen.indices), primary: onScreen.indices.first)
+            moveSelected(to: created.id, notice: clean ? notice : nil)
+        } else {
+            reloadTree()
+            if clean { showBanner(notice) } else { showError(notice) }
+            // Never under the removal veil — see `maybeRelearnFiling`.
+            if removalVeil == nil { maybeRelearnFiling() }
+        }
+    }
+
     // MARK: receiving (POP3)
 
     /// Check mail: fetch new messages from **every** configured incoming account
@@ -7155,7 +7586,8 @@ final class AppModel: ObservableObject {
     /// One line per watched-domain arrival in the diagnostics log, saying what
     /// was decided. On while the rule is new, so a held real person can be
     /// explained from the log rather than guessed at; turn off once trusted.
-    static let diagnoseHolding = true
+    /// Off since 2026nov14: the first libero.it arrival was held correctly.
+    static let diagnoseHolding = false
 
     /// Whether Stephen has dealt with this address: true, false, or nil when it
     /// can't be told.
@@ -7964,4 +8396,29 @@ final class AppModel: ObservableObject {
             selectedMailboxID = mailboxID   // onChange → loadListing() applies pending
         }
     }
+}
+
+// MARK: - Make Person Mailbox… payloads
+
+/// A mailbox to read for Make Person Mailbox…, carried into a detached task.
+/// File-scope, like the other payload types, so it doesn't inherit
+/// `AppModel`'s `@MainActor`.
+struct PersonMailboxTarget: Sendable {
+    let id: MailboxItem.ID
+    let base: URL
+}
+
+/// What reading one mailbox found: nil `scan` when it couldn't be read or
+/// changed while it was being read.
+/// How the right-clicked message is found again: its offset, confirmed by its
+/// Message-ID when it has one.
+struct PersonMailboxClicked: Sendable {
+    let offset: Int
+    let messageID: String?
+}
+
+struct PersonMailboxScanResult: Sendable {
+    let id: MailboxItem.ID
+    let base: URL
+    let scan: PersonMailbox.Scan?
 }

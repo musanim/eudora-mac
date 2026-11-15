@@ -524,6 +524,14 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             menu.addItem(open)
         }
 
+        // Make Person Mailbox…: the item above acted on — a PEOPLE mailbox of
+        // the sender's own, with their mail gathered into it. Same gate, for
+        // the same reason: on mail Stephen wrote, the sender is him. Shown
+        // rather than greyed, like Send Again: it is meaningless elsewhere.
+        if n == 1, let id = clickedPrimary, !model.isOutgoingMessage(id) {
+            add("Make Person Mailbox\u{2026}", #selector(makePersonMailbox))
+        }
+
         menu.addItem(.separator())
         // Reply and Forward only make sense on one message (the design
         // decision), so they grey out over a multi-selection rather than
@@ -719,6 +727,14 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
     @objc private func sendAgain() {
         guard let id = clickedPrimary else { return }
         model.sendAgain(messageIndex: id)
+    }
+
+    /// Not through `actOnClickedRows`: the command reads the clicked row by
+    /// id and installs its own selection later, once it knows what to move.
+    /// The table's window goes along so the sheet hangs from it.
+    @objc private func makePersonMailbox() {
+        guard let id = clickedPrimary else { return }
+        model.makePersonMailbox(for: id, in: table?.window)
     }
 
     /// Jump to the most recent reply to the clicked message.
