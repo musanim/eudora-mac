@@ -172,11 +172,6 @@ public enum PersonMailbox {
         /// one was given. An offset alone can name another message once
         /// anything earlier in the mailbox has been removed.
         public let indexAtOffset: Int?
-        /// The `.toc` lists records that aren't there. Moving out of such a
-        /// mailbox makes `removeMany` drop its index, and the next listing
-        /// scans — showing every deleted-but-uncompacted message again. So
-        /// nothing is moved out of one directly.
-        public let indexIsStale: Bool
         /// Read by scanning the `.mbx`, with no usable `.toc`, so no status is
         /// known — a draft can't be told from a sent copy. Out read this way is
         /// never moved from.
@@ -234,13 +229,8 @@ public enum PersonMailbox {
                 offsets[row.index] = row.offset
             }
         }
-        // Every listed row is a `.toc` entry that names a real record, so
-        // fewer rows than entries means some entries name nothing.
-        let stale = listing.source == .tocCompacted
-            && (Toc.read(base.appendingPathExtension("toc"))?.count ?? 0) != listing.rows.count
         guard Fingerprint.of(base: base) == before else { return nil }
         return Scan(matches: matches, offsets: offsets, indexAtOffset: atOffset,
-                    indexIsStale: stale,
                     statusesUnknown: listing.source == .scanNoToc || listing.source == .scanStale,
                     fingerprint: before)
     }

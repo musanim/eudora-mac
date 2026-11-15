@@ -6865,15 +6865,19 @@ final class AppModel: ObservableObject {
         personMailboxProgress = nil
     }
 
-    /// A mailbox nothing may be moved out of directly: its index is stale
-    /// (`Scan.indexIsStale`), or it is Out read without an index, where a
-    /// draft can't be told from a sent copy (`Scan.statusesUnknown`). The
-    /// clicked message's own mailbox is exempt from the first — moving that
-    /// message is an ordinary Move — but not from the second.
+    /// A mailbox nothing may be moved out of directly: Out read without an
+    /// index, where a draft can't be told from a sent copy
+    /// (`Scan.statusesUnknown`). That holds for the clicked message's own
+    /// mailbox too.
+    ///
+    /// A mailbox whose index carries dead entries used to be blocked as well,
+    /// because a move out of it deleted the index and brought its
+    /// deleted-but-uncompacted messages back. `MailboxMutator.removeMany` now
+    /// keeps such an index (dropping the dead entries), so that is no longer
+    /// a reason. `sourceID` is kept so callers needn't change.
     private func personMoveBlocked(_ scan: PersonMailbox.Scan, id: MailboxItem.ID,
                                    sourceID: MailboxItem.ID) -> Bool {
-        (scan.indexIsStale && id != sourceID)
-            || (scan.statusesUnknown && itemsByID[id]?.type == .outbox)
+        scan.statusesUnknown && itemsByID[id]?.type == .outbox
     }
 
     /// Read every target off the main thread. The one the clicked message is in
@@ -6937,9 +6941,7 @@ final class AppModel: ObservableObject {
                 continue
             }
             guard !scan.matches.isEmpty else { continue }
-            // See `Scan.indexIsStale`. The clicked message's own mailbox is the
-            // exception: moving that message is an ordinary Move, which already
-            // behaves this way, and the command exists to file it.
+            // See `personMoveBlocked`.
             let blocked = personMoveBlocked(scan, id: result.id, sourceID: sourceID)
             let ticked = !blocked && PersonMailbox.tickedByDefault(
                 type: item.type, isTopLevel: !result.id.contains("/"),
@@ -7069,7 +7071,7 @@ final class AppModel: ObservableObject {
                 }
                 continue
             }
-            // See `Scan.indexIsStale`; the sheet already disabled such boxes,
+            // See `personMoveBlocked`; the sheet already disabled such boxes,
             // but the second read is the one that counts.
             guard !personMoveBlocked(scan, id: id, sourceID: sourceID),
                   PersonMailbox.Fingerprint.of(base: result.base) == scan.fingerprint else {

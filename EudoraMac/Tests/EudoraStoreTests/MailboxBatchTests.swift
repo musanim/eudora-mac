@@ -106,6 +106,62 @@ final class MailboxBatchTests: XCTestCase {
         XCTAssertEqual(entries.map(\.length), recs.map(\.length))
     }
 
+    /// An index with a few dead entries (offsets naming nothing) over a
+    /// mailbox with a deleted-but-uncompacted ghost — `__MAM.fol/MISCINQ`'s
+    /// shape. The listing trusts it; a removal must keep it, minus the dead
+    /// entries, or the next listing scans and the ghost comes back status-less.
+    func testRemoveManyKeepsAStaleButTrustedTocAndDropsItsDeadEntries() throws {
+        try build(bodies: ["first", "second", "third", "fourth"])
+        let toc = base.appendingPathExtension("toc")
+        let loaded = try XCTUnwrap(Toc.load(toc))
+        // S2 becomes a ghost (no entry), and one dead entry is added.
+        var entries = loaded.entries.enumerated()
+            .filter { $0.offset != 1 }
+            .map { (source: Optional($0.offset), entry: $0.element) }
+        entries.append((source: nil, entry: TocEntry(offset: 999_999, length: 10, status: 1, priority: 4,
+                                                     date: "", to: "", subject: "dead")))
+        try TocWriter.patched(original: loaded.data, originalEntries: loaded.entries,
+                              entries: entries).write(to: toc)
+        XCTAssertEqual(MailStore(root: root).list(at: base, name: "Box")!.rows.map(\.subject),
+                       ["S1", "S3", "S4"], "fixture: the listing trusts the index and hides the ghost")
+
+        try MailboxMutator.removeMany(base: base, indices: [3])   // S3
+
+        let after = try XCTUnwrap(Toc.read(toc), "a trusted index must not be deleted")
+        let recs = Mbox.findRecords([UInt8](try Data(contentsOf: base.appendingPathExtension("mbx"))))
+        XCTAssertEqual(recs.count, 3, "S1, the S2 ghost and S4 remain in the .mbx")
+        XCTAssertEqual(after.map(\.subject), ["S1", "S4"], "dead entry dropped, ghost still unnamed")
+        XCTAssertEqual(after.map(\.offset), [recs[0].offset, recs[2].offset])
+        XCTAssertEqual(after.map(\.length), [recs[0].length, recs[2].length])
+
+        let listing = MailStore(root: root).list(at: base, name: "Box")!
+        XCTAssertEqual(listing.source, .tocCompacted)
+        XCTAssertEqual(listing.rows.map(\.subject), ["S1", "S4"], "the ghost must stay hidden")
+        XCTAssertEqual(listing.rows.map(\.status),
+                       [MailboxMutator.statusSent, MailboxMutator.statusSent], "statuses survive")
+    }
+
+    /// An index the listing doesn't trust (most entries name nothing) is still
+    /// dropped, as before: the listing scans it either way.
+    func testRemoveManyStillDropsAnUntrustedToc() throws {
+        try build(bodies: ["first", "second"])
+        let toc = base.appendingPathExtension("toc")
+        let loaded = try XCTUnwrap(Toc.load(toc))
+        let dead = loaded.entries.enumerated().map { (k, e) in
+            (source: Optional(k), entry: TocEntry(offset: 900_000 + k, length: e.length, status: e.status,
+                                                  priority: e.priority, date: e.date, to: e.to,
+                                                  subject: e.subject))
+        }
+        try TocWriter.patched(original: loaded.data, originalEntries: loaded.entries,
+                              entries: dead).write(to: toc)
+        XCTAssertEqual(MailStore(root: root).list(at: base, name: "Box")!.source, .scanStale, "fixture")
+
+        try MailboxMutator.removeMany(base: base, indices: [1])
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: toc.path))
+        XCTAssertEqual(MailStore(root: root).list(at: base, name: "Box")!.rows.map(\.subject), ["S2"])
+    }
+
     func testRemoveManyReturnsRecordsInAscendingIndexOrder() throws {
         try build(bodies: ["first", "second", "third"])
         let removed = try MailboxMutator.removeMany(base: base, indices: [3, 1])

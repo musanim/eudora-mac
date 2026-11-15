@@ -488,8 +488,8 @@ enum PersonMailboxDialog {
         /// The mailbox holding the right-clicked message, which moves whether
         /// or not this is ticked.
         let holdsClicked: Bool
-        /// Shown, but can't be ticked: its index is out of date, and moving out
-        /// of it would bring its deleted messages back (`Scan.indexIsStale`).
+        /// Shown, but can't be ticked: Out read without an index, where a
+        /// draft can't be told from a sent copy (`Scan.statusesUnknown`).
         let blocked: Bool
     }
 
@@ -569,7 +569,7 @@ final class PersonMailboxDialogController: NSObject, NSTextFieldDelegate {
             for (i, entry) in entries.enumerated() {
                 var title = "\(entry.title)  (\(entry.count))"
                 if entry.holdsClicked { title += " \u{2014} the message you clicked moves either way" }
-                if entry.blocked { title += " \u{2014} can't move: its index is out of date" }
+                if entry.blocked { title += " \u{2014} can't move: it has no index, so drafts can't be told from sent mail" }
                 let box = NSButton(checkboxWithTitle: title, target: nil, action: nil)
                 box.state = entry.ticked && !entry.blocked ? .on : .off
                 box.isEnabled = !entry.blocked

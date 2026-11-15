@@ -237,14 +237,14 @@ final class PersonMailboxTests: XCTestCase {
                                         offset: rows[1].offset, messageID: "<a@x>")?.indexAtOffset)
     }
 
-    func testStaleIndexIsReported() throws {
+    /// A trusted index with a dead entry still scans normally. (It used to be
+    /// reported as stale and refused; `removeMany` now keeps such an index.)
+    func testIndexWithADeadEntryStillScans() throws {
         try build([
             message(from: "jane@x.com", to: "me@y.com", subject: "S1"),
             message(from: "jane@x.com", to: "me@y.com", subject: "S2"),
             message(from: "jane@x.com", to: "me@y.com", subject: "S3"),
         ])
-        XCTAssertEqual(PersonMailbox.scan(base: base, address: "jane@x.com")?.indexIsStale, false)
-
         // One extra entry pointing at nothing: still trusted by the listing
         // (a majority matches), but not consistent.
         let toc = base.appendingPathExtension("toc")
@@ -257,7 +257,7 @@ final class PersonMailboxTests: XCTestCase {
 
         let scan = try XCTUnwrap(PersonMailbox.scan(base: base, address: "jane@x.com"))
         XCTAssertEqual(scan.matches, [1, 2, 3])
-        XCTAssertTrue(scan.indexIsStale)
+        XCTAssertFalse(scan.statusesUnknown)
     }
 
     func testMissingMailboxScansNil() {

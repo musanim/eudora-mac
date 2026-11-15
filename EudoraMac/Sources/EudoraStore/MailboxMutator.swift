@@ -306,8 +306,9 @@ public enum MailboxMutator {
               let last = unique.last, last <= recs.count else { throw MutateError.outOfRange }
 
         // The .toc read once and keyed by offset, not re-read per message as
-        // `oneEntry` would. `uniquingKeysWith` is defensive only — a .toc with
-        // duplicate offsets is already inconsistent and gets dropped below.
+        // `oneEntry` would. `uniquingKeysWith` keeps the first of any
+        // duplicate offsets; such an index is otherwise treated like any other
+        // (both copies kept, or both dropped with their record).
         let tocByOffset: [Int: TocEntry]? = Toc.read(toc).map { entries in
             Dictionary(entries.map { ($0.offset, $0) }, uniquingKeysWith: { a, _ in a })
         }
@@ -343,13 +344,18 @@ public enum MailboxMutator {
             try MailboxIO.atomicWrite(newData, to: mbx)
         } catch { throw MutateError.ioError(error.localizedDescription) }
 
-        // Keep the .toc consistent when its offsets are a valid (sub)set of the
-        // mailbox — drop the removed entries (by offset) and shift every kept
-        // offset left by the total length of the removed spans before it. This
-        // preserves status even for a mailbox with deleted ghosts. Only a
-        // genuinely inconsistent .toc is dropped (reader rescans). Never parses
-        // the whole mailbox.
-        if let loaded = Toc.load(toc), tocConsistent(loaded.entries, recs: recs) {
+        // Keep the .toc whenever the listing trusts it (`trustedEntries`, the
+        // rule `MailStore.list` reads by): drop the removed entries and any
+        // dead ones, and shift every kept offset left by the total length of
+        // the removed spans before it. This preserves status, and keeps
+        // deleted-but-uncompacted ghosts hidden, even when the index already
+        // carried a few dead entries. Deleting it then — as this once did
+        // unless *every* entry named a record — made the next listing scan and
+        // show every ghost again, status-less ("?"); `__MAM.fol/MISCINQ`, with
+        // 4 dead entries among 2,092, was one Move away from that. Only an
+        // index the listing ignores anyway is dropped. Never parses the whole
+        // mailbox.
+        if let loaded = Toc.load(toc), let live = trustedEntries(loaded.entries, recs: recs) {
             let original = loaded.data, entries0 = loaded.entries
             let removedOffsets = Set(spans.map { $0.start })
             // Prefix sums of the cut lengths, so each kept entry's shift is a
@@ -361,10 +367,11 @@ public enum MailboxMutator {
             for s in spans { prefix.append(prefix[prefix.count - 1] + (s.end - s.start)) }
 
             var kept: [(source: Int?, entry: TocEntry)] = []
-            kept.reserveCapacity(max(0, entries0.count - removedOffsets.count))
-            for (k, e) in entries0.enumerated() where !removedOffsets.contains(e.offset) {
+            kept.reserveCapacity(live.count)
+            for k in live where !removedOffsets.contains(entries0[k].offset) {
+                let e = entries0[k]
                 // How many cut spans start before this offset (they are disjoint
-                // from it — the offset survived the removedOffsets test).
+                // from it — it names a record, and not a removed one).
                 var lo = 0, hi = starts.count
                 while lo < hi {
                     let mid = (lo + hi) / 2
@@ -473,6 +480,25 @@ public enum MailboxMutator {
     static func tocConsistent(_ toc: [TocEntry], recs: [MboxRecord]) -> Bool {
         let offsets = Set(recs.map { $0.offset })
         return toc.allSatisfy { offsets.contains($0.offset) }
+    }
+
+    /// The positions in `toc` of the entries a listing shows — every entry
+    /// naming a real record, in `.toc` order — or nil when the index isn't
+    /// trusted at all.
+    ///
+    /// Trusted means what `MailStore.list(at:)` means, which reads through this:
+    /// an empty index (it lists nothing), or one where a simple majority of
+    /// entries name a record. Below that the `.toc` belongs to some other
+    /// state of the mailbox and the listing scans instead. Dead entries in a
+    /// trusted index — offsets into compaction padding — are left out; records
+    /// it doesn't name stay hidden, as deleted-but-uncompacted ghosts.
+    ///
+    /// Looser than `tocConsistent`, which accepts only an index with no dead
+    /// entries at all. The two agree on every index this app writes itself.
+    static func trustedEntries(_ toc: [TocEntry], recs: [MboxRecord]) -> [Int]? {
+        let offsets = Set(recs.map { $0.offset })
+        let live = toc.indices.filter { offsets.contains(toc[$0].offset) }
+        return (toc.isEmpty || live.count * 2 > toc.count) ? live : nil
     }
 
     /// Append a raw record (envelope line + message) to a mailbox. Streams the

@@ -280,14 +280,16 @@ public struct MailStore: Sendable {
         // messages deleted without compaction. Scanning instead would put every
         // one of those back on screen with no status. (`.toc` missing or
         // shorter than its header is `nil` and still scans.) See
-        // `MailboxMutator.tocConsistent`, which holds the write-side half.
+        // `MailboxMutator.tocConsistent` for the write-side half of that.
         if let t = toc, t.isEmpty {
             return Listing(name: label, source: recs.isEmpty ? .toc : .tocCompacted, rows: [])
         }
 
+        // The rule itself lives in `MailboxMutator.trustedEntries`, so that
+        // what Move and Delete keep is exactly what this shows.
         if let t = toc, !t.isEmpty {
-            let matched = t.filter { indexByOffset[$0.offset] != nil }
-            if matched.count * 2 > t.count {
+            if let live = MailboxMutator.trustedEntries(t, recs: recs) {
+                let matched = live.map { t[$0] }
                 let source: IndexSource =
                     (matched.count == t.count && t.count == recs.count) ? .toc : .tocCompacted
                 let rows = matched.map { e -> ListingRow in
