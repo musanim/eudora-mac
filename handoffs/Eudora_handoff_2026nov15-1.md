@@ -19,6 +19,12 @@ Follow `/Users/stephenmalinowski/ClaudeProjects/GenericClaudeSessionStartup.md`:
    and read `claude-conventions.md`. Ask for `~/Eudora` too if MAM4U work or
    live-tree reading is likely — request both together.
 2. Read this project's `CLAUDE.md`.
+2a. Read `ClaudeProjects/ClaudeManagement/CLAIMS.md` and `LOG.md` (the shared
+   board; rules in the "Coordination between instances" section of
+   `claude-conventions.md`, effective 2026nov15). **Before editing anything
+   outside `Eudora/`** — including `MAMforTheMasses/tools/mam4u_batch.py` and
+   the `PeopleToEmail/` files — add a claim line; when done, commit, remove it,
+   and append one line to `LOG.md`.
 3. Read this handoff, then the "Carried forward" section of
    `handoffs/archive/Eudora_handoff_2026nov14-1.md`.
 4. Wait for Stephen.
@@ -105,7 +111,10 @@ All committed and pushed except this handoff's commit. `swift test` passes
 - Two review agents on each; they found no bugs, one rare regression
   (shifted index after a failed write) answered by the atomic writes.
 - **MAM4U batches 6–14** (rows 103–270). `progress.txt` is current.
-- **`mam4u_batch.py` fixes** (MAMforTheMasses, not in this repo):
+- **`mam4u_batch.py` fixes** — committed in the **MAMforTheMasses** repo
+  (`8eec160`, logged in `ClaudeManagement/LOG.md`), not this one. That repo
+  belongs to the MAMforTheMasses instance; touch it only under a claim. It
+  needs `git -c user.name=… -c user.email=…` (no identity configured there).
   `unflip()` turns "Last, First" into "First Last" — **a comma in a To display
   name fails on send** — and a name with several commas goes to the bare
   address with "Hello,"; a leading initial is skipped for the greeting;
