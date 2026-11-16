@@ -20,7 +20,7 @@ Follow `/Users/stephenmalinowski/ClaudeProjects/GenericClaudeSessionStartup.md`:
    project folder (see item 1) — request all together.
 2. Read this project's `CLAUDE.md`.
 2a. Read `ClaudeProjects/ClaudeManagement/CLAIMS.md` and `LOG.md`. Claim
-   before editing anything outside `Eudora/` (MAMforTheMasses, the site
+   before editing anything outside `Eudora/` (MAM4U, formerly MAMforTheMasses; the site
    mirror `~/Documents/Active/HTMirror/musanim`).
 3. Read this handoff, then nov15-1's items 2–5.
 4. Wait for Stephen.
@@ -77,14 +77,14 @@ Files, both in `Eudora/reference/` (gitignored — built from private mail):
 
 ### 2. MAM4U mailing — finished (record)
 
-All three sections of `MAMforTheMasses/PeopleToEmail/PeopleToEmail_2026nov14.txt`
+All three sections of `MAM4U/PeopleToEmail/PeopleToEmail_2026nov14.txt`
 were turned into drafts: A (batches 1–14), B (B01–B04: Tapper/Tantrum/
 Harmonizer replies lead with a link — MIDI Tapper, TantrumToy, the new
 Harmonizer page — after Stephen's reply to Bruno De Florence), C (C01–C02,
 plain template), plus Herbert Anton Kellner (Tantrum mailbox, not on the
 list). Andort (B row 37) skipped at Stephen's word. `progress.txt` there has
 every batch and greeting decision. `mam4u_batch.py` gained `--section B|C`,
-per-program fill-ins and leads — committed in the MAMforTheMasses repo
+per-program fill-ins and leads — committed in the MAM4U repo (formerly MAMforTheMasses)
 (`e17a6b8`), claim removed, LOG line added.
 
 Known gap, Stephen not interested now: the list builder skipped
