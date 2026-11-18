@@ -438,6 +438,7 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
         //
         // The whole point: a title now, contents only if opened.
         let n = clickedIDs.count
+        let soleID = n == 1 ? clickedPrimary : nil
         let move = NSMenuItem(title: "Move to", action: nil, keyEquivalent: "")
         let submenu = NSMenu(title: "Move to")
         submenu.autoenablesItems = false
@@ -468,6 +469,19 @@ final class MessageContextMenuController: NSObject, NSMenuDelegate {
             // must not rely on.
             suggestions: { [weak self] in
                 self?.model.filingSuggestions() ?? []
+            },
+            // Make Person Mailbox… for the recipient of a message Stephen sent,
+            // when the suggestions hold no PEOPLE mailbox — see
+            // `AppModel.personMailboxOffers`. One message only; a pure read,
+            // for the reason the suggestions closure is.
+            personOffers: { [weak self] suggested in
+                guard let self, let id = soleID else { return [] }
+                return self.model.personMailboxOffers(for: id, suggested: suggested)
+            },
+            // Not through `actOnClickedRows`, for `makePersonMailbox`'s reason.
+            onPerson: { [weak self] offer in
+                guard let self, let id = soleID else { return }
+                self.model.makePersonMailbox(for: id, recipient: offer, in: self.table?.window)
             })
         submenu.delegate = builder
         moveBuilders.append(builder)

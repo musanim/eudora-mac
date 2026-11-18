@@ -84,6 +84,15 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
     /// selection change.
     private let suggestions: (() -> [AppModel.FilingSuggestion])?
 
+    /// Make Person Mailbox… entries to show below the suggestions, given what
+    /// they turned out to be — so the model can offer them only when none is
+    /// under PEOPLE (`AppModel.personMailboxOffers`). Root level only, like
+    /// `suggestions`, and only shown in a suggesting menu.
+    private let personOffers: (([AppModel.FilingSuggestion]) -> [AppModel.PersonOffer])?
+    private let onPerson: ((AppModel.PersonOffer) -> Void)?
+    /// The offers on show, by item tag — rebuilt with the menu.
+    private var shownOffers: [AppModel.PersonOffer] = []
+
     /// Child builders, retained because `NSMenu.delegate` is a **weak**
     /// reference: a builder that nothing else held would be gone by the time its
     /// submenu opened, and the submenu would come up empty. Whoever owns the
@@ -95,12 +104,16 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
          folderID: MailboxItem.ID? = nil,
          onPick: @escaping (MailboxItem.ID) -> Void,
          onNew: ((MailboxItem.ID?) -> Void)? = nil,
-         suggestions: (() -> [AppModel.FilingSuggestion])? = nil) {
+         suggestions: (() -> [AppModel.FilingSuggestion])? = nil,
+         personOffers: (([AppModel.FilingSuggestion]) -> [AppModel.PersonOffer])? = nil,
+         onPerson: ((AppModel.PersonOffer) -> Void)? = nil) {
         self.items = items
         self.folderID = folderID
         self.onPick = onPick
         self.onNew = onNew
         self.suggestions = suggestions
+        self.personOffers = personOffers
+        self.onPerson = onPerson
         super.init()
     }
 
@@ -111,6 +124,7 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
         // negligible cost of redoing it.
         menu.removeAllItems()
         children.removeAll()
+        shownOffers.removeAll()
 
         // Where this person's mail already goes, ahead of everything else.
         //
@@ -156,6 +170,21 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
                 menu.addItem(entry)
             }
             if !suggested.isEmpty { menu.addItem(.separator()) }
+
+            // Where the suggestions run out: a sent message to someone with no
+            // PEOPLE mailbox. Offered here, beside where the message would
+            // otherwise go, because that is where Stephen looks for it.
+            if onPerson != nil {
+                shownOffers = personOffers?(suggested) ?? []
+                for (i, offer) in shownOffers.enumerated() {
+                    let entry = NSMenuItem(title: offer.title, action: #selector(makePerson(_:)),
+                                           keyEquivalent: "")
+                    entry.target = self
+                    entry.tag = i
+                    menu.addItem(entry)
+                }
+                if !shownOffers.isEmpty { menu.addItem(.separator()) }
+            }
 
             // The full tree, one level down. Built by a *child* builder with no
             // suggestions closure, so the suggestions appear once at the top
@@ -224,6 +253,11 @@ final class MailboxMenuBuilder: NSObject, NSMenuDelegate {
     @objc private func pick(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? MailboxItem.ID else { return }
         onPick(id)
+    }
+
+    @objc private func makePerson(_ sender: NSMenuItem) {
+        guard shownOffers.indices.contains(sender.tag) else { return }
+        onPerson?(shownOffers[sender.tag])
     }
 
     @objc private func newHere() {

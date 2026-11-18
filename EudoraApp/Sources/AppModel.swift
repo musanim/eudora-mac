@@ -4562,6 +4562,83 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// A recipient of a sent message that Make Person Mailbox… can be offered
+    /// for, from the Move to menu.
+    struct PersonOffer: Equatable {
+        /// Bare and lowercased, as `EmailAddress.bareAddress` gives it.
+        let address: String
+        /// The recipient's own entry from the address header, display name
+        /// and all — what `PersonMailbox.suggestedName` prefills the sheet from.
+        let entry: String
+        /// The menu item's title.
+        let title: String
+    }
+
+    /// The recipients of one sent message who have no PEOPLE mailbox yet, as
+    /// far as Move to's suggestions can tell — offered under Move to as Make
+    /// Person Mailbox… (Stephen, 2026nov17: the case that kept coming up was
+    /// mail he had just sent to someone new, which Move to had nothing to
+    /// suggest for).
+    ///
+    /// **Gated on the suggestions, not on the person.** `filingSuggestions`
+    /// already asks the index where these correspondents' mail lives, From,
+    /// To and Cc; if any answer is under PEOPLE, a person mailbox exists for
+    /// someone on the message and the right move is to pick it, so nothing is
+    /// offered. Taking the computed list rather than asking again keeps the
+    /// menu to one index query.
+    ///
+    /// **Successfully sent only** (`isSentMessage`), not `isOutgoingMessage`:
+    /// `PersonMailbox.scan` never matches unsent, queued or failed messages —
+    /// they belong in Out until they go — so on one of those the command
+    /// would read everything and then refuse, having lost the clicked
+    /// message.
+    ///
+    /// A pure read, like the suggestions: AppKit may call `menuNeedsUpdate:`
+    /// more than once. One bounded read of the message's headers.
+    func personMailboxOffers(for clicked: MessageRow.ID,
+                             suggested: [FilingSuggestion]) -> [PersonOffer] {
+        // Three ways the suggestions can be empty without meaning "no PEOPLE
+        // mailbox", each of which would offer a duplicate: no index or a Find
+        // in flight (`filingCounts` didn't ask), and a message already sitting
+        // in a PEOPLE mailbox (`filingSuggestions` drops the one on screen).
+        guard isSentMessage(clicked), !isSearching, searchIndex != nil,
+              let people = peopleFolder(),
+              !(selectedMailboxID ?? "").hasPrefix(people.id + "/"),
+              !suggested.contains(where: { $0.id.hasPrefix(people.id + "/") }),
+              let sourceID = listedMailboxID, sourceID == selectedMailboxID,
+              let source = itemsByID[sourceID], let row = listedRow(clicked), let store,
+              let raw = store.rawMessage(at: source.base, offset: row.offset,
+                                         length: min(row.size, 64 * 1024)) else { return [] }
+        let header = MIMEParser.parse([UInt8](Self.headerBlock(raw)))
+        var seen: Set<String> = []
+        var offers: [PersonOffer] = []
+        // To and Cc, not Bcc: the suggestions are asked about From/To/Cc, so a
+        // Bcc'd person with a PEOPLE mailbox wouldn't have suppressed the offer.
+        for field in ["To", "Cc"] {
+            // The address comes from each part alone, as `addresses(in:)` takes
+            // it. An unquoted `Doe, Jane <j@x>` splits at its comma into a name
+            // with no address and the rest; only for the name is the last such
+            // part put back in front, and only onto a `<…>` entry.
+            var pending = ""
+            for part in EmailAddress.splitList(header.header(field) ?? "") {
+                guard let address = EmailAddress.bareAddress(part) else {
+                    pending = part
+                    continue
+                }
+                let entry = (!pending.isEmpty && part.contains("<")) ? pending + "," + part : part
+                pending = ""
+                guard !me.matches(headerValue: address), seen.insert(address).inserted else { continue }
+                let name = PersonMailbox.suggestedName(fromHeader: entry)
+                offers.append(PersonOffer(
+                    address: address, entry: entry,
+                    title: "Make Person Mailbox for \(name.isEmpty ? address : name)\u{2026}"))
+            }
+        }
+        // A message to a crowd is a mailing, not a correspondence; a menu of
+        // twenty people would be noise. Eight covers any real conversation.
+        return offers.count <= 8 ? offers : []
+    }
+
     /// The unfiltered ranking behind `filingSuggestions` — which mailboxes the
     /// index has seen this correspondence filed into, and how often.
     ///
@@ -6765,7 +6842,13 @@ final class AppModel: ObservableObject {
     /// `window` is the one the right-click happened in, which the sheet hangs
     /// from: by the time the read finishes the user may be in another app, or a
     /// composer may be the main window.
-    func makePersonMailbox(for clicked: MessageRow.ID, in window: NSWindow?) {
+    /// `recipient` is set when the command comes from Move to on a message
+    /// Stephen sent (`personMailboxOffers`): the person is that recipient, not
+    /// the sender, who is him. Everything after choosing the address is the
+    /// same — `PersonMailbox.scan` already matches To, Cc and Bcc as well as
+    /// From, so the clicked message and any other sent mail to them is found.
+    func makePersonMailbox(for clicked: MessageRow.ID, recipient: PersonOffer? = nil,
+                           in window: NSWindow?) {
         guard !personMailboxInFlight else {
             showBanner("Make Person Mailbox\u{2026} is already under way.")
             return
@@ -6780,14 +6863,24 @@ final class AppModel: ObservableObject {
             return
         }
         let header = MIMEParser.parse([UInt8](Self.headerBlock(raw)))
-        let fromValue = header.header("From") ?? ""
         let clickedMessageID = header.header("Message-ID")
-        guard let address = EmailAddress.addresses(in: fromValue).first else {
-            showError("That message has no sender address to make a mailbox for.")
-            return
+        // The header the prefilled name comes from: the sender's From, or the
+        // recipient's own entry.
+        let nameSource: String
+        let address: String
+        if let recipient {
+            nameSource = recipient.entry
+            address = recipient.address
+        } else {
+            nameSource = header.header("From") ?? ""
+            guard let from = EmailAddress.addresses(in: nameSource).first else {
+                showError("That message has no sender address to make a mailbox for.")
+                return
+            }
+            address = from
         }
         guard !me.matches(headerValue: address) else {
-            showError("That message is from you — there's no one to make a mailbox for.")
+            showError("That address is yours \u{2014} there's no one to make a mailbox for.")
             return
         }
         guard peopleFolder() != nil else {
@@ -6823,7 +6916,7 @@ final class AppModel: ObservableObject {
         let targets = ids.compactMap { id in
             itemsByID[id].map { PersonMailboxTarget(id: id, base: $0.base) }
         }
-        let suggested = PersonMailbox.suggestedName(fromHeader: fromValue)
+        let suggested = PersonMailbox.suggestedName(fromHeader: nameSource)
         let clickedOffset = row.offset
 
         let clickedRef = PersonMailboxClicked(offset: clickedOffset, messageID: clickedMessageID)
