@@ -4715,6 +4715,26 @@ final class AppModel: ObservableObject {
             if clicked == nil {
                 bodies.append(String(raw.map { Character(UnicodeScalar($0)) }))
             }
+            // A bounce is about the address that failed, not about the mail
+            // system that sent it (From: MAILER-DAEMON) or about Stephen (To:),
+            // so its suggestions come from the failed recipients — Move to then
+            // offers the person's own mailbox, where the bounce belongs as a
+            // reminder (Stephen, 2026nov20). This is the by-hand path for the
+            // bounces the arrival hook leaves in In: a 4.x.x "gave up" such as
+            // a connection timeout, or a free-text report. Not in `fromOnly`
+            // mode: "who sent this" has no failed recipient to answer with.
+            if clicked == nil, looksLikeBounce(row.id) {
+                var failed = BounceReport.failures(in: part).map(\.address)
+                if failed.isEmpty {
+                    failed = BounceReport.failures(inStatusText: Self.bounceStatusText(raw))
+                        .map(\.address)
+                }
+                let theirs = failed.filter { !me.matches(headerValue: $0) }
+                if !theirs.isEmpty {
+                    addresses.formUnion(theirs)
+                    continue
+                }
+            }
             for field in clicked == nil ? ["From", "To", "Cc"] : ["From"] {
                 // `addresses(in:)` already returns bare addresses — it is
                 // `splitList` followed by `bareAddress` — so no second pass.
@@ -8076,13 +8096,20 @@ final class AppModel: ObservableObject {
         guard let raw = rawRecord(id, limit: 512 * 1024) else { return [] }
         let strict = BounceReport.failures(in: MIMEParser.parse([UInt8](raw)))
         if !strict.isEmpty { return strict }
-        let text = String(decoding: raw, as: UTF8.self)
+        return BounceReport.failures(inStatusText: Self.bounceStatusText(raw))
+    }
+
+    /// A bounce as text for `BounceReport.failures(inStatusText:)`: `<br>`s
+    /// taken out and `&lt;`/`&gt;`/`&amp;` decoded, since a report HTML-ized
+    /// by Eudora 7 writes its fields that way. Shared by Record Bad Address
+    /// and Move to's suggestions.
+    private static func bounceStatusText(_ raw: Data) -> String {
+        String(decoding: raw, as: UTF8.self)
             .replacingOccurrences(of: "<br\\s*/?>", with: "",
                                   options: [.regularExpression, .caseInsensitive])
             .replacingOccurrences(of: "&lt;", with: "<")
             .replacingOccurrences(of: "&gt;", with: ">")
             .replacingOccurrences(of: "&amp;", with: "&")
-        return BounceReport.failures(inStatusText: text)
     }
 
     /// Record Bad Address: add one address to the list by hand, dated by the
